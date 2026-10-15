@@ -111,6 +111,10 @@ impl App {
             }
             return;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+            self.should_quit = true;
+            return;
+        }
         // A pending permission request owns the keyboard.
         if self.current().is_some_and(|s| s.pending.is_some()) {
             self.handle_permission_key(key);
@@ -344,6 +348,14 @@ mod tests {
     fn q_quits_from_normal_mode() {
         let (mut app, _) = app_with_session();
         app.handle_key(key(KeyCode::Char('q')));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_d_quits_from_any_mode() {
+        let (mut app, _) = app_with_session();
+        app.mode = Mode::Insert;
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert!(app.should_quit);
     }
 }
