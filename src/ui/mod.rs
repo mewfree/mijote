@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, Mode};
+use crate::app::{App, Confirm, Mode};
 use crate::session::{Entry, Session, Status};
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
@@ -34,6 +34,26 @@ pub fn render(f: &mut Frame, app: &App) {
             render_permission(f, s);
         }
     }
+    if let Some(c) = app.confirm {
+        render_confirm(f, c);
+    }
+}
+
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Animated frame for a running turn, advancing every 100ms.
+fn spinner(s: &Session) -> &'static str {
+    let ms = s.turn_started.map_or(0, |t| t.elapsed().as_millis());
+    SPINNER[(ms / 100) as usize % SPINNER.len()]
+}
+
+fn elapsed(s: &Session) -> String {
+    let secs = s.turn_started.map_or(0, |t| t.elapsed().as_secs());
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
 }
 
 fn status_glyph(s: Status) -> (&'static str, Color) {
@@ -52,6 +72,11 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|s| {
             let (g, c) = status_glyph(s.status);
+            let g = if s.status == Status::Running {
+                spinner(s)
+            } else {
+                g
+            };
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{g} "), Style::new().fg(c)),
                 Span::raw(s.spec.name),
@@ -107,6 +132,21 @@ fn entry_lines(e: &Entry) -> Vec<Line<'static>> {
     }
 }
 
+/// Trailing "the agent is busy" line, so a long silent turn never looks hung.
+fn activity_line(s: &Session) -> Option<Line<'static>> {
+    match s.status {
+        Status::Running => Some(Line::from(vec![
+            Span::styled(format!("{} ", spinner(s)), Style::new().fg(Color::Cyan)),
+            Span::styled(format!("working… {}", elapsed(s)), DIM),
+        ])),
+        Status::AwaitingPermission => Some(Line::styled(
+            "! waiting for your permission",
+            Style::new().fg(Color::Magenta),
+        )),
+        _ => None,
+    }
+}
+
 fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
     let title = match app.current() {
         Some(s) => match &s.worktree {
@@ -139,6 +179,7 @@ fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
                 l.push(Line::from(""));
                 l
             })
+            .chain(activity_line(s))
             .collect(),
     };
 
@@ -177,15 +218,25 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
+    let busy = app
+        .current()
+        .is_some_and(|s| matches!(s.status, Status::Running | Status::AwaitingPermission));
     let hint = match app.mode {
-        Mode::Normal => {
-            "n new  d close  j/k switch  i prompt  Esc/^C cancel  PgUp/PgDn scroll  q quit"
-        }
-        Mode::Insert => "Enter send  Esc normal  ^C cancel turn",
+        _ if app.confirm.is_some() => "y confirm  any other key cancels",
+        Mode::Normal if app.scroll > 0 => "G follow  PgUp/PgDn scroll  i prompt  n new  q quit",
+        Mode::Normal if busy => "^C cancel turn  j/k switch  PgUp/PgDn scroll  n new  q quit",
+        Mode::Normal => "i prompt  n new  d close  j/k switch  PgUp/PgDn scroll  q quit",
+        Mode::Insert if busy => "Enter sends when idle  ^C cancel turn  Esc normal",
+        Mode::Insert => "Enter send  Esc normal  ^C quit",
         Mode::Picker => "j/k move  Enter/1-9 choose  Esc close",
     };
+    let mut text = format!(" {hint}");
     let cwd = app.cwd().display().to_string();
-    f.render_widget(Paragraph::new(format!(" {hint}   {cwd}")).style(DIM), area);
+    // Only show the cwd when the hint leaves room for it.
+    if text.chars().count() + cwd.chars().count() + 3 <= area.width as usize {
+        text.push_str(&format!("   {cwd}"));
+    }
+    f.render_widget(Paragraph::new(text).style(DIM), area);
 }
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
@@ -229,6 +280,29 @@ fn render_picker(f: &mut Frame, app: &App) {
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     f.render_widget(Clear, area);
     f.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_confirm(f: &mut Frame, c: Confirm) {
+    let text = match c {
+        Confirm::CloseSession => "Close this session? Its transcript will be lost.",
+        Confirm::Quit => "An agent is mid-turn. Quit and stop it?",
+    };
+    let area = centered(f.area(), 56, 5);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Yellow))
+        .title(" confirm ");
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(text),
+            Line::from(""),
+            Line::styled("y / Enter yes   any other key no", DIM),
+        ])
+        .block(block)
+        .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn render_permission(f: &mut Frame, s: &Session) {
@@ -303,5 +377,14 @@ mod tests {
         assert!(screen.contains("› fix the bug"), "{screen}");
         assert!(screen.contains("on it"));
         assert!(screen.contains("Claude Code"));
+
+        app.sessions[0].status = Status::Running;
+        app.sessions[0].turn_started = Some(std::time::Instant::now());
+        term.draw(|f| render(f, &app)).unwrap();
+        assert!(dump(&term).contains("working… 0s"));
+
+        app.confirm = Some(Confirm::Quit);
+        term.draw(|f| render(f, &app)).unwrap();
+        assert!(dump(&term).contains("Quit and stop it?"));
     }
 }

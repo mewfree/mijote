@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use crate::agent::acp::{AcpClient, CancelHandle, Event, PermissionRequest, StopReason};
 use crate::agent::{install, AgentSpec};
@@ -63,6 +64,8 @@ pub struct Session {
     pub status: Status,
     pub pending: Option<PermissionRequest>,
     pub worktree: Option<Worktree>,
+    /// When the current turn started; `None` while not running.
+    pub turn_started: Option<Instant>,
     cancel: Option<CancelHandle>,
     cmd_tx: Sender<WorkerCmd>,
     perm_tx: Sender<Option<String>>,
@@ -103,6 +106,7 @@ impl Session {
             status: Status::Starting,
             pending: None,
             worktree: None,
+            turn_started: None,
             cancel: None,
             cmd_tx,
             perm_tx,
@@ -128,6 +132,7 @@ impl Session {
         }
         self.entries.push(Entry::User(text.clone()));
         self.status = Status::Running;
+        self.turn_started = Some(Instant::now());
         let _ = self.cmd_tx.send(WorkerCmd::Prompt(text));
     }
 
@@ -193,6 +198,7 @@ impl Session {
             }
             UiMsg::TurnDone(stop) => {
                 self.status = Status::Idle;
+                self.turn_started = None;
                 self.pending = None;
                 if stop != StopReason::EndTurn {
                     self.entries
@@ -201,6 +207,7 @@ impl Session {
             }
             UiMsg::Error(e) => {
                 self.status = Status::Failed;
+                self.turn_started = None;
                 self.pending = None;
                 self.entries.push(Entry::Notice(format!("error: {e}")));
             }

@@ -16,6 +16,13 @@ pub enum Mode {
     Picker,
 }
 
+/// A destructive action waiting for the user to confirm it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirm {
+    CloseSession,
+    Quit,
+}
+
 pub struct App {
     pub sessions: Vec<Session>,
     pub selected: usize,
@@ -27,6 +34,8 @@ pub struct App {
     /// Lines scrolled up from the bottom of the transcript (0 = follow).
     pub scroll: u16,
     pub should_quit: bool,
+    /// Action awaiting y/n; owns the keyboard while set.
+    pub confirm: Option<Confirm>,
     /// One-line notice shown in the status bar until the next key press.
     pub message: Option<String>,
     cwd: PathBuf,
@@ -46,6 +55,7 @@ impl App {
             picker_cursor: 0,
             scroll: 0,
             should_quit: false,
+            confirm: None,
             message: None,
             cwd,
             worktrees_root,
@@ -107,7 +117,7 @@ impl App {
                 Some(s) if matches!(s.status, Status::Running | Status::AwaitingPermission) => {
                     s.cancel()
                 }
-                _ => self.should_quit = true,
+                _ => self.request_quit(),
             }
             return;
         }
@@ -118,6 +128,15 @@ impl App {
         // A pending permission request owns the keyboard.
         if self.current().is_some_and(|s| s.pending.is_some()) {
             self.handle_permission_key(key);
+            return;
+        }
+        if let Some(action) = self.confirm.take() {
+            if matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) {
+                match action {
+                    Confirm::CloseSession => self.close_selected(),
+                    Confirm::Quit => self.should_quit = true,
+                }
+            }
             return;
         }
         match self.mode {
@@ -154,9 +173,9 @@ impl App {
 
     fn handle_normal(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('n') => self.open_picker(),
-            KeyCode::Char('d') => self.close_selected(),
+            KeyCode::Char('d') => self.request_close(),
             KeyCode::Char('i') | KeyCode::Enter => {
                 if !self.sessions.is_empty() {
                     self.mode = Mode::Insert;
@@ -167,12 +186,31 @@ impl App {
             KeyCode::PageUp => self.scroll = self.scroll.saturating_add(10),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::Char('G') | KeyCode::End => self.scroll = 0,
-            KeyCode::Esc => {
-                if let Some(s) = self.current_mut() {
-                    s.cancel();
-                }
-            }
             _ => {}
+        }
+    }
+
+    /// Quit now, or ask first when an agent is mid-turn.
+    fn request_quit(&mut self) {
+        let busy = self
+            .sessions
+            .iter()
+            .any(|s| matches!(s.status, Status::Running | Status::AwaitingPermission));
+        if busy {
+            self.confirm = Some(Confirm::Quit);
+        } else {
+            self.should_quit = true;
+        }
+    }
+
+    /// Close the selected session, asking first if it is running or has history.
+    fn request_close(&mut self) {
+        let Some(s) = self.current() else { return };
+        let busy = matches!(s.status, Status::Running | Status::AwaitingPermission);
+        if busy || !s.entries.is_empty() {
+            self.confirm = Some(Confirm::CloseSession);
+        } else {
+            self.close_selected();
         }
     }
 
@@ -349,6 +387,45 @@ mod tests {
         let (mut app, _) = app_with_session();
         app.handle_key(key(KeyCode::Char('q')));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn q_asks_before_quitting_a_running_turn() {
+        let (mut app, _) = app_with_session();
+        app.sessions[0].status = Status::Running;
+        app.handle_key(key(KeyCode::Char('q')));
+        assert!(!app.should_quit);
+        assert_eq!(app.confirm, Some(Confirm::Quit));
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(!app.should_quit && app.confirm.is_none());
+        app.handle_key(key(KeyCode::Char('q')));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn d_confirms_when_session_has_history() {
+        let (mut app, _) = app_with_session();
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.sessions.len(), 0);
+
+        let (mut app, _) = app_with_session();
+        app.sessions[0]
+            .entries
+            .push(crate::session::Entry::Agent("x".into()));
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.confirm, Some(Confirm::CloseSession));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(app.sessions.len(), 0);
+    }
+
+    #[test]
+    fn esc_in_normal_mode_does_not_cancel_the_turn() {
+        let (mut app, _) = app_with_session();
+        app.sessions[0].status = Status::Running;
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.sessions[0].status, Status::Running);
     }
 
     #[test]

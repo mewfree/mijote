@@ -50,6 +50,20 @@ Only PgUp/PgDn today; add half-page, =g=/=G=, =/= search.
 Don't auto-spawn: an agent must be chosen and spawning launches/installs an external CLI. Instead (1) with no sessions at startup, open the picker directly; (2) =i=/=Enter= with no sessions opens the picker (currently a silent no-op in =handle_normal=); (3) if =open_picker= yields exactly one agent, spawn it directly and skip the picker.
 ** DONE TUI: Ctrl-D quits
 =Ctrl-D= sets =should_quit= from any mode, ahead of the permission modal (same path as idle =Ctrl-C=). Conflicts with the planned =Ctrl-u/d= half-page scroll in the vim task; resolve there.
+** DONE TUI: working indicator
+Running turns show an animated spinner in the sidebar and a trailing =working… 12s= line in the transcript (=Session.turn_started=); a pending permission shows =waiting for your permission=. A long silent turn no longer looks hung.
+** DONE TUI: confirm destructive actions
+=q= (while any agent is mid-turn) and =d= (running or non-empty session) open a y/n confirm modal. Normal-mode =Esc= no longer cancels the turn; use =Ctrl-C=. =Ctrl-D= still quits immediately.
+** DONE TUI: context-aware status bar
+Key hints depend on state (idle, running, scrolled, insert, confirm); cwd is shown only when it fits.
+** TODO TUI: sidebar labels and attention
+Show branch/label per session so parallel sessions of one agent are distinguishable; loud highlight (and optional bell) when a background session needs permission or finishes.
+** TODO TUI: richer permission modal
+Show the command/path/diff from the request, =a=/=r= shortcuts, human option labels instead of raw kinds.
+** TODO TUI: picker shows install/login state
+Mark each agent installed / needs install / needs login.
+** TODO TUI: persistent notices and help overlay
+Keep transient messages visible a few seconds; =?= opens a key help overlay.
 ** TODO TUI: vim mode support
 Normal/Insert/Picker modes exist but the keys are ad hoc. Make it a real vim-style layer: motions and operators in the prompt (=h/l/w/b/0/$=, =x=, =dd=, =cw=, =u=), =a/A/I/o= to enter insert, =Ctrl-u/d= half-page in the transcript, =g=/=G=. Likely builds on the tui-textarea task; make it configurable (vim vs. plain) once config exists.
 ** TODO Parallel runs and cross-agent comparison
