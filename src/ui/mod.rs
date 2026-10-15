@@ -109,7 +109,10 @@ fn entry_lines(e: &Entry) -> Vec<Line<'static>> {
 
 fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
     let title = match app.current() {
-        Some(s) => format!(" {} ", s.spec.name),
+        Some(s) => match &s.worktree {
+            Some(w) => format!(" {} · {} ", s.spec.name, w.branch),
+            None => format!(" {} · (current directory) ", s.spec.name),
+        },
         None => " mijote ".to_string(),
     };
     let block = Block::default().borders(Borders::BOTTOM).title(title);
@@ -167,8 +170,17 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
+    if let Some(m) = &app.message {
+        f.render_widget(
+            Paragraph::new(format!(" {m}")).style(Style::new().fg(Color::Yellow)),
+            area,
+        );
+        return;
+    }
     let hint = match app.mode {
-        Mode::Normal => "n new  j/k switch  i prompt  Esc/^C cancel turn  PgUp/PgDn scroll  q quit",
+        Mode::Normal => {
+            "n new  d close  j/k switch  i prompt  Esc/^C cancel  PgUp/PgDn scroll  q quit"
+        }
         Mode::Insert => "Enter send  Esc normal  ^C cancel turn",
         Mode::Picker => "j/k move  Enter/1-9 choose  Esc close",
     };
@@ -275,7 +287,7 @@ mod tests {
     #[test]
     fn renders_empty_and_populated_states() {
         let (tx, _rx) = mpsc::channel();
-        let mut app = App::new(PathBuf::from("/work"), tx);
+        let mut app = App::new(PathBuf::from("/work"), PathBuf::from("/wt"), tx);
         let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
 
         term.draw(|f| render(f, &app)).unwrap();

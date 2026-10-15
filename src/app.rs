@@ -6,7 +6,8 @@ use std::sync::mpsc::Sender;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::agent::{self, AgentSpec};
-use crate::session::{Msg, Session, Status};
+use crate::session::{Msg, Session, Status, UiMsg};
+use crate::worktree::Worktree;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -26,13 +27,16 @@ pub struct App {
     /// Lines scrolled up from the bottom of the transcript (0 = follow).
     pub scroll: u16,
     pub should_quit: bool,
+    /// One-line notice shown in the status bar until the next key press.
+    pub message: Option<String>,
     cwd: PathBuf,
+    worktrees_root: PathBuf,
     ui_tx: Sender<Msg>,
     next_id: usize,
 }
 
 impl App {
-    pub fn new(cwd: PathBuf, ui_tx: Sender<Msg>) -> Self {
+    pub fn new(cwd: PathBuf, worktrees_root: PathBuf, ui_tx: Sender<Msg>) -> Self {
         Self {
             sessions: Vec::new(),
             selected: 0,
@@ -42,7 +46,9 @@ impl App {
             picker_cursor: 0,
             scroll: 0,
             should_quit: false,
+            message: None,
             cwd,
+            worktrees_root,
             ui_tx,
             next_id: 0,
         }
@@ -61,6 +67,10 @@ impl App {
     }
 
     pub fn handle_msg(&mut self, msg: Msg) {
+        if let UiMsg::Closed(text) = msg.body {
+            self.message = Some(text);
+            return;
+        }
         if let Some(s) = self.sessions.iter_mut().find(|s| s.id == msg.session) {
             s.apply(msg.body);
         }
@@ -69,10 +79,20 @@ impl App {
     pub fn open_session(&mut self, spec: &'static AgentSpec) {
         let id = self.next_id;
         self.next_id += 1;
+        let worktree = match Worktree::create(&self.cwd, &self.worktrees_root, spec.id) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                self.message = Some(format!(
+                    "no worktree ({e}); running in the current directory"
+                ));
+                None
+            }
+        };
         self.sessions.push(Session::spawn(
             id,
             spec,
             self.cwd.clone(),
+            worktree,
             self.ui_tx.clone(),
         ));
         self.selected = self.sessions.len() - 1;
@@ -81,6 +101,7 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        self.message = None;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             match self.current_mut() {
                 Some(s) if matches!(s.status, Status::Running | Status::AwaitingPermission) => {
@@ -131,6 +152,7 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('n') => self.open_picker(),
+            KeyCode::Char('d') => self.close_selected(),
             KeyCode::Char('i') | KeyCode::Enter => {
                 if !self.sessions.is_empty() {
                     self.mode = Mode::Insert;
@@ -212,6 +234,30 @@ impl App {
         }
     }
 
+    /// Close every session (used on quit). Returns how many `Closed`
+    /// notices to expect on the message channel.
+    pub fn close_all(&mut self) -> usize {
+        let n = self.sessions.len();
+        for s in self.sessions.drain(..) {
+            s.close(self.ui_tx.clone());
+        }
+        n
+    }
+
+    fn close_selected(&mut self) {
+        if self.selected >= self.sessions.len() {
+            return;
+        }
+        let s = self.sessions.remove(self.selected);
+        self.selected = self
+            .selected
+            .saturating_sub(1)
+            .min(self.sessions.len().saturating_sub(1));
+        self.scroll = 0;
+        self.message = Some(format!("closing {}…", s.spec.name));
+        s.close(self.ui_tx.clone());
+    }
+
     fn select(&mut self, delta: isize) {
         let n = self.sessions.len();
         if n == 0 {
@@ -235,7 +281,7 @@ mod tests {
 
     fn app_with_session() -> (App, std::sync::mpsc::Receiver<Option<String>>) {
         let (tx, _rx) = mpsc::channel();
-        let mut app = App::new(PathBuf::from("."), tx);
+        let mut app = App::new(PathBuf::from("."), PathBuf::from("."), tx);
         let (s, perm_rx) = Session::detached(0, agent::find("claude").unwrap());
         app.sessions.push(s);
         app.sessions[0].status = Status::Idle;
@@ -282,6 +328,16 @@ mod tests {
         assert!(!app.should_quit);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(perm_rx.try_recv().unwrap(), Some("no".into()));
+    }
+
+    #[test]
+    fn closed_notice_sets_status_message() {
+        let (mut app, _) = app_with_session();
+        app.handle_msg(Msg {
+            session: 7,
+            body: UiMsg::Closed("done".into()),
+        });
+        assert_eq!(app.message.as_deref(), Some("done"));
     }
 
     #[test]

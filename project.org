@@ -28,16 +28,22 @@ Pinned versions drift. Add =mijote update= (or a version check) and decide how t
 For CLIs without ACP (=claude -p --output-format stream-json=, =codex exec --json=).
 ** TODO Session model and persistence
 Task -> session(s) -> transcript, stored under the XDG data dir.
-** TODO Git worktree per task
-Create/cleanup worktrees; branch naming; never touch the user's main checkout.
+** DONE Git worktree per task
+=src/worktree.rs=: each session gets branch =mijote/<agent>-<n>= in a worktree under =$MIJOTE_HOME/worktrees/<repo>/=, based on the repo's =HEAD=. Outside a git repo (or with no commits) the session falls back to the current directory with a notice. On =d= close or quit, an untouched worktree and branch are deleted; one with changes or commits is kept and reported. Shells out to =git=. Verified in a pty against a real repo.
+** TODO Worktrees: review and merge flow
+Show the session branch's diff/commits in the TUI; actions to merge, cherry-pick, open a PR, or discard. Today kept branches are only reported on close.
+** TODO Worktrees: start from the dirty tree (optional)
+Worktrees branch from =HEAD=, so uncommitted work in the main checkout is invisible to the agent. Offer =git stash create= as the base, or warn when the main tree is dirty.
+** TODO Worktrees: crash cleanup and hung agents
+A crashed mijote leaves worktrees behind (=mijote cleanup= / =git worktree prune=). Closing waits for the agent thread; a hung agent keeps its worktree (safe, but never reported).
 ** DONE TUI shell (ratatui)
 Sidebar of sessions, transcript pane, prompt line, permission modal, new-session picker (=n=). One worker thread per session owns its ACP client; =session/cancel= goes through a =CancelHandle= so it works mid-turn. Files: =src/app.rs= (state, keys), =src/ui/mod.rs= (rendering), =src/session.rs= (model + worker). Verified in a pty against a real Claude turn.
 ** TODO TUI: multi-line input and editing
 Prompt box is single-line, append-only. Use tui-textarea (as rugit does): cursor movement, multi-line, paste.
 ** TODO TUI: markdown rendering and tool call detail
 Render agent markdown/code blocks; expand tool call content and diffs (=tool_call_update.content=).
-** TODO TUI: close/rename sessions, per-session cwd
-=d= to close a session (kills the agent); show the cwd/branch per session. Pairs with the worktree task.
+** TODO TUI: rename sessions, show worktree state
+=d= closes (done); still want rename, and live dirty/ahead counts per session in the sidebar.
 ** TODO TUI: transcript scrolling and search
 Only PgUp/PgDn today; add half-page, =g=/=G=, =/= search.
 ** TODO TUI: open the picker when there is no session

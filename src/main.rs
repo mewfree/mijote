@@ -2,6 +2,7 @@ mod agent;
 mod app;
 mod session;
 mod ui;
+mod worktree;
 
 use std::io::Write;
 
@@ -134,7 +135,11 @@ fn tui() -> Result<()> {
     use crossterm::event::{self, Event as TermEvent, KeyEventKind};
 
     let (tx, rx) = mpsc::channel();
-    let mut app = app::App::new(std::env::current_dir()?, tx);
+    let mut app = app::App::new(
+        std::env::current_dir()?,
+        agent::install::data_dir().join("worktrees"),
+        tx,
+    );
     let mut terminal = ratatui::init();
     let result = (|| -> Result<()> {
         while !app.should_quit {
@@ -153,5 +158,21 @@ fn tui() -> Result<()> {
         Ok(())
     })();
     ratatui::restore();
+
+    // Stop agents and release untouched worktrees; report what was kept.
+    let mut pending = app.close_all();
+    while pending > 0 {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(session::Msg {
+                body: session::UiMsg::Closed(text),
+                ..
+            }) => {
+                println!("{text}");
+                pending -= 1;
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
     result
 }

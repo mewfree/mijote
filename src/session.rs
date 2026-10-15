@@ -3,10 +3,11 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use crate::agent::acp::{AcpClient, CancelHandle, Event, PermissionRequest, StopReason};
 use crate::agent::{install, AgentSpec};
+use crate::worktree::{Released, Worktree};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
@@ -39,6 +40,9 @@ pub enum UiMsg {
     Permission(PermissionRequest),
     TurnDone(StopReason),
     Error(String),
+    /// A closed session finished shutting down (agent stopped, worktree
+    /// released). Delivered after the session is gone from the UI.
+    Closed(String),
 }
 
 #[derive(Debug)]
@@ -58,19 +62,32 @@ pub struct Session {
     pub entries: Vec<Entry>,
     pub status: Status,
     pub pending: Option<PermissionRequest>,
+    pub worktree: Option<Worktree>,
     cancel: Option<CancelHandle>,
     cmd_tx: Sender<WorkerCmd>,
     perm_tx: Sender<Option<String>>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl Session {
     /// Start a session; the agent is installed (if needed) and launched on a
-    /// worker thread, reporting back through `ui_tx`.
-    pub fn spawn(id: usize, spec: &'static AgentSpec, cwd: PathBuf, ui_tx: Sender<Msg>) -> Self {
+    /// worker thread, reporting back through `ui_tx`. The agent runs in the
+    /// worktree if there is one, else in `cwd`.
+    pub fn spawn(
+        id: usize,
+        spec: &'static AgentSpec,
+        cwd: PathBuf,
+        worktree: Option<Worktree>,
+        ui_tx: Sender<Msg>,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (perm_tx, perm_rx) = mpsc::channel();
-        thread::spawn(move || worker(id, spec, cwd, ui_tx, cmd_rx, perm_rx));
-        Self::new(id, spec, cmd_tx, perm_tx)
+        let dir = worktree.as_ref().map_or(cwd, |w| w.path.clone());
+        let handle = thread::spawn(move || worker(id, spec, dir, ui_tx, cmd_rx, perm_rx));
+        let mut s = Self::new(id, spec, cmd_tx, perm_tx);
+        s.worktree = worktree;
+        s.thread = Some(handle);
+        s
     }
 
     fn new(
@@ -85,9 +102,11 @@ impl Session {
             entries: Vec::new(),
             status: Status::Starting,
             pending: None,
+            worktree: None,
             cancel: None,
             cmd_tx,
             perm_tx,
+            thread: None,
         }
     }
 
@@ -132,8 +151,37 @@ impl Session {
         }
     }
 
+    /// Stop the agent, then release the worktree (on a background thread, so
+    /// the UI never waits). Reports back with `UiMsg::Closed`.
+    pub fn close(mut self, ui_tx: Sender<Msg>) {
+        self.cancel();
+        let _ = self.cmd_tx.send(WorkerCmd::Quit);
+        let id = self.id;
+        let thread = self.thread.take();
+        let worktree = self.worktree.take();
+        let name = self.spec.name;
+        thread::spawn(move || {
+            if let Some(t) = thread {
+                let _ = t.join();
+            }
+            let msg = match worktree.map(|w| w.release()) {
+                None => format!("{name} session closed"),
+                Some(Ok(Released::Removed)) => format!("{name} session closed (no changes)"),
+                Some(Ok(Released::Kept { path, branch })) => {
+                    format!("{name} session closed; kept {branch} at {}", path.display())
+                }
+                Some(Err(e)) => format!("{name} session closed; worktree cleanup failed: {e}"),
+            };
+            let _ = ui_tx.send(Msg {
+                session: id,
+                body: UiMsg::Closed(msg),
+            });
+        });
+    }
+
     pub fn apply(&mut self, body: UiMsg) {
         match body {
+            UiMsg::Closed(_) => {}
             UiMsg::Ready(handle) => {
                 self.cancel = Some(handle);
                 self.status = Status::Idle;
