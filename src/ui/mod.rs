@@ -364,7 +364,12 @@ mod tests {
     #[test]
     fn renders_empty_and_populated_states() {
         let (tx, _rx) = mpsc::channel();
-        let mut app = App::new(PathBuf::from("/work"), PathBuf::from("/wt"), tx);
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
         let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
 
         term.draw(|f| render(f, &app)).unwrap();

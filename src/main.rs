@@ -1,6 +1,7 @@
 mod agent;
 mod app;
 mod session;
+mod store;
 mod ui;
 mod worktree;
 
@@ -138,8 +139,10 @@ fn tui() -> Result<()> {
     let mut app = app::App::new(
         std::env::current_dir()?,
         agent::install::data_dir().join("worktrees"),
+        store::Store::new(agent::install::data_dir().join("sessions")),
         tx,
     );
+    app.restore();
     let mut terminal = ratatui::init();
     let result = (|| -> Result<()> {
         while !app.should_quit {

@@ -26,8 +26,12 @@ Exercise =codex-acp= (needs Codex login or API key). Antigravity stays manual (B
 Pinned versions drift. Add =mijote update= (or a version check) and decide how to handle a missing Node (download a managed runtime?).
 ** TODO Stream-JSON fallback transport (only if an agent lacks an ACP adapter)
 For CLIs without ACP (=claude -p --output-format stream-json=, =codex exec --json=).
-** TODO Session model and persistence
-Task -> session(s) -> transcript, stored under the XDG data dir.
+** DONE Session persistence
+=src/store.rs=: one JSON record per session under =$MIJOTE_HOME/sessions/= (agent, cwd, worktree, transcript), written atomically after each prompt and turn end and on quit. On start, records for the current directory are reopened with a fresh agent behind the old transcript (a notice says the agent does not remember it). Closing with =d= deletes the record; quitting keeps it. A missing worktree falls back to the current directory.
+** TODO Resume agent context on restore
+Persisted sessions restart the agent cold. Store the ACP session id and use =session/load= when the agent advertises =loadSession=. Also: restored sessions spawn their agents eagerly at startup; make that lazy (first prompt) so reopening many sessions does not launch many CLIs.
+** TODO Session model: tasks and history browser
+Task -> session(s) grouping, and a way to list and reopen records saved from other directories or closed sessions.
 ** DONE Git worktree per task
 =src/worktree.rs=: each session gets branch =mijote/<agent>-<n>= in a worktree under =$MIJOTE_HOME/worktrees/<repo>/=, based on the repo's =HEAD=. Outside a git repo (or with no commits) the session falls back to the current directory with a notice. On =d= close or quit, an untouched worktree and branch are deleted; one with changes or commits is kept and reported. Shells out to =git=. Verified in a pty against a real repo.
 ** DONE Worktrees: optional

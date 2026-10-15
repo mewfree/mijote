@@ -6,11 +6,14 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
+
 use crate::agent::acp::{AcpClient, CancelHandle, Event, PermissionRequest, StopReason};
 use crate::agent::{install, AgentSpec};
+use crate::store::{self, Record};
 use crate::worktree::{Released, Worktree};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Entry {
     User(String),
     Agent(String),
@@ -59,6 +62,8 @@ enum WorkerCmd {
 
 pub struct Session {
     pub id: usize,
+    /// Key of this session's on-disk record (see `store`).
+    pub key: String,
     pub spec: &'static AgentSpec,
     pub entries: Vec<Entry>,
     pub status: Status,
@@ -101,6 +106,7 @@ impl Session {
     ) -> Self {
         Self {
             id,
+            key: store::new_key(spec.id),
             spec,
             entries: Vec::new(),
             status: Status::Starting,
@@ -120,6 +126,16 @@ impl Session {
         let (cmd_tx, _cmd_rx) = mpsc::channel();
         let (perm_tx, perm_rx) = mpsc::channel();
         (Self::new(id, spec, cmd_tx, perm_tx), perm_rx)
+    }
+
+    /// What to persist for this session.
+    pub fn record(&self, cwd: &std::path::Path) -> Record {
+        Record {
+            agent: self.spec.id.to_string(),
+            cwd: cwd.to_path_buf(),
+            worktree: self.worktree.clone(),
+            entries: self.entries.clone(),
+        }
     }
 
     pub fn can_prompt(&self) -> bool {

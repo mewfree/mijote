@@ -8,6 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorktreeError {
     #[error("{0} is not inside a git repository")]
@@ -20,7 +22,7 @@ pub enum WorktreeError {
     Io(#[from] std::io::Error),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Worktree {
     pub path: PathBuf,
     pub branch: String,

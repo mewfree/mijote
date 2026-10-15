@@ -6,7 +6,8 @@ use std::sync::mpsc::Sender;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::agent::{self, AgentSpec};
-use crate::session::{Msg, Session, Status, UiMsg};
+use crate::session::{Entry, Msg, Session, Status, UiMsg};
+use crate::store::Store;
 use crate::worktree::Worktree;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,12 +44,13 @@ pub struct App {
     pub message: Option<String>,
     cwd: PathBuf,
     worktrees_root: PathBuf,
+    store: Store,
     ui_tx: Sender<Msg>,
     next_id: usize,
 }
 
 impl App {
-    pub fn new(cwd: PathBuf, worktrees_root: PathBuf, ui_tx: Sender<Msg>) -> Self {
+    pub fn new(cwd: PathBuf, worktrees_root: PathBuf, store: Store, ui_tx: Sender<Msg>) -> Self {
         Self {
             sessions: Vec::new(),
             selected: 0,
@@ -63,6 +65,7 @@ impl App {
             message: None,
             cwd,
             worktrees_root,
+            store,
             ui_tx,
             next_id: 0,
         }
@@ -85,8 +88,55 @@ impl App {
             self.message = Some(text);
             return;
         }
+        let settled = matches!(msg.body, UiMsg::TurnDone(_) | UiMsg::Error(_));
         if let Some(s) = self.sessions.iter_mut().find(|s| s.id == msg.session) {
             s.apply(msg.body);
+            if settled {
+                self.persist(msg.session);
+            }
+        }
+    }
+
+    /// Write one session's record. A failure is shown, never fatal.
+    fn persist(&mut self, id: usize) {
+        let Some(s) = self.sessions.iter().find(|s| s.id == id) else {
+            return;
+        };
+        if s.entries.is_empty() {
+            return;
+        }
+        if let Err(e) = self.store.save(&s.key, &s.record(&self.cwd)) {
+            self.message = Some(format!("could not save session: {e}"));
+        }
+    }
+
+    /// Reopen sessions saved for this directory. Each gets a fresh agent
+    /// behind its old transcript; the agent does not remember it.
+    pub fn restore(&mut self) {
+        for (key, rec) in self.store.load(&self.cwd) {
+            let Some(spec) = agent::find(&rec.agent) else {
+                continue;
+            };
+            let mut note =
+                "restored from a previous run; the agent does not remember it".to_string();
+            let worktree = match rec.worktree {
+                Some(w) if w.path.is_dir() => Some(w),
+                Some(w) => {
+                    note.push_str(&format!(
+                        "; worktree {} is gone, running in the current directory",
+                        w.path.display()
+                    ));
+                    None
+                }
+                None => None,
+            };
+            let id = self.next_id;
+            self.next_id += 1;
+            let mut s = Session::spawn(id, spec, self.cwd.clone(), worktree, self.ui_tx.clone());
+            s.key = key;
+            s.entries = rec.entries;
+            s.entries.push(Entry::Notice(note));
+            self.sessions.push(s);
         }
     }
 
@@ -231,12 +281,17 @@ impl App {
                 if text.is_empty() {
                     return;
                 }
+                let mut sent = None;
                 if let Some(s) = self.current_mut() {
                     if s.can_prompt() {
                         s.send_prompt(text);
-                        self.input.clear();
-                        self.scroll = 0;
+                        sent = Some(s.id);
                     }
+                }
+                if let Some(id) = sent {
+                    self.input.clear();
+                    self.scroll = 0;
+                    self.persist(id);
                 }
             }
             KeyCode::Backspace => {
@@ -290,6 +345,10 @@ impl App {
     /// notices to expect on the message channel.
     pub fn close_all(&mut self) -> usize {
         let n = self.sessions.len();
+        // Save everything first: records are what `restore` reopens.
+        for i in 0..n {
+            self.persist(self.sessions[i].id);
+        }
         for s in self.sessions.drain(..) {
             s.close(self.ui_tx.clone());
         }
@@ -301,6 +360,7 @@ impl App {
             return;
         }
         let s = self.sessions.remove(self.selected);
+        self.store.remove(&s.key);
         self.selected = self
             .selected
             .saturating_sub(1)
@@ -333,7 +393,8 @@ mod tests {
 
     fn app_with_session() -> (App, std::sync::mpsc::Receiver<Option<String>>) {
         let (tx, _rx) = mpsc::channel();
-        let mut app = App::new(PathBuf::from("."), PathBuf::from("."), tx);
+        let store = Store::new(tempfile::tempdir().unwrap().keep());
+        let mut app = App::new(PathBuf::from("."), PathBuf::from("."), store, tx);
         let (s, perm_rx) = Session::detached(0, agent::find("claude").unwrap());
         app.sessions.push(s);
         app.sessions[0].status = Status::Idle;
@@ -428,6 +489,27 @@ mod tests {
         assert_eq!(app.confirm, Some(Confirm::CloseSession));
         app.handle_key(key(KeyCode::Char('y')));
         assert_eq!(app.sessions.len(), 0);
+    }
+
+    #[test]
+    fn transcripts_persist_and_closing_forgets_them() {
+        let (mut app, _) = app_with_session();
+        app.sessions[0].key = "k".into();
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::Event(crate::agent::acp::Event::AgentText("hi".into())),
+        });
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::TurnDone(crate::agent::acp::StopReason::EndTurn),
+        });
+        let saved = app.store.load(app.cwd());
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].1.entries, vec![Entry::Agent("hi".into())]);
+
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(app.store.load(app.cwd()).is_empty());
     }
 
     #[test]
