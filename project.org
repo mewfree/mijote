@@ -54,8 +54,10 @@ Sidebar of sessions, transcript pane, prompt line, permission modal, new-session
 =src/ui/mod.rs= only. Palette constants (ANSI accent, one 256-colour grey); sidebar of two-row session cards (status glyph, agent, branch or live state, accent bar on the selection) with a wordmark and key footer; header strip with agent, branch and status; transcript without a box, hand-wrapped so every line keeps its gutter (user =▎=, thoughts =┊=, code fences =▏=, tool calls =✓ ✗ ○= grouped without gaps); rounded prompt box with placeholder; NORMAL/INSERT/PICK badge and bold-key hints in the status bar; rounded modals with hints on the bottom edge; welcome screen. =locate= follows the new geometry (cards are 2 rows, 2-row head).
 ** TODO TUI: multi-line input and editing
 Prompt box is single-line, append-only. Use tui-textarea (as rugit does): cursor movement, multi-line, paste.
-** TODO TUI: markdown rendering and tool call detail
-Render agent markdown/code blocks; expand tool call content and diffs (=tool_call_update.content=).
+** DONE TUI: markdown rendering
+Agent messages render through =ui/markdown.rs= (pulldown-cmark): headings, bold/italic/strikethrough, inline and fenced code, bullet/numbered/task lists, block quotes, rules, links (destination shown after the text). Wrapped to the transcript width with hanging indents. Tables and syntax highlighting are not handled; tables show as plain text.
+** TODO TUI: tool call detail
+Expand tool call content and diffs (=tool_call_update.content=).
 ** TODO TUI: rename sessions, show worktree state
 =d= closes (done); still want rename, and live dirty/ahead counts per session in the sidebar.
 ** DONE TUI: mouse mode

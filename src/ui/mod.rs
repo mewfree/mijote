@@ -8,6 +8,8 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
+mod markdown;
+
 use crate::app::{App, Confirm, Mode};
 use crate::session::{Entry, Session, Status};
 
@@ -347,22 +349,10 @@ fn transcript_lines(s: &Session, width: usize) -> Vec<Line<'static>> {
         match e {
             Entry::User(t) => out.extend(prose(t, "  ▎ ", Style::new().fg(ACCENT), BOLD)),
             Entry::Agent(t) => {
-                let mut in_code = false;
-                for raw in t.lines() {
-                    if raw.trim_start().starts_with("```") {
-                        in_code = !in_code;
-                        continue;
-                    }
-                    if in_code {
-                        for l in wrap_code(raw, body) {
-                            out.push(Line::from(vec![
-                                Span::styled("  ▏ ", DIM),
-                                Span::styled(l, Style::new().fg(CODE_FG)),
-                            ]));
-                        }
-                    } else {
-                        out.extend(prose(raw, "    ", Style::new(), Style::new()));
-                    }
+                for l in markdown::render(t, body) {
+                    let mut spans = vec![Span::raw("    ")];
+                    spans.extend(l.spans);
+                    out.push(Line::from(spans));
                 }
             }
             Entry::Thought(t) => {
