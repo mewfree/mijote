@@ -15,15 +15,14 @@ Early scaffold. See =project.org= for the plan.
 * build
 
 #+begin_src sh
-cargo build
-cargo run -- agents
+make run ARGS=agents
+make test
 #+end_src
 
 * design
 
 - *orchestrator*: the agent loop, tools and model access
   stay in the vendor CLIs.
-- *transport*: Agent Client Protocol (ACP) over stdio where available, the
-  CLI's streaming JSON output otherwise.
+- *transport*: Agent Client Protocol (ACP) over stdio, via each agent's native flag or adapter.
 - *isolation*: one git worktree per task, so agents never step on each other.
 - *ux*: ratatui TUI, keyboard first.
