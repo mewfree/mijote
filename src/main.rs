@@ -18,6 +18,11 @@ struct Cli {
 enum Command {
     /// List known agent backends and whether they are on PATH
     Agents,
+    /// Install an agent's ACP adapter into mijote's data dir
+    Install {
+        /// Agent id (see `mijote agents`)
+        agent: String,
+    },
     /// Send one prompt to an agent over ACP and stream the reply
     Ask {
         /// Agent id (see `mijote agents`)
@@ -30,13 +35,14 @@ enum Command {
 fn main() -> Result<()> {
     match Cli::parse().command.unwrap_or(Command::Agents) {
         Command::Agents => list_agents(),
+        Command::Install { agent } => install(&agent),
         Command::Ask { agent, prompt } => ask(&agent, &prompt),
     }
 }
 
 fn list_agents() -> Result<()> {
     for spec in agent::KNOWN {
-        let found = match agent::which(spec.bin) {
+        let found = match agent::install::locate(spec) {
             Some(p) => p.display().to_string(),
             None => "(not found)".to_string(),
         };
@@ -49,12 +55,30 @@ fn list_agents() -> Result<()> {
     Ok(())
 }
 
-fn ask(id: &str, prompt: &str) -> Result<()> {
+fn resolve(id: &str) -> Result<(&'static agent::AgentSpec, std::path::PathBuf)> {
     let Some(spec) = agent::find(id) else {
         bail!("unknown agent `{id}` (try `mijote agents`)");
     };
+    if agent::install::locate(spec).is_none() {
+        eprintln!(
+            "installing {} adapter into {}...",
+            spec.name,
+            agent::install::data_dir().display()
+        );
+    }
+    Ok((spec, agent::install::ensure(spec)?))
+}
+
+fn install(id: &str) -> Result<()> {
+    let (spec, program) = resolve(id)?;
+    println!("{} ready: {}", spec.name, program.display());
+    Ok(())
+}
+
+fn ask(id: &str, prompt: &str) -> Result<()> {
+    let (spec, program) = resolve(id)?;
     let cwd = std::env::current_dir()?;
-    let mut client = AcpClient::spawn(spec.bin, spec.args, &cwd)
+    let mut client = AcpClient::spawn(&program.to_string_lossy(), spec.args, &cwd)
         .with_context(|| format!("starting {}", spec.name))?;
     let name = client.initialize()?;
     eprintln!("connected to {name}");

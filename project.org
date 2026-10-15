@@ -18,8 +18,12 @@ Community adapter =antigravity-acp= wraps the =agy= CLI over ACP. Works technica
 =session/new= against gemini fails with 401 until the CLI is logged in. Handle =authMethods= from =initialize= and call =authenticate=, or surface a clear "log in with the CLI first" message.
 ** TODO ACP: cancel, load/resume, set_mode
 =session/cancel= needs a non-blocking prompt loop (comes with the TUI event loop). Then =session/load= and =session/set_mode=.
-** TODO ACP: verify adapters end to end
-Install and exercise =claude-agent-acp=, =codex-acp= and =antigravity-acp= (needs Bun or a prebuilt binary + =agy=). Antigravity: Google's ToS prohibits third-party access with personal accounts; prefer Vertex/AI Studio keys.
+** DONE Managed adapter install
+=src/agent/install.rs=: resolves an agent binary from PATH or =$MIJOTE_HOME= (default =~/.local/share/mijote=), otherwise =npm install --prefix= of a pinned adapter version (claude: =@agentclientprotocol/claude-agent-acp=, codex: =@agentclientprotocol/codex-acp=). =mijote install <agent>= does it explicitly; =mijote ask= does it on first use. Requires Node/npm. Verified: =mijote ask claude= completes a real turn.
+** TODO Verify codex and antigravity end to end
+Exercise =codex-acp= (needs Codex login or API key). Antigravity stays manual (Bun or prebuilt binary + =agy=); Google's ToS prohibits third-party access with personal accounts.
+** TODO Adapter updates
+Pinned versions drift. Add =mijote update= (or a version check) and decide how to handle a missing Node (download a managed runtime?).
 ** TODO Stream-JSON fallback transport (only if an agent lacks an ACP adapter)
 For CLIs without ACP (=claude -p --output-format stream-json=, =codex exec --json=).
 ** TODO Session model and persistence
