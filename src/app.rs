@@ -1,5 +1,6 @@
 //! TUI application state and key handling. No rendering here.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
@@ -42,6 +43,9 @@ pub struct App {
     pub model_cursor: usize,
     /// Lines scrolled up from the bottom of the transcript (0 = follow).
     pub scroll: u16,
+    /// Largest useful `scroll`, reported by the last render so scrolling
+    /// stops at the top instead of piling up invisible overscroll.
+    pub max_scroll: Cell<u16>,
     pub should_quit: bool,
     /// Whether the terminal reports mouse events (`m` toggles; off lets the
     /// terminal select text natively).
@@ -69,6 +73,7 @@ impl App {
             picker_isolated: true,
             model_cursor: 0,
             scroll: 0,
+            max_scroll: Cell::new(u16::MAX),
             should_quit: false,
             mouse: true,
             confirm: None,
@@ -234,9 +239,7 @@ impl App {
         }
         let region = ui::locate(area, ev.column, ev.row);
         match ev.kind {
-            MouseEventKind::ScrollUp if region != Region::Other => {
-                self.scroll = self.scroll.saturating_add(3)
-            }
+            MouseEventKind::ScrollUp if region != Region::Other => self.scroll_up(3),
             MouseEventKind::ScrollDown if region != Region::Other => {
                 self.scroll = self.scroll.saturating_sub(3)
             }
@@ -302,13 +305,22 @@ impl App {
                     self.mode = Mode::Insert;
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => self.select(1),
-            KeyCode::Char('k') | KeyCode::Up => self.select(-1),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(10),
+            KeyCode::Char('j') => self.select(1),
+            KeyCode::Char('k') => self.select(-1),
+            // Terminals without mouse capture turn the wheel into arrow
+            // keys on the alternate screen, so arrows scroll the transcript.
+            KeyCode::Up => self.scroll_up(3),
+            KeyCode::Down => self.scroll = self.scroll.saturating_sub(3),
+            KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
+            KeyCode::Char('g') | KeyCode::Home => self.scroll = self.max_scroll.get(),
             KeyCode::Char('G') | KeyCode::End => self.scroll = 0,
             _ => {}
         }
+    }
+
+    fn scroll_up(&mut self, n: u16) {
+        self.scroll = self.scroll.saturating_add(n).min(self.max_scroll.get());
     }
 
     /// Quit now, or ask first when an agent is mid-turn.
@@ -360,6 +372,8 @@ impl App {
                     self.persist(id);
                 }
             }
+            KeyCode::PageUp => self.scroll_up(10),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::Backspace => {
                 self.input.pop();
             }

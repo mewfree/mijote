@@ -465,6 +465,7 @@ fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
     lines.extend(activity_line(s));
     let total = lines.len() as u16;
     let max_scroll = total.saturating_sub(inner.height);
+    app.max_scroll.set(max_scroll);
     let from_top = max_scroll.saturating_sub(app.scroll.min(max_scroll));
     f.render_widget(Paragraph::new(lines).scroll((from_top, 0)), inner);
 }

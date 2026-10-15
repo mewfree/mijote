@@ -61,7 +61,7 @@ Render agent markdown/code blocks; expand tool call content and diffs (=tool_cal
 ** DONE TUI: mouse mode
 Mouse capture is on by default: wheel scrolls the transcript, a click on a sidebar row selects that session, a click on the prompt box enters insert mode. =m= (normal mode) toggles capture off so the terminal's own text selection works. Hit-testing lives in =ui::locate= beside the layout; modals (picker, permission, confirm) ignore the mouse.
 ** TODO TUI: transcript scrolling and search
-Only PgUp/PgDn today; add half-page, =g=/=G=, =/= search.
+PgUp/PgDn (also in insert mode), =g=/Home top, =G=/End follow, wheel; scroll clamps to the transcript. Still want half-page and =/= search.
 ** TODO TUI: open the picker when there is no session
 Don't auto-spawn: an agent must be chosen and spawning launches/installs an external CLI. Instead (1) with no sessions at startup, open the picker directly; (2) =i=/=Enter= with no sessions opens the picker (currently a silent no-op in =handle_normal=); (3) if =open_picker= yields exactly one agent, spawn it directly and skip the picker.
 ** DONE TUI: Ctrl-D quits
