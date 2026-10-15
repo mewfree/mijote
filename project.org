@@ -40,6 +40,10 @@ Render agent markdown/code blocks; expand tool call content and diffs (=tool_cal
 =d= to close a session (kills the agent); show the cwd/branch per session. Pairs with the worktree task.
 ** TODO TUI: transcript scrolling and search
 Only PgUp/PgDn today; add half-page, =g=/=G=, =/= search.
+** TODO TUI: open the picker when there is no session
+Don't auto-spawn: an agent must be chosen and spawning launches/installs an external CLI. Instead (1) with no sessions at startup, open the picker directly; (2) =i=/=Enter= with no sessions opens the picker (currently a silent no-op in =handle_normal=); (3) if =open_picker= yields exactly one agent, spawn it directly and skip the picker.
+** TODO TUI: vim mode support
+Normal/Insert/Picker modes exist but the keys are ad hoc. Make it a real vim-style layer: motions and operators in the prompt (=h/l/w/b/0/$=, =x=, =dd=, =cw=, =u=), =a/A/I/o= to enter insert, =Ctrl-u/d= half-page in the transcript, =g=/=G=. Likely builds on the tui-textarea task; make it configurable (vim vs. plain) once config exists.
 ** TODO Parallel runs and cross-agent comparison
 Same prompt to N agents, compare resulting diffs.
 ** TODO Config (=~/.config/mijote/config.toml=)
