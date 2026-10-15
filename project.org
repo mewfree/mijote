@@ -50,6 +50,8 @@ Prompt box is single-line, append-only. Use tui-textarea (as rugit does): cursor
 Render agent markdown/code blocks; expand tool call content and diffs (=tool_call_update.content=).
 ** TODO TUI: rename sessions, show worktree state
 =d= closes (done); still want rename, and live dirty/ahead counts per session in the sidebar.
+** DONE TUI: mouse mode
+Mouse capture is on by default: wheel scrolls the transcript, a click on a sidebar row selects that session, a click on the prompt box enters insert mode. =m= (normal mode) toggles capture off so the terminal's own text selection works. Hit-testing lives in =ui::locate= beside the layout; modals (picker, permission, confirm) ignore the mouse.
 ** TODO TUI: transcript scrolling and search
 Only PgUp/PgDn today; add half-page, =g=/=G=, =/= search.
 ** TODO TUI: open the picker when there is no session

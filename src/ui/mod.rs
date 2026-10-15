@@ -11,17 +11,57 @@ use crate::session::{Entry, Session, Status};
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 
-pub fn render(f: &mut Frame, app: &App) {
+/// Screen areas: sidebar, transcript, prompt box, status bar. Shared by
+/// rendering and mouse hit-testing so they cannot drift apart.
+fn layout(area: Rect) -> [Rect; 4] {
     let [side, main] =
-        Layout::horizontal([Constraint::Length(28), Constraint::Min(30)]).areas(f.area());
-    render_sidebar(f, app, side);
-
+        Layout::horizontal([Constraint::Length(28), Constraint::Min(30)]).areas(area);
     let [transcript, input, status] = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(3),
         Constraint::Length(1),
     ])
     .areas(main);
+    [side, transcript, input, status]
+}
+
+fn sidebar_block() -> Block<'static> {
+    Block::default().borders(Borders::RIGHT).title(" sessions ")
+}
+
+/// What is under a mouse position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Region {
+    /// A row of the session list (may be past the last session).
+    Session(usize),
+    Transcript,
+    Input,
+    Other,
+}
+
+/// Map a terminal cell to the region it falls in, for a terminal of `area`.
+pub fn locate(area: Rect, col: u16, row: u16) -> Region {
+    let [side, transcript, input, _] = layout(area);
+    let at = |r: Rect| r.contains((col, row).into());
+    if at(side) {
+        let inner = sidebar_block().inner(side);
+        if at(inner) {
+            return Region::Session((row - inner.y) as usize);
+        }
+        return Region::Other;
+    }
+    if at(transcript) {
+        Region::Transcript
+    } else if at(input) {
+        Region::Input
+    } else {
+        Region::Other
+    }
+}
+
+pub fn render(f: &mut Frame, app: &App) {
+    let [side, transcript, input, status] = layout(f.area());
+    render_sidebar(f, app, side);
     render_transcript(f, app, transcript);
     render_input(f, app, input);
     render_status(f, app, status);
@@ -88,7 +128,7 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
         state.select(Some(app.selected));
     }
     let list = List::new(items)
-        .block(Block::default().borders(Borders::RIGHT).title(" sessions "))
+        .block(sidebar_block())
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, area, &mut state);
 }
@@ -226,7 +266,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         Mode::Normal if app.scroll > 0 => "G follow  PgUp/PgDn scroll  i prompt  n new  q quit",
         Mode::Normal if busy => "^C cancel turn  j/k switch  PgUp/PgDn scroll  n new  q quit",
         Mode::Normal => {
-            "i prompt  n new  N new here  d close  j/k switch  PgUp/PgDn scroll  q quit"
+            "i prompt  n new  N new here  d close  j/k switch  PgUp/PgDn scroll  m mouse  q quit"
         }
         Mode::Insert if busy => "Enter sends when idle  ^C cancel turn  Esc normal",
         Mode::Insert => "Enter send  Esc normal  ^C quit",

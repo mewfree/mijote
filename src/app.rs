@@ -3,11 +3,13 @@
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 
 use crate::agent::{self, AgentSpec};
 use crate::session::{Entry, Msg, Session, Status, UiMsg};
 use crate::store::Store;
+use crate::ui::{self, Region};
 use crate::worktree::Worktree;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +40,9 @@ pub struct App {
     /// Lines scrolled up from the bottom of the transcript (0 = follow).
     pub scroll: u16,
     pub should_quit: bool,
+    /// Whether the terminal reports mouse events (`m` toggles; off lets the
+    /// terminal select text natively).
+    pub mouse: bool,
     /// Action awaiting y/n; owns the keyboard while set.
     pub confirm: Option<Confirm>,
     /// One-line notice shown in the status bar until the next key press.
@@ -61,6 +66,7 @@ impl App {
             picker_isolated: true,
             scroll: 0,
             should_quit: false,
+            mouse: true,
             confirm: None,
             message: None,
             cwd,
@@ -204,6 +210,37 @@ impl App {
         }
     }
 
+    /// React to a mouse event on a terminal of `area`. Modals (picker,
+    /// permission, confirm) own the screen, so the mouse is ignored then.
+    pub fn handle_mouse(&mut self, ev: MouseEvent, area: Rect) {
+        if self.mode == Mode::Picker
+            || self.confirm.is_some()
+            || self.current().is_some_and(|s| s.pending.is_some())
+        {
+            return;
+        }
+        let region = ui::locate(area, ev.column, ev.row);
+        match ev.kind {
+            MouseEventKind::ScrollUp if region != Region::Other => {
+                self.scroll = self.scroll.saturating_add(3)
+            }
+            MouseEventKind::ScrollDown if region != Region::Other => {
+                self.scroll = self.scroll.saturating_sub(3)
+            }
+            MouseEventKind::Down(MouseButton::Left) => match region {
+                Region::Session(i) if i < self.sessions.len() => {
+                    if i != self.selected {
+                        self.selected = i;
+                        self.scroll = 0;
+                    }
+                }
+                Region::Input if !self.sessions.is_empty() => self.mode = Mode::Insert,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
     fn handle_permission_key(&mut self, key: KeyEvent) {
         let Some(s) = self.current_mut() else { return };
         let Some(req) = &s.pending else { return };
@@ -235,6 +272,17 @@ impl App {
             KeyCode::Char('n') => self.open_picker(true),
             KeyCode::Char('N') => self.open_picker(false),
             KeyCode::Char('d') => self.request_close(),
+            KeyCode::Char('m') => {
+                self.mouse = !self.mouse;
+                self.message = Some(
+                    if self.mouse {
+                        "mouse on"
+                    } else {
+                        "mouse off: terminal text selection works"
+                    }
+                    .into(),
+                );
+            }
             KeyCode::Char('i') | KeyCode::Enter => {
                 if !self.sessions.is_empty() {
                     self.mode = Mode::Insert;
@@ -510,6 +558,50 @@ mod tests {
         app.handle_key(key(KeyCode::Char('d')));
         app.handle_key(key(KeyCode::Char('y')));
         assert!(app.store.load(app.cwd()).is_empty());
+    }
+
+    fn click(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_selects_sessions_and_scrolls() {
+        let area = Rect::new(0, 0, 100, 30);
+        let (mut app, _) = app_with_session();
+        let (s, _) = Session::detached(1, agent::find("gemini").unwrap());
+        app.sessions.push(s);
+        // Sidebar rows start under the " sessions " title row.
+        app.handle_mouse(click(2, 2), area);
+        assert_eq!(app.selected, 1);
+        app.handle_mouse(click(2, 20), area); // empty row: no change
+        assert_eq!(app.selected, 1);
+
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 50,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(wheel(MouseEventKind::ScrollUp), area);
+        assert_eq!(app.scroll, 3);
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown), area);
+        assert_eq!(app.scroll, 0);
+
+        app.handle_mouse(click(50, 28), area); // prompt box
+        assert_eq!(app.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn m_toggles_mouse_capture() {
+        let (mut app, _) = app_with_session();
+        assert!(app.mouse);
+        app.handle_key(key(KeyCode::Char('m')));
+        assert!(!app.mouse);
     }
 
     #[test]

@@ -133,7 +133,10 @@ fn tui() -> Result<()> {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use crossterm::event::{self, Event as TermEvent, KeyEventKind};
+    use crossterm::event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyEventKind,
+    };
+    use crossterm::execute;
 
     let (tx, rx) = mpsc::channel();
     let mut app = app::App::new(
@@ -144,22 +147,34 @@ fn tui() -> Result<()> {
     );
     app.restore();
     let mut terminal = ratatui::init();
+    let mut mouse_on = false;
     let result = (|| -> Result<()> {
         while !app.should_quit {
+            if app.mouse != mouse_on {
+                mouse_on = app.mouse;
+                if mouse_on {
+                    execute!(std::io::stdout(), EnableMouseCapture)?;
+                } else {
+                    execute!(std::io::stdout(), DisableMouseCapture)?;
+                }
+            }
             while let Ok(msg) = rx.try_recv() {
                 app.handle_msg(msg);
             }
             terminal.draw(|f| ui::render(f, &app))?;
             if event::poll(Duration::from_millis(50))? {
-                if let TermEvent::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        app.handle_key(key);
-                    }
+                match event::read()? {
+                    TermEvent::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+                    TermEvent::Mouse(m) => app.handle_mouse(m, terminal.size()?.into()),
+                    _ => {}
                 }
             }
         }
         Ok(())
     })();
+    if mouse_on {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    }
     ratatui::restore();
 
     // Stop agents and release untouched worktrees; report what was kept.
