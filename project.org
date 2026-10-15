@@ -44,6 +44,8 @@ Worktrees branch from =HEAD=, so uncommitted work in the main checkout is invisi
 A crashed mijote leaves worktrees behind (=mijote cleanup= / =git worktree prune=). Closing waits for the agent thread; a hung agent keeps its worktree (safe, but never reported).
 ** DONE TUI shell (ratatui)
 Sidebar of sessions, transcript pane, prompt line, permission modal, new-session picker (=n=). One worker thread per session owns its ACP client; =session/cancel= goes through a =CancelHandle= so it works mid-turn. Files: =src/app.rs= (state, keys), =src/ui/mod.rs= (rendering), =src/session.rs= (model + worker). Verified in a pty against a real Claude turn.
+** DONE TUI: visual redesign
+=src/ui/mod.rs= only. Palette constants (ANSI accent, one 256-colour grey); sidebar of two-row session cards (status glyph, agent, branch or live state, accent bar on the selection) with a wordmark and key footer; header strip with agent, branch and status; transcript without a box, hand-wrapped so every line keeps its gutter (user =▎=, thoughts =┊=, code fences =▏=, tool calls =✓ ✗ ○= grouped without gaps); rounded prompt box with placeholder; NORMAL/INSERT/PICK badge and bold-key hints in the status bar; rounded modals with hints on the bottom edge; welcome screen. =locate= follows the new geometry (cards are 2 rows, 2-row head).
 ** TODO TUI: multi-line input and editing
 Prompt box is single-line, append-only. Use tui-textarea (as rugit does): cursor movement, multi-line, paste.
 ** TODO TUI: markdown rendering and tool call detail

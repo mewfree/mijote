@@ -575,8 +575,8 @@ mod tests {
         let (mut app, _) = app_with_session();
         let (s, _) = Session::detached(1, agent::find("gemini").unwrap());
         app.sessions.push(s);
-        // Sidebar rows start under the " sessions " title row.
-        app.handle_mouse(click(2, 2), area);
+        // Session cards are two rows tall, below the two-row wordmark head.
+        app.handle_mouse(click(2, 4), area);
         assert_eq!(app.selected, 1);
         app.handle_mouse(click(2, 20), area); // empty row: no change
         assert_eq!(app.selected, 1);
