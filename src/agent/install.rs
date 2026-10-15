@@ -12,8 +12,8 @@ pub enum InstallError {
     Manual(String, &'static str),
     #[error("`npm` is required to install {0} but was not found on PATH (install Node.js)")]
     NoNpm(&'static str),
-    #[error("npm install of {0} failed")]
-    NpmFailed(String),
+    #[error("npm install of {0} failed: {1}")]
+    NpmFailed(String, String),
     #[error("installed {0} but could not find `{1}` in {2}")]
     MissingBin(String, &'static str, PathBuf),
     #[error("io error: {0}")]
@@ -83,15 +83,16 @@ fn npm_install(dir: &Path, package: &'static str, version: &str) -> Result<(), I
     let npm = which("npm").ok_or(InstallError::NoNpm(package))?;
     std::fs::create_dir_all(dir)?;
     let spec = format!("{package}@{version}");
-    let status = Command::new(npm)
+    let out = Command::new(npm)
         .args(["install", "--prefix"])
         .arg(dir)
         .args(["--no-audit", "--no-fund", "--loglevel=error", &spec])
-        .status()?;
-    if status.success() {
+        .output()?;
+    if out.status.success() {
         Ok(())
     } else {
-        Err(InstallError::NpmFailed(spec))
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(InstallError::NpmFailed(spec, stderr.trim().to_string()))
     }
 }
 

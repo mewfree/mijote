@@ -10,6 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use serde_json::{json, Value};
@@ -87,9 +88,38 @@ impl StopReason {
     }
 }
 
+/// Sends `session/cancel` from any thread, even while a prompt is running.
+#[derive(Clone, Debug)]
+pub struct CancelHandle {
+    stdin: Arc<Mutex<ChildStdin>>,
+    session_id: String,
+}
+
+impl CancelHandle {
+    pub fn cancel(&self) -> Result<(), AcpError> {
+        write_line(
+            &self.stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {"sessionId": self.session_id},
+            }),
+        )
+    }
+}
+
+fn write_line(stdin: &Mutex<ChildStdin>, msg: &Value) -> Result<(), AcpError> {
+    let mut line = serde_json::to_string(msg).map_err(|e| AcpError::Protocol(e.to_string()))?;
+    line.push('\n');
+    let mut w = stdin.lock().map_err(|_| AcpError::Closed)?;
+    w.write_all(line.as_bytes())?;
+    w.flush()?;
+    Ok(())
+}
+
 pub struct AcpClient {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Arc<Mutex<ChildStdin>>,
     rx: Receiver<Value>,
     next_id: u64,
 }
@@ -119,18 +149,23 @@ impl AcpClient {
         });
         Ok(Self {
             child,
-            stdin,
+            stdin: Arc::new(Mutex::new(stdin)),
             rx,
             next_id: 0,
         })
     }
 
     fn send(&mut self, msg: &Value) -> Result<(), AcpError> {
-        let mut line = serde_json::to_string(msg).map_err(|e| AcpError::Protocol(e.to_string()))?;
-        line.push('\n');
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.flush()?;
-        Ok(())
+        write_line(&self.stdin, msg)
+    }
+
+    /// A handle that can interrupt a running turn from another thread. The
+    /// pending `prompt` then resolves with `StopReason::Cancelled`.
+    pub fn cancel_handle(&self, session_id: &str) -> CancelHandle {
+        CancelHandle {
+            stdin: Arc::clone(&self.stdin),
+            session_id: session_id.to_string(),
+        }
     }
 
     /// Send a request and block until its response, dispatching any

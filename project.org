@@ -30,8 +30,16 @@ For CLIs without ACP (=claude -p --output-format stream-json=, =codex exec --jso
 Task -> session(s) -> transcript, stored under the XDG data dir.
 ** TODO Git worktree per task
 Create/cleanup worktrees; branch naming; never touch the user's main checkout.
-** TODO TUI shell (ratatui)
-Task list, live transcript pane, diff pane, permission prompt.
+** DONE TUI shell (ratatui)
+Sidebar of sessions, transcript pane, prompt line, permission modal, new-session picker (=n=). One worker thread per session owns its ACP client; =session/cancel= goes through a =CancelHandle= so it works mid-turn. Files: =src/app.rs= (state, keys), =src/ui/mod.rs= (rendering), =src/session.rs= (model + worker). Verified in a pty against a real Claude turn.
+** TODO TUI: multi-line input and editing
+Prompt box is single-line, append-only. Use tui-textarea (as rugit does): cursor movement, multi-line, paste.
+** TODO TUI: markdown rendering and tool call detail
+Render agent markdown/code blocks; expand tool call content and diffs (=tool_call_update.content=).
+** TODO TUI: close/rename sessions, per-session cwd
+=d= to close a session (kills the agent); show the cwd/branch per session. Pairs with the worktree task.
+** TODO TUI: transcript scrolling and search
+Only PgUp/PgDn today; add half-page, =g=/=G=, =/= search.
 ** TODO Parallel runs and cross-agent comparison
 Same prompt to N agents, compare resulting diffs.
 ** TODO Config (=~/.config/mijote/config.toml=)

@@ -1,4 +1,7 @@
 mod agent;
+mod app;
+mod session;
+mod ui;
 
 use std::io::Write;
 
@@ -16,6 +19,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Open the TUI (default)
+    Tui,
     /// List known agent backends and whether they are on PATH
     Agents,
     /// Install an agent's ACP adapter into mijote's data dir
@@ -33,7 +38,8 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().command.unwrap_or(Command::Agents) {
+    match Cli::parse().command.unwrap_or(Command::Tui) {
+        Command::Tui => tui(),
         Command::Agents => list_agents(),
         Command::Install { agent } => install(&agent),
         Command::Ask { agent, prompt } => ask(&agent, &prompt),
@@ -119,4 +125,33 @@ fn ask(id: &str, prompt: &str) -> Result<()> {
         eprintln!("stopped: {stop:?}");
     }
     Ok(())
+}
+
+fn tui() -> Result<()> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use crossterm::event::{self, Event as TermEvent, KeyEventKind};
+
+    let (tx, rx) = mpsc::channel();
+    let mut app = app::App::new(std::env::current_dir()?, tx);
+    let mut terminal = ratatui::init();
+    let result = (|| -> Result<()> {
+        while !app.should_quit {
+            while let Ok(msg) = rx.try_recv() {
+                app.handle_msg(msg);
+            }
+            terminal.draw(|f| ui::render(f, &app))?;
+            if event::poll(Duration::from_millis(50))? {
+                if let TermEvent::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press {
+                        app.handle_key(key);
+                    }
+                }
+            }
+        }
+        Ok(())
+    })();
+    ratatui::restore();
+    result
 }

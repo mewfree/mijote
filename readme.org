@@ -12,6 +12,19 @@ existing subscriptions, logins and quotas keep working untouched.
 
 Early scaffold. See =project.org= for the plan.
 
+* usage
+
+#+begin_src sh
+mijote            # open the TUI
+mijote agents     # list backends
+mijote install claude
+mijote ask claude "explain this repo"
+#+end_src
+
+Keys: =n= new session, =j=/=k= switch, =i= prompt, =Enter= send,
+=Esc=/=Ctrl-c= cancel a running turn, =q= quit. Permission requests pop up as
+a modal: =1-9= choose, =Esc= rejects.
+
 * build
 
 #+begin_src sh
