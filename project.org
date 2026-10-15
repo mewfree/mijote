@@ -32,6 +32,10 @@ For CLIs without ACP (=claude -p --output-format stream-json=, =codex exec --jso
 Persisted sessions restart the agent cold. Store the ACP session id and use =session/load= when the agent advertises =loadSession=. Also: restored sessions spawn their agents eagerly at startup; make that lazy (first prompt) so reopening many sessions does not launch many CLIs.
 ** DONE Model selection
 =ModelState= in =src/agent/acp.rs= reads the model from =session/new=: the =configOptions= entry with category =model= (what =claude-agent-acp= sends; switched with =session/set_config_option=, announced by =config_option_update=), falling back to the older =models= field (=session/set_model=, =current_model_update=). The header shows the current model, =M= (normal mode, between turns) opens a picker, and each change is logged as a transcript notice. The choice is stored in the session record and re-applied on restore. Agents that advertise no models get a "does not offer model selection" message. Unit-tested against fake agents; the config-option shape was taken from the pinned =claude-agent-acp= source, not a live run. Codex and Gemini not checked.
+** DONE Slash commands: /model
+Insert-mode =/model= opens the model picker; =/model <name>= switches directly (id or display name, case-insensitive; unknown names list the choices). Handled locally in =App::slash_model= because =/model= is a terminal-UI command in Claude Code and not reliable to forward. Anything else, including =/models=, goes to the agent as a prompt.
+** TODO Slash commands: agent-advertised
+Parse =available_commands_update= (today =Event::Other=) so the agent's own commands can be listed and completed in the prompt box; =/model= should then appear alongside them.
 ** TODO Session model: tasks and history browser
 Task -> session(s) grouping, and a way to list and reopen records saved from other directories or closed sessions.
 ** DONE Git worktree per task

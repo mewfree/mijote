@@ -343,6 +343,10 @@ impl App {
                 if text.is_empty() {
                     return;
                 }
+                if self.slash_model(&text) {
+                    self.input.clear();
+                    return;
+                }
                 let mut sent = None;
                 if let Some(s) = self.current_mut() {
                     if s.can_prompt() {
@@ -362,6 +366,44 @@ impl App {
             KeyCode::Char(c) => self.input.push(c),
             _ => {}
         }
+    }
+
+    /// Handle `/model` and `/model <name>` locally; returns whether `text`
+    /// was that command. It is a terminal-UI command in Claude Code, so
+    /// forwarding it to the agent is not reliable.
+    fn slash_model(&mut self, text: &str) -> bool {
+        let Some(rest) = text.strip_prefix("/model") else {
+            return false;
+        };
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            return false; // e.g. `/models`
+        }
+        let want = rest.trim();
+        if want.is_empty() {
+            self.open_models();
+            return true;
+        }
+        let Some(s) = self.current_mut() else {
+            return true;
+        };
+        let found = s
+            .models
+            .available
+            .iter()
+            .find(|m| m.id.eq_ignore_ascii_case(want) || m.name.eq_ignore_ascii_case(want))
+            .map(|m| m.id.clone());
+        self.message = Some(if s.models.available.is_empty() {
+            format!("{} does not offer model selection", s.spec.name)
+        } else if !s.can_prompt() {
+            "change the model between turns".into()
+        } else if let Some(id) = found {
+            s.set_model(id);
+            return true;
+        } else {
+            let names: Vec<_> = s.models.available.iter().map(|m| m.name.as_str()).collect();
+            format!("unknown model `{want}`; try: {}", names.join(", "))
+        });
+        true
     }
 
     fn open_models(&mut self) {
@@ -686,6 +728,46 @@ mod tests {
         app.handle_key(key(KeyCode::Char('k')));
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn slash_model_is_handled_locally() {
+        use crate::agent::acp::{ModelInfo, ModelState};
+        let (mut app, _) = app_with_session();
+        app.sessions[0].models = ModelState {
+            current: Some("a".into()),
+            available: vec![
+                ModelInfo {
+                    id: "a".into(),
+                    name: "Alpha".into(),
+                },
+                ModelInfo {
+                    id: "b".into(),
+                    name: "Beta".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let say = |app: &mut App, t: &str| {
+            app.mode = Mode::Insert;
+            app.input = t.into();
+            app.handle_key(key(KeyCode::Enter));
+        };
+        say(&mut app, "/model");
+        assert_eq!(app.mode, Mode::Model);
+        assert!(app.input.is_empty());
+        assert!(app.sessions[0].entries.is_empty(), "not sent as a prompt");
+
+        say(&mut app, "/model nope");
+        assert!(app.message.as_deref().unwrap().contains("Alpha, Beta"));
+        assert_eq!(app.sessions[0].status, Status::Idle);
+
+        say(&mut app, "/model beta");
+        assert!(app.sessions[0].entries.is_empty());
+
+        // Not the command: goes to the agent as a normal prompt.
+        say(&mut app, "/models please");
+        assert_eq!(app.sessions[0].status, Status::Running);
     }
 
     #[test]
