@@ -1,0 +1,29 @@
+#+title: mijote
+#+description: A keyboard-driven TUI orchestrator for the coding agents you already pay for
+
+mijote runs several coding agents side by side (Claude Code, Gemini CLI,
+Codex...) behind one interface: shared sessions, isolated git worktrees,
+one place to review diffs and approve tool calls.
+
+It does *not* replace the agents. Each backend spawns the official CLI, so your
+existing subscriptions, logins and quotas keep working untouched.
+
+* status
+
+Early scaffold. See =project.org= for the plan.
+
+* build
+
+#+begin_src sh
+cargo build
+cargo run -- agents
+#+end_src
+
+* design
+
+- *orchestrator*: the agent loop, tools and model access
+  stay in the vendor CLIs.
+- *transport*: Agent Client Protocol (ACP) over stdio where available, the
+  CLI's streaming JSON output otherwise.
+- *isolation*: one git worktree per task, so agents never step on each other.
+- *ux*: ratatui TUI, keyboard first.

@@ -1,0 +1,28 @@
+#+title: mijote – Project Tasks
+#+description: TUI orchestrator for existing coding-agent subscriptions
+
+* Decisions
+
+** DONE Orchestrator, not a harness
+Reusing subscriptions means driving the official CLIs. Writing our own agent loop would force API-key billing and lose vendor tuning. We own the UX, sessions and worktrees; vendors own the loop.
+
+** TODO Verify Antigravity has a headless/ACP entry point
+Antigravity is IDE-first. If there is no scriptable CLI, it stays out of scope.
+
+* Tasks
+
+** DONE Scaffold crate, readme.org, project.org
+** TODO ACP client over stdio
+Spawn an agent, initialize, create session, stream =session/update=, handle permission requests. Check the Claude Code ACP adapter and Gemini =--experimental-acp=.
+** TODO Stream-JSON fallback transport
+For CLIs without ACP (=claude -p --output-format stream-json=, =codex exec --json=).
+** TODO Session model and persistence
+Task -> session(s) -> transcript, stored under the XDG data dir.
+** TODO Git worktree per task
+Create/cleanup worktrees; branch naming; never touch the user's main checkout.
+** TODO TUI shell (ratatui)
+Task list, live transcript pane, diff pane, permission prompt.
+** TODO Parallel runs and cross-agent comparison
+Same prompt to N agents, compare resulting diffs.
+** TODO Config (=~/.config/mijote/config.toml=)
+Enabled agents, binary paths, default permissions.
