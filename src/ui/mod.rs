@@ -91,6 +91,9 @@ pub fn render(f: &mut Frame, app: &App) {
     if app.mode == Mode::Picker {
         render_picker(f, app);
     }
+    if app.mode == Mode::Model {
+        render_models(f, app);
+    }
     if let Some(s) = app.current() {
         if s.pending.is_some() {
             render_permission(f, s);
@@ -291,6 +294,10 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
             Span::raw("  "),
             Span::styled(s.spec.name, BOLD),
             Span::styled(format!("  {place}"), DIM),
+            Span::styled(
+                s.model_name().map_or(String::new(), |m| format!("  · {m}")),
+                DIM,
+            ),
         ])),
         inner,
     );
@@ -500,6 +507,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         Mode::Normal => (" NORMAL ", ACCENT),
         Mode::Insert => (" INSERT ", OK),
         Mode::Picker => (" PICK ", ASK),
+        Mode::Model => (" MODEL ", ASK),
     };
     let mut spans = vec![
         Span::styled(
@@ -541,6 +549,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             ("n", "new"),
             ("N", "new here"),
             ("d", "close"),
+            ("M", "model"),
             ("j/k", "switch"),
             ("PgUp/PgDn", "scroll"),
             ("m", "mouse"),
@@ -552,7 +561,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             ("Esc", "normal"),
         ],
         Mode::Insert => &[("Enter", "send"), ("Esc", "normal"), ("^C", "quit")],
-        Mode::Picker => &[("j/k", "move"), ("Enter/1-9", "choose"), ("Esc", "close")],
+        Mode::Picker | Mode::Model => &[("j/k", "move"), ("Enter/1-9", "choose"), ("Esc", "close")],
     };
     for (i, (k, what)) in hints.iter().enumerate() {
         if i > 0 {
@@ -646,6 +655,41 @@ fn render_picker(f: &mut Frame, app: &App) {
     let list = List::new(items)
         .block(modal(
             title,
+            ACCENT,
+            hint_line(&[("Enter", "choose"), ("Esc", "close")]),
+        ))
+        .highlight_symbol("▌ ")
+        .highlight_style(BOLD.fg(ACCENT).bg(SELECTED_BG));
+    f.render_widget(Clear, area);
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_models(f: &mut Frame, app: &App) {
+    let Some(s) = app.current() else { return };
+    let current = s.model();
+    let area = centered(f.area(), 52, s.models.available.len() as u16 + 4);
+    let items: Vec<ListItem> = s
+        .models
+        .available
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let mark = if current == Some(m.id.as_str()) {
+                " ✓"
+            } else {
+                ""
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{} ", i + 1), DIM),
+                Span::raw(format!("{}{mark}", m.name)),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(app.model_cursor));
+    let list = List::new(items)
+        .block(modal(
+            "model",
             ACCENT,
             hint_line(&[("Enter", "choose"), ("Esc", "close")]),
         ))

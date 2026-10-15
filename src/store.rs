@@ -21,6 +21,9 @@ pub struct Record {
     pub cwd: PathBuf,
     pub worktree: Option<Worktree>,
     pub entries: Vec<Entry>,
+    /// Model id the user last had selected, re-applied on restore.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +95,7 @@ mod tests {
             cwd: PathBuf::from(cwd),
             worktree: None,
             entries: vec![Entry::User("hi".into()), Entry::Agent("hello".into())],
+            model: None,
         }
     }
 

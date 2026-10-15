@@ -47,6 +47,8 @@ pub enum Event {
         status: Option<String>,
     },
     Plan(Vec<String>),
+    /// The agent switched models (e.g. `/model` inside Claude Code).
+    ModelChanged(String),
     /// An update type we don't model yet (kept so nothing is silently lost).
     Other(String),
 }
@@ -88,6 +90,89 @@ impl StopReason {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+}
+
+/// Models an agent advertises for a session. Empty `available` means the
+/// agent offers no model selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelState {
+    pub current: Option<String>,
+    pub available: Vec<ModelInfo>,
+    /// Set when the model is a session config option (switched with
+    /// `session/set_config_option`) rather than the older `models` field.
+    pub config_id: Option<String>,
+}
+
+impl ModelState {
+    fn parse(models: &Value) -> Self {
+        Self {
+            current: models
+                .get("currentModelId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            config_id: None,
+            available: models
+                .get("availableModels")
+                .and_then(Value::as_array)
+                .map(|ms| {
+                    ms.iter()
+                        .map(|m| {
+                            let id = str_of(m, "modelId");
+                            let name = m
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map_or_else(|| id.clone(), str::to_string);
+                            ModelInfo { id, name }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Pull the model select out of a `configOptions` array, if there is one.
+    fn from_config_options(options: &Value) -> Option<Self> {
+        let opt = options.as_array()?.iter().find(|o| {
+            o.get("category").and_then(Value::as_str) == Some("model")
+                || (o.get("category").is_none()
+                    && o.get("id").and_then(Value::as_str) == Some("model"))
+        })?;
+        // Values are flat, or grouped as `{group, options: [...]}`.
+        let mut available = Vec::new();
+        for v in opt.get("options").and_then(Value::as_array)? {
+            let group = v.get("options").and_then(Value::as_array);
+            for m in group.map_or(std::slice::from_ref(v), Vec::as_slice) {
+                let id = str_of(m, "value");
+                let name = m
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| id.clone(), str::to_string);
+                available.push(ModelInfo { id, name });
+            }
+        }
+        Some(Self {
+            current: opt
+                .get("currentValue")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            available,
+            config_id: Some(str_of(opt, "id")),
+        })
+    }
+
+    /// Display name for `id`, falling back to the id itself.
+    pub fn display(&self, id: &str) -> String {
+        self.available
+            .iter()
+            .find(|m| m.id == id)
+            .map_or_else(|| id.to_string(), |m| m.name.clone())
+    }
+}
+
 /// Sends `session/cancel` from any thread, even while a prompt is running.
 #[derive(Clone, Debug)]
 pub struct CancelHandle {
@@ -122,6 +207,7 @@ pub struct AcpClient {
     stdin: Arc<Mutex<ChildStdin>>,
     rx: Receiver<Value>,
     next_id: u64,
+    models: ModelState,
 }
 
 impl AcpClient {
@@ -152,6 +238,7 @@ impl AcpClient {
             stdin: Arc::new(Mutex::new(stdin)),
             rx,
             next_id: 0,
+            models: ModelState::default(),
         })
     }
 
@@ -258,11 +345,41 @@ impl AcpClient {
             "session/new",
             json!({"cwd": cwd.to_string_lossy(), "mcpServers": []}),
         )?;
+        if let Some(m) = result
+            .get("configOptions")
+            .and_then(ModelState::from_config_options)
+        {
+            self.models = m;
+        } else if let Some(models) = result.get("models") {
+            self.models = ModelState::parse(models);
+        }
         result
             .get("sessionId")
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| AcpError::Protocol("session/new: missing sessionId".into()))
+    }
+
+    /// Models the agent advertised in `session/new` (empty if none).
+    pub fn models(&self) -> &ModelState {
+        &self.models
+    }
+
+    /// Switch the session's model. Agents that do not support it answer with
+    /// an RPC error, which the caller reports.
+    pub fn set_model(&mut self, session_id: &str, model_id: &str) -> Result<(), AcpError> {
+        match self.models.config_id.clone() {
+            Some(config_id) => self.call_quiet(
+                "session/set_config_option",
+                json!({"sessionId": session_id, "configId": config_id, "value": model_id}),
+            )?,
+            None => self.call_quiet(
+                "session/set_model",
+                json!({"sessionId": session_id, "modelId": model_id}),
+            )?,
+        };
+        self.models.current = Some(model_id.to_string());
+        Ok(())
     }
 
     /// Run one prompt turn to completion.
@@ -338,6 +455,15 @@ fn parse_update(u: &Value) -> Event {
                 .map(|es| es.iter().map(|e| str_of(e, "content")).collect())
                 .unwrap_or_default(),
         ),
+        "config_option_update" => match u
+            .get("configOptions")
+            .and_then(ModelState::from_config_options)
+            .and_then(|m| m.current)
+        {
+            Some(id) => Event::ModelChanged(id),
+            None => Event::Other(kind),
+        },
+        "current_model_update" => Event::ModelChanged(str_of(u, "currentModelId")),
         _ => Event::Other(kind),
     }
 }
@@ -410,6 +536,56 @@ case "$l" in *'"optionId":"ok"'*) echo '{"jsonrpc":"2.0","id":2,"result":{"stopR
         assert_eq!(events, vec![Event::AgentText("hello".into())]);
         assert_eq!(perms[0].tool_call_id, "c1");
         assert_eq!(perms[0].title.as_deref(), Some("rm"));
+    }
+
+    /// Advertises two models, then accepts `session/set_model`.
+    const FAKE_MODELS: &str = r#"
+read l
+echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1}}'
+read l
+echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"s1","models":{"currentModelId":"a","availableModels":[{"modelId":"a","name":"Alpha"},{"modelId":"b"}]}}}'
+read l
+case "$l" in *'"modelId":"b"'*) echo '{"jsonrpc":"2.0","id":2,"result":{}}';; *) echo '{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"bad"}}';; esac
+"#;
+
+    #[test]
+    fn models_are_advertised_and_settable() {
+        let mut c = AcpClient::spawn("sh", &["-c", FAKE_MODELS], Path::new(".")).unwrap();
+        c.initialize().unwrap();
+        let sid = c.new_session(Path::new("/tmp")).unwrap();
+        let m = c.models().clone();
+        assert_eq!(m.current.as_deref(), Some("a"));
+        assert_eq!(m.available.len(), 2);
+        assert_eq!(m.display("a"), "Alpha");
+        assert_eq!(m.display("b"), "b");
+        c.set_model(&sid, "b").unwrap();
+        assert_eq!(c.models().current.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn model_as_config_option() {
+        let opts = json!([
+            {"id": "mode", "category": "mode", "currentValue": "default", "options": []},
+            {"id": "model", "category": "model", "type": "select", "currentValue": "opus",
+             "options": [
+                {"value": "default", "name": "Default"},
+                {"group": "g", "name": "G", "options": [{"value": "opus", "name": "Opus"}]}
+             ]}
+        ]);
+        let m = ModelState::from_config_options(&opts).unwrap();
+        assert_eq!(m.current.as_deref(), Some("opus"));
+        assert_eq!(m.config_id.as_deref(), Some("model"));
+        assert_eq!(m.display("opus"), "Opus");
+        assert_eq!(m.available.len(), 2);
+        let u = json!({"sessionUpdate": "config_option_update", "configOptions": opts});
+        assert_eq!(parse_update(&u), Event::ModelChanged("opus".into()));
+        assert!(ModelState::from_config_options(&json!([])).is_none());
+    }
+
+    #[test]
+    fn model_update_notification_is_parsed() {
+        let u = json!({"sessionUpdate": "current_model_update", "currentModelId": "b"});
+        assert_eq!(parse_update(&u), Event::ModelChanged("b".into()));
     }
 
     #[test]

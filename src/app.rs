@@ -17,6 +17,8 @@ pub enum Mode {
     Normal,
     Insert,
     Picker,
+    /// Choosing a model for the current session.
+    Model,
 }
 
 /// A destructive action waiting for the user to confirm it.
@@ -37,6 +39,7 @@ pub struct App {
     /// Whether the picked session gets its own worktree (`n`) or runs
     /// directly in the current directory/branch (`N`).
     pub picker_isolated: bool,
+    pub model_cursor: usize,
     /// Lines scrolled up from the bottom of the transcript (0 = follow).
     pub scroll: u16,
     pub should_quit: bool,
@@ -64,6 +67,7 @@ impl App {
             picker: Vec::new(),
             picker_cursor: 0,
             picker_isolated: true,
+            model_cursor: 0,
             scroll: 0,
             should_quit: false,
             mouse: true,
@@ -138,7 +142,14 @@ impl App {
             };
             let id = self.next_id;
             self.next_id += 1;
-            let mut s = Session::spawn(id, spec, self.cwd.clone(), worktree, self.ui_tx.clone());
+            let mut s = Session::spawn(
+                id,
+                spec,
+                self.cwd.clone(),
+                worktree,
+                rec.model,
+                self.ui_tx.clone(),
+            );
             s.key = key;
             s.entries = rec.entries;
             s.entries.push(Entry::Notice(note));
@@ -167,6 +178,7 @@ impl App {
             spec,
             self.cwd.clone(),
             worktree,
+            None,
             self.ui_tx.clone(),
         ));
         self.selected = self.sessions.len() - 1;
@@ -207,13 +219,14 @@ impl App {
             Mode::Normal => self.handle_normal(key),
             Mode::Insert => self.handle_insert(key),
             Mode::Picker => self.handle_picker(key),
+            Mode::Model => self.handle_model(key),
         }
     }
 
     /// React to a mouse event on a terminal of `area`. Modals (picker,
     /// permission, confirm) own the screen, so the mouse is ignored then.
     pub fn handle_mouse(&mut self, ev: MouseEvent, area: Rect) {
-        if self.mode == Mode::Picker
+        if matches!(self.mode, Mode::Picker | Mode::Model)
             || self.confirm.is_some()
             || self.current().is_some_and(|s| s.pending.is_some())
         {
@@ -272,6 +285,7 @@ impl App {
             KeyCode::Char('n') => self.open_picker(true),
             KeyCode::Char('N') => self.open_picker(false),
             KeyCode::Char('d') => self.request_close(),
+            KeyCode::Char('M') => self.open_models(),
             KeyCode::Char('m') => {
                 self.mouse = !self.mouse;
                 self.message = Some(
@@ -347,6 +361,54 @@ impl App {
             }
             KeyCode::Char(c) => self.input.push(c),
             _ => {}
+        }
+    }
+
+    fn open_models(&mut self) {
+        let Some(s) = self.current() else { return };
+        if s.models.available.is_empty() {
+            self.message = Some(if s.status == Status::Starting {
+                "agent is still starting".into()
+            } else {
+                format!("{} does not offer model selection", s.spec.name)
+            });
+        } else if !s.can_prompt() {
+            self.message = Some("change the model between turns".into());
+        } else {
+            self.model_cursor = s
+                .model()
+                .and_then(|cur| s.models.available.iter().position(|m| m.id == cur))
+                .unwrap_or(0);
+            self.mode = Mode::Model;
+        }
+    }
+
+    fn handle_model(&mut self, key: KeyEvent) {
+        let n = self.current().map_or(0, |s| s.models.available.len());
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down if n > 0 => {
+                self.model_cursor = (self.model_cursor + 1) % n
+            }
+            KeyCode::Char('k') | KeyCode::Up if n > 0 => {
+                self.model_cursor = (self.model_cursor + n - 1) % n
+            }
+            KeyCode::Enter => self.choose_model(self.model_cursor),
+            KeyCode::Char(c) => {
+                if let Some(i) = c.to_digit(10).and_then(|d| (d as usize).checked_sub(1)) {
+                    self.choose_model(i);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn choose_model(&mut self, i: usize) {
+        if let Some(s) = self.current_mut() {
+            if let Some(id) = s.models.available.get(i).map(|m| m.id.clone()) {
+                s.set_model(id);
+                self.mode = Mode::Normal;
+            }
         }
     }
 
@@ -594,6 +656,36 @@ mod tests {
 
         app.handle_mouse(click(50, 28), area); // prompt box
         assert_eq!(app.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn model_picker_selects_between_turns() {
+        use crate::agent::acp::{ModelInfo, ModelState};
+        let (mut app, _) = app_with_session();
+        app.handle_key(key(KeyCode::Char('M')));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.message.is_some());
+
+        app.sessions[0].models = ModelState {
+            current: Some("b".into()),
+            available: vec![
+                ModelInfo {
+                    id: "a".into(),
+                    name: "A".into(),
+                },
+                ModelInfo {
+                    id: "b".into(),
+                    name: "B".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        app.handle_key(key(KeyCode::Char('M')));
+        assert_eq!(app.mode, Mode::Model);
+        assert_eq!(app.model_cursor, 1, "starts on the current model");
+        app.handle_key(key(KeyCode::Char('k')));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     #[test]

@@ -8,7 +8,9 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::acp::{AcpClient, CancelHandle, Event, PermissionRequest, StopReason};
+use crate::agent::acp::{
+    AcpClient, CancelHandle, Event, ModelState, PermissionRequest, StopReason,
+};
 use crate::agent::{install, AgentSpec};
 use crate::store::{self, Record};
 use crate::worktree::{Released, Worktree};
@@ -39,7 +41,9 @@ pub enum Status {
 /// Worker -> UI messages.
 #[derive(Debug)]
 pub enum UiMsg {
-    Ready(CancelHandle),
+    Ready(CancelHandle, ModelState),
+    /// `session/set_model` failed; the model is unchanged.
+    ModelFailed(String),
     Event(Event),
     Permission(PermissionRequest),
     TurnDone(StopReason),
@@ -57,6 +61,7 @@ pub struct Msg {
 
 enum WorkerCmd {
     Prompt(String),
+    SetModel(String),
     Quit,
 }
 
@@ -71,6 +76,10 @@ pub struct Session {
     pub worktree: Option<Worktree>,
     /// When the current turn started; `None` while not running.
     pub turn_started: Option<Instant>,
+    /// Models the agent advertised; empty until it is ready.
+    pub models: ModelState,
+    /// Model to apply once the agent is up (restored from the record).
+    preferred_model: Option<String>,
     cancel: Option<CancelHandle>,
     cmd_tx: Sender<WorkerCmd>,
     perm_tx: Sender<Option<String>>,
@@ -86,14 +95,18 @@ impl Session {
         spec: &'static AgentSpec,
         cwd: PathBuf,
         worktree: Option<Worktree>,
+        model: Option<String>,
         ui_tx: Sender<Msg>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (perm_tx, perm_rx) = mpsc::channel();
         let dir = worktree.as_ref().map_or(cwd, |w| w.path.clone());
-        let handle = thread::spawn(move || worker(id, spec, dir, ui_tx, cmd_rx, perm_rx));
+        let preferred = model.clone();
+        let handle =
+            thread::spawn(move || worker(id, spec, dir, preferred, ui_tx, cmd_rx, perm_rx));
         let mut s = Self::new(id, spec, cmd_tx, perm_tx);
         s.worktree = worktree;
+        s.preferred_model = model;
         s.thread = Some(handle);
         s
     }
@@ -113,6 +126,8 @@ impl Session {
             pending: None,
             worktree: None,
             turn_started: None,
+            models: ModelState::default(),
+            preferred_model: None,
             cancel: None,
             cmd_tx,
             perm_tx,
@@ -135,11 +150,41 @@ impl Session {
             cwd: cwd.to_path_buf(),
             worktree: self.worktree.clone(),
             entries: self.entries.clone(),
+            model: self
+                .models
+                .current
+                .clone()
+                .or_else(|| self.preferred_model.clone()),
         }
     }
 
     pub fn can_prompt(&self) -> bool {
         self.status == Status::Idle
+    }
+
+    /// Id of the model in use, if the agent reported one.
+    pub fn model(&self) -> Option<&str> {
+        self.models.current.as_deref()
+    }
+
+    /// Human name of the model in use.
+    pub fn model_name(&self) -> Option<String> {
+        self.model().map(|id| self.models.display(id))
+    }
+
+    /// Ask the agent to switch models (only between turns).
+    pub fn set_model(&mut self, id: String) {
+        if self.can_prompt() && self.models.available.iter().any(|m| m.id == id) {
+            let _ = self.cmd_tx.send(WorkerCmd::SetModel(id));
+        }
+    }
+
+    fn note_model(&mut self, id: String) {
+        if self.models.current.as_deref() != Some(&id) {
+            let name = self.models.display(&id);
+            self.entries.push(Entry::Notice(format!("model: {name}")));
+            self.models.current = Some(id);
+        }
     }
 
     pub fn send_prompt(&mut self, text: String) {
@@ -203,10 +248,15 @@ impl Session {
     pub fn apply(&mut self, body: UiMsg) {
         match body {
             UiMsg::Closed(_) => {}
-            UiMsg::Ready(handle) => {
+            UiMsg::Ready(handle, models) => {
                 self.cancel = Some(handle);
                 self.status = Status::Idle;
+                self.models = models;
+                self.preferred_model = None;
             }
+            UiMsg::ModelFailed(e) => self
+                .entries
+                .push(Entry::Notice(format!("could not change model: {e}"))),
             UiMsg::Event(e) => self.apply_event(e),
             UiMsg::Permission(req) => {
                 self.pending = Some(req);
@@ -274,6 +324,7 @@ impl Session {
                     .join("\n");
                 self.entries.push(Entry::Notice(format!("plan:\n{list}")));
             }
+            Event::ModelChanged(id) => self.note_model(id),
             Event::Other(_) => {}
         }
     }
@@ -289,6 +340,7 @@ fn worker(
     id: usize,
     spec: &'static AgentSpec,
     cwd: PathBuf,
+    preferred: Option<String>,
     ui_tx: Sender<Msg>,
     cmd_rx: Receiver<WorkerCmd>,
     perm_rx: Receiver<Option<String>>,
@@ -302,8 +354,29 @@ fn worker(
             .map_err(|e| e.to_string())?;
         client.initialize().map_err(|e| e.to_string())?;
         let sid = client.new_session(&cwd).map_err(|e| e.to_string())?;
-        send(UiMsg::Ready(client.cancel_handle(&sid)));
-        while let Ok(WorkerCmd::Prompt(text)) = cmd_rx.recv() {
+        // Re-apply a restored choice; failure just leaves the default model.
+        if let Some(want) = preferred {
+            let m = client.models();
+            if m.current.as_deref() != Some(&want) && m.available.iter().any(|a| a.id == want) {
+                let _ = client.set_model(&sid, &want);
+            }
+        }
+        send(UiMsg::Ready(
+            client.cancel_handle(&sid),
+            client.models().clone(),
+        ));
+        while let Ok(cmd) = cmd_rx.recv() {
+            let text = match cmd {
+                WorkerCmd::Prompt(text) => text,
+                WorkerCmd::SetModel(id) => {
+                    match client.set_model(&sid, &id) {
+                        Ok(()) => send(UiMsg::Event(Event::ModelChanged(id))),
+                        Err(e) => send(UiMsg::ModelFailed(e.to_string())),
+                    }
+                    continue;
+                }
+                WorkerCmd::Quit => break,
+            };
             let stop = client
                 .prompt(
                     &sid,
@@ -380,6 +453,35 @@ mod tests {
         }));
         s.cancel();
         assert_eq!(perm_rx.try_recv().unwrap(), None);
+    }
+
+    #[test]
+    fn model_changes_are_logged_once() {
+        use crate::agent::acp::ModelInfo;
+        let (mut s, _) = session();
+        s.models = ModelState {
+            current: Some("a".into()),
+            available: vec![
+                ModelInfo {
+                    id: "a".into(),
+                    name: "Alpha".into(),
+                },
+                ModelInfo {
+                    id: "b".into(),
+                    name: "Beta".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        s.apply(UiMsg::Event(Event::ModelChanged("a".into())));
+        assert!(s.entries.is_empty());
+        s.apply(UiMsg::Event(Event::ModelChanged("b".into())));
+        assert_eq!(s.entries, vec![Entry::Notice("model: Beta".into())]);
+        assert_eq!(s.model_name().as_deref(), Some("Beta"));
+        assert_eq!(
+            s.record(std::path::Path::new(".")).model.as_deref(),
+            Some("b")
+        );
     }
 
     #[test]
