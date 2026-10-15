@@ -21,11 +21,12 @@ mijote install claude
 mijote ask claude "explain this repo"
 #+end_src
 
-Keys: =n= new session, =d= close it, =j=/=k= switch, =i= prompt, =Enter= send,
+Keys: =n= new session (own worktree), =N= new session in the current
+directory/branch, =d= close it, =j=/=k= switch, =i= prompt, =Enter= send,
 =Esc=/=Ctrl-c= cancel a running turn, =q= quit. Permission requests pop up as
 a modal: =1-9= choose, =Esc= rejects.
 
-Each session runs in its own git worktree and branch (=mijote/<agent>-<n>=),
+By default each session runs in its own git worktree and branch (=mijote/<agent>-<n>=),
 stored under =~/.local/share/mijote/worktrees=. Untouched worktrees are deleted
 when the session closes; ones with changes are kept and reported.
 

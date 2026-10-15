@@ -30,6 +30,8 @@ For CLIs without ACP (=claude -p --output-format stream-json=, =codex exec --jso
 Task -> session(s) -> transcript, stored under the XDG data dir.
 ** DONE Git worktree per task
 =src/worktree.rs=: each session gets branch =mijote/<agent>-<n>= in a worktree under =$MIJOTE_HOME/worktrees/<repo>/=, based on the repo's =HEAD=. Outside a git repo (or with no commits) the session falls back to the current directory with a notice. On =d= close or quit, an untouched worktree and branch are deleted; one with changes or commits is kept and reported. Shells out to =git=. Verified in a pty against a real repo.
+** DONE Worktrees: optional
+=n= opens the picker for an isolated session (worktree, as before); =N= opens it for a session that runs directly in the current directory and branch (no worktree, nothing to clean up). Picker title says which. Still TODO: a config default once =src/config.rs= exists.
 ** TODO Worktrees: review and merge flow
 Show the session branch's diff/commits in the TUI; actions to merge, cherry-pick, open a PR, or discard. Today kept branches are only reported on close.
 ** TODO Worktrees: start from the dirty tree (optional)

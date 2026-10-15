@@ -31,6 +31,9 @@ pub struct App {
     /// Agents offered by the new-session picker.
     pub picker: Vec<&'static AgentSpec>,
     pub picker_cursor: usize,
+    /// Whether the picked session gets its own worktree (`n`) or runs
+    /// directly in the current directory/branch (`N`).
+    pub picker_isolated: bool,
     /// Lines scrolled up from the bottom of the transcript (0 = follow).
     pub scroll: u16,
     pub should_quit: bool,
@@ -53,6 +56,7 @@ impl App {
             input: String::new(),
             picker: Vec::new(),
             picker_cursor: 0,
+            picker_isolated: true,
             scroll: 0,
             should_quit: false,
             confirm: None,
@@ -86,17 +90,21 @@ impl App {
         }
     }
 
-    pub fn open_session(&mut self, spec: &'static AgentSpec) {
+    pub fn open_session(&mut self, spec: &'static AgentSpec, isolated: bool) {
         let id = self.next_id;
         self.next_id += 1;
-        let worktree = match Worktree::create(&self.cwd, &self.worktrees_root, spec.id) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                self.message = Some(format!(
-                    "no worktree ({e}); running in the current directory"
-                ));
-                None
+        let worktree = if isolated {
+            match Worktree::create(&self.cwd, &self.worktrees_root, spec.id) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    self.message = Some(format!(
+                        "no worktree ({e}); running in the current directory"
+                    ));
+                    None
+                }
             }
+        } else {
+            None
         };
         self.sessions.push(Session::spawn(
             id,
@@ -174,7 +182,8 @@ impl App {
     fn handle_normal(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.request_quit(),
-            KeyCode::Char('n') => self.open_picker(),
+            KeyCode::Char('n') => self.open_picker(true),
+            KeyCode::Char('N') => self.open_picker(false),
             KeyCode::Char('d') => self.request_close(),
             KeyCode::Char('i') | KeyCode::Enter => {
                 if !self.sessions.is_empty() {
@@ -238,7 +247,8 @@ impl App {
         }
     }
 
-    fn open_picker(&mut self) {
+    fn open_picker(&mut self, isolated: bool) {
+        self.picker_isolated = isolated;
         self.picker = agent::KNOWN
             .iter()
             .filter(|a| {
@@ -272,7 +282,7 @@ impl App {
 
     fn pick(&mut self, i: usize) {
         if let Some(spec) = self.picker.get(i).copied() {
-            self.open_session(spec);
+            self.open_session(spec, self.picker_isolated);
         }
     }
 

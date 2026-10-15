@@ -161,7 +161,7 @@ fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
     let lines: Vec<Line> = match app.current() {
         None => vec![
             Line::from(""),
-            Line::from("No sessions yet. Press n to start one."),
+            Line::from("No sessions yet. Press n to start one (N: in the current directory)."),
         ],
         Some(s) if s.entries.is_empty() => {
             let msg = match s.status {
@@ -225,7 +225,9 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         _ if app.confirm.is_some() => "y confirm  any other key cancels",
         Mode::Normal if app.scroll > 0 => "G follow  PgUp/PgDn scroll  i prompt  n new  q quit",
         Mode::Normal if busy => "^C cancel turn  j/k switch  PgUp/PgDn scroll  n new  q quit",
-        Mode::Normal => "i prompt  n new  d close  j/k switch  PgUp/PgDn scroll  q quit",
+        Mode::Normal => {
+            "i prompt  n new  N new here  d close  j/k switch  PgUp/PgDn scroll  q quit"
+        }
         Mode::Insert if busy => "Enter sends when idle  ^C cancel turn  Esc normal",
         Mode::Insert => "Enter send  Esc normal  ^C quit",
         Mode::Picker => "j/k move  Enter/1-9 choose  Esc close",
@@ -263,6 +265,11 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 
 fn render_picker(f: &mut Frame, app: &App) {
     let area = centered(f.area(), 50, app.picker.len() as u16 + 4);
+    let title = if app.picker_isolated {
+        " new session (worktree) "
+    } else {
+        " new session (current directory) "
+    };
     let items: Vec<ListItem> = app
         .picker
         .iter()
@@ -272,11 +279,7 @@ fn render_picker(f: &mut Frame, app: &App) {
     let mut state = ListState::default();
     state.select(Some(app.picker_cursor));
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" new session "),
-        )
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     f.render_widget(Clear, area);
     f.render_stateful_widget(list, area, &mut state);
