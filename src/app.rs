@@ -20,6 +20,8 @@ pub enum Mode {
     Picker,
     /// Choosing a model for the current session.
     Model,
+    /// Floating session list.
+    Switcher,
 }
 
 /// A destructive action waiting for the user to confirm it.
@@ -41,6 +43,7 @@ pub struct App {
     /// directly in the current directory/branch (`N`).
     pub picker_isolated: bool,
     pub model_cursor: usize,
+    pub switcher_cursor: usize,
     /// Lines scrolled up from the bottom of the transcript (0 = follow).
     pub scroll: u16,
     /// Largest useful `scroll`, reported by the last render so scrolling
@@ -72,6 +75,7 @@ impl App {
             picker_cursor: 0,
             picker_isolated: true,
             model_cursor: 0,
+            switcher_cursor: 0,
             scroll: 0,
             max_scroll: Cell::new(u16::MAX),
             should_quit: false,
@@ -160,6 +164,8 @@ impl App {
             s.entries.push(Entry::Notice(note));
             self.sessions.push(s);
         }
+        // Records load oldest first; land on the newest, like `open_session`.
+        self.selected = self.sessions.len().saturating_sub(1);
     }
 
     pub fn open_session(&mut self, spec: &'static AgentSpec, isolated: bool) {
@@ -225,13 +231,14 @@ impl App {
             Mode::Insert => self.handle_insert(key),
             Mode::Picker => self.handle_picker(key),
             Mode::Model => self.handle_model(key),
+            Mode::Switcher => self.handle_switcher(key),
         }
     }
 
     /// React to a mouse event on a terminal of `area`. Modals (picker,
     /// permission, confirm) own the screen, so the mouse is ignored then.
     pub fn handle_mouse(&mut self, ev: MouseEvent, area: Rect) {
-        if matches!(self.mode, Mode::Picker | Mode::Model)
+        if matches!(self.mode, Mode::Picker | Mode::Model | Mode::Switcher)
             || self.confirm.is_some()
             || self.current().is_some_and(|s| s.pending.is_some())
         {
@@ -244,12 +251,6 @@ impl App {
                 self.scroll = self.scroll.saturating_sub(3)
             }
             MouseEventKind::Down(MouseButton::Left) => match region {
-                Region::Session(i) if i < self.sessions.len() => {
-                    if i != self.selected {
-                        self.selected = i;
-                        self.scroll = 0;
-                    }
-                }
                 Region::Input if !self.sessions.is_empty() => self.mode = Mode::Insert,
                 _ => {}
             },
@@ -289,6 +290,7 @@ impl App {
             KeyCode::Char('N') => self.open_picker(false),
             KeyCode::Char('d') => self.request_close(),
             KeyCode::Char('M') => self.open_models(),
+            KeyCode::Char('s') | KeyCode::Tab => self.open_switcher(),
             KeyCode::Char('m') => {
                 self.mouse = !self.mouse;
                 self.message = Some(
@@ -465,6 +467,46 @@ impl App {
                 s.set_model(id);
                 self.mode = Mode::Normal;
             }
+        }
+    }
+
+    fn open_switcher(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        self.switcher_cursor = self.selected;
+        self.mode = Mode::Switcher;
+    }
+
+    fn handle_switcher(&mut self, key: KeyEvent) {
+        let n = self.sessions.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') | KeyCode::Tab => {
+                self.mode = Mode::Normal
+            }
+            KeyCode::Char('j') | KeyCode::Down if n > 0 => {
+                self.switcher_cursor = (self.switcher_cursor + 1) % n
+            }
+            KeyCode::Char('k') | KeyCode::Up if n > 0 => {
+                self.switcher_cursor = (self.switcher_cursor + n - 1) % n
+            }
+            KeyCode::Enter => self.switch_to(self.switcher_cursor),
+            KeyCode::Char(c) => {
+                if let Some(i) = c.to_digit(10).and_then(|d| (d as usize).checked_sub(1)) {
+                    self.switch_to(i);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn switch_to(&mut self, i: usize) {
+        if i < self.sessions.len() {
+            if i != self.selected {
+                self.selected = i;
+                self.scroll = 0;
+            }
+            self.mode = Mode::Normal;
         }
     }
 
@@ -688,16 +730,22 @@ mod tests {
     }
 
     #[test]
-    fn mouse_selects_sessions_and_scrolls() {
+    fn switcher_picks_a_session_and_mouse_scrolls() {
         let area = Rect::new(0, 0, 100, 30);
         let (mut app, _) = app_with_session();
         let (s, _) = Session::detached(1, agent::find("gemini").unwrap());
         app.sessions.push(s);
-        // Session cards are two rows tall, below the two-row wordmark head.
-        app.handle_mouse(click(2, 4), area);
-        assert_eq!(app.selected, 1);
-        app.handle_mouse(click(2, 20), area); // empty row: no change
-        assert_eq!(app.selected, 1);
+        app.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(app.mode, Mode::Switcher);
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!((app.mode, app.selected), (Mode::Normal, 1));
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!((app.mode, app.selected), (Mode::Normal, 1));
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(app.selected, 0);
 
         let wheel = |kind| MouseEvent {
             kind,

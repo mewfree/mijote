@@ -26,36 +26,21 @@ const CODE_FG: Color = Color::Indexed(250);
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 
-const SIDEBAR_WIDTH: u16 = 30;
-/// Sidebar rows above the first session: wordmark and a spacer.
-const SIDEBAR_HEAD: u16 = 2;
-/// Sidebar rows per session: name line and detail line.
-const SESSION_ROWS: u16 = 2;
-
-/// Screen areas: sidebar, header, transcript, prompt box, status bar. Shared
-/// by rendering and mouse hit-testing so they cannot drift apart.
-fn layout(area: Rect) -> [Rect; 5] {
-    let [side, main] =
-        Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(30)]).areas(area);
-    let [header, transcript, input, status] = Layout::vertical([
+/// Screen areas: header, transcript, prompt box, status bar. Shared by
+/// rendering and mouse hit-testing so they cannot drift apart.
+fn layout(area: Rect) -> [Rect; 4] {
+    Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(3),
         Constraint::Length(3),
         Constraint::Length(1),
     ])
-    .areas(main);
-    [side, header, transcript, input, status]
-}
-
-fn sidebar_block() -> Block<'static> {
-    Block::default().borders(Borders::RIGHT).border_style(DIM)
+    .areas(area)
 }
 
 /// What is under a mouse position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Region {
-    /// A session card of the sidebar (may be past the last session).
-    Session(usize),
     Transcript,
     Input,
     Other,
@@ -63,16 +48,8 @@ pub enum Region {
 
 /// Map a terminal cell to the region it falls in, for a terminal of `area`.
 pub fn locate(area: Rect, col: u16, row: u16) -> Region {
-    let [side, _, transcript, input, _] = layout(area);
+    let [_, transcript, input, _] = layout(area);
     let at = |r: Rect| r.contains((col, row).into());
-    if at(side) {
-        let inner = sidebar_block().inner(side);
-        let first = inner.y + SIDEBAR_HEAD;
-        if at(inner) && row >= first {
-            return Region::Session(((row - first) / SESSION_ROWS) as usize);
-        }
-        return Region::Other;
-    }
     if at(transcript) {
         Region::Transcript
     } else if at(input) {
@@ -83,8 +60,7 @@ pub fn locate(area: Rect, col: u16, row: u16) -> Region {
 }
 
 pub fn render(f: &mut Frame, app: &App) {
-    let [side, header, transcript, input, status] = layout(f.area());
-    render_sidebar(f, app, side);
+    let [header, transcript, input, status] = layout(f.area());
     render_header(f, app, header);
     render_transcript(f, app, transcript);
     render_input(f, app, input);
@@ -95,6 +71,9 @@ pub fn render(f: &mut Frame, app: &App) {
     }
     if app.mode == Mode::Model {
         render_models(f, app);
+    }
+    if app.mode == Mode::Switcher {
+        render_switcher(f, app);
     }
     if let Some(s) = app.current() {
         if s.pending.is_some() {
@@ -202,85 +181,6 @@ fn wrap_code(text: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
-fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
-    let block = sidebar_block();
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    let w = inner.width as usize;
-
-    let mut lines: Vec<Line> = vec![
-        Line::from(vec![
-            Span::styled(" ◆ ", Style::new().fg(ACCENT)),
-            Span::styled("mijote", BOLD),
-        ]),
-        Line::from(""),
-    ];
-    for (i, s) in app.sessions.iter().enumerate() {
-        let selected = i == app.selected;
-        let (g, c) = status_glyph(s.status);
-        let g = if s.status == Status::Running {
-            spinner(s)
-        } else {
-            g
-        };
-        let detail = match s.status {
-            Status::Idle => match &s.worktree {
-                Some(wt) => format!("⎇ {}", wt.branch),
-                None => "current directory".to_string(),
-            },
-            _ => status_label(s).0,
-        };
-        let detail_color = match s.status {
-            Status::Idle | Status::Starting => Color::DarkGray,
-            _ => status_glyph(s.status).1,
-        };
-        let bar = if selected { "▌" } else { " " };
-        let name_style = if selected { BOLD } else { Style::new() };
-        let mut name = Line::from(vec![
-            Span::styled(bar, Style::new().fg(ACCENT)),
-            Span::styled(format!(" {g} "), Style::new().fg(c)),
-            Span::styled(fit(s.spec.name, w.saturating_sub(4)), name_style),
-        ]);
-        let mut sub = Line::from(vec![
-            Span::styled(bar, Style::new().fg(ACCENT)),
-            Span::raw("   "),
-            Span::styled(
-                fit(&detail, w.saturating_sub(4)),
-                Style::new().fg(detail_color),
-            ),
-        ]);
-        if selected {
-            for l in [&mut name, &mut sub] {
-                let used: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
-                l.spans.push(Span::raw(" ".repeat(w.saturating_sub(used))));
-                *l = std::mem::take(l).style(Style::new().bg(SELECTED_BG));
-            }
-        }
-        lines.push(name);
-        lines.push(sub);
-    }
-    if app.sessions.is_empty() {
-        lines.push(Line::styled("  no sessions", DIM));
-    }
-    f.render_widget(Paragraph::new(lines), inner);
-
-    if inner.height > 6 {
-        let foot = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::raw(" "),
-                Span::styled("n", BOLD),
-                Span::styled(" new  ", DIM),
-                Span::styled("N", BOLD),
-                Span::styled(" here  ", DIM),
-                Span::styled("d", BOLD),
-                Span::styled(" close", DIM),
-            ])),
-            foot,
-        );
-    }
-}
-
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default().borders(Borders::BOTTOM).border_style(DIM);
     let inner = block.inner(area);
@@ -306,6 +206,21 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
 
     let (label, color) = status_label(s);
     let mut right = vec![Span::styled(label, Style::new().fg(color))];
+    let waiting = app
+        .sessions
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| *i != app.selected && s.status == Status::AwaitingPermission)
+        .count();
+    if waiting > 0 {
+        right.insert(
+            0,
+            Span::styled(
+                format!("◆ {waiting} waiting · s switch   "),
+                Style::new().fg(ASK),
+            ),
+        );
+    }
     if app.scroll > 0 {
         right.insert(
             0,
@@ -499,6 +414,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         Mode::Insert => (" INSERT ", OK),
         Mode::Picker => (" PICK ", ASK),
         Mode::Model => (" MODEL ", ASK),
+        Mode::Switcher => (" SESSIONS ", ASK),
     };
     let mut spans = vec![
         Span::styled(
@@ -530,7 +446,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         ],
         Mode::Normal if busy => &[
             ("^C", "cancel turn"),
-            ("j/k", "switch"),
+            ("s", "sessions"),
             ("PgUp/PgDn", "scroll"),
             ("n", "new"),
             ("q", "quit"),
@@ -541,7 +457,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             ("N", "new here"),
             ("d", "close"),
             ("M", "model"),
-            ("j/k", "switch"),
+            ("s", "sessions"),
             ("PgUp/PgDn", "scroll"),
             ("m", "mouse"),
             ("q", "quit"),
@@ -552,7 +468,9 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             ("Esc", "normal"),
         ],
         Mode::Insert => &[("Enter", "send"), ("Esc", "normal"), ("^C", "quit")],
-        Mode::Picker | Mode::Model => &[("j/k", "move"), ("Enter/1-9", "choose"), ("Esc", "close")],
+        Mode::Picker | Mode::Model | Mode::Switcher => {
+            &[("j/k", "move"), ("Enter/1-9", "choose"), ("Esc", "close")]
+        }
     };
     for (i, (k, what)) in hints.iter().enumerate() {
         if i > 0 {
@@ -648,6 +566,59 @@ fn render_picker(f: &mut Frame, app: &App) {
             title,
             ACCENT,
             hint_line(&[("Enter", "choose"), ("Esc", "close")]),
+        ))
+        .highlight_symbol("▌ ")
+        .highlight_style(BOLD.fg(ACCENT).bg(SELECTED_BG));
+    f.render_widget(Clear, area);
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_switcher(f: &mut Frame, app: &App) {
+    let rows = app.sessions.len() as u16;
+    let area = centered(f.area(), 56, rows + 4);
+    let w = area.width.saturating_sub(10) as usize;
+    let items: Vec<ListItem> = app
+        .sessions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let (g, c) = status_glyph(s.status);
+            let g = if s.status == Status::Running {
+                spinner(s)
+            } else {
+                g
+            };
+            let detail = match s.status {
+                Status::Idle => match &s.worktree {
+                    Some(wt) => format!("⎇ {}", wt.branch),
+                    None => "current directory".to_string(),
+                },
+                _ => status_label(s).0,
+            };
+            let detail_color = match s.status {
+                Status::Idle | Status::Starting => Color::DarkGray,
+                _ => c,
+            };
+            let name = s.spec.name;
+            let room = w.saturating_sub(name.chars().count() + 2);
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{} ", i + 1), DIM),
+                Span::styled(format!("{g} "), Style::new().fg(c)),
+                Span::raw(name),
+                Span::styled(
+                    format!("  {}", fit(&detail, room)),
+                    Style::new().fg(detail_color),
+                ),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(app.switcher_cursor));
+    let list = List::new(items)
+        .block(modal(
+            "sessions",
+            ACCENT,
+            hint_line(&[("Enter", "switch"), ("Esc", "close")]),
         ))
         .highlight_symbol("▌ ")
         .highlight_style(BOLD.fg(ACCENT).bg(SELECTED_BG));
@@ -795,6 +766,11 @@ mod tests {
         app.sessions[0].turn_started = Some(std::time::Instant::now());
         term.draw(|f| render(f, &app)).unwrap();
         assert!(dump(&term).contains("working… 0s"));
+
+        app.mode = Mode::Switcher;
+        term.draw(|f| render(f, &app)).unwrap();
+        assert!(dump(&term).contains("sessions"));
+        app.mode = Mode::Normal;
 
         app.confirm = Some(Confirm::Quit);
         term.draw(|f| render(f, &app)).unwrap();
