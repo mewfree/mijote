@@ -244,7 +244,7 @@ impl App {
         {
             return;
         }
-        let region = ui::locate(area, ev.column, ev.row);
+        let region = ui::locate(area, &self.input, ev.column, ev.row);
         match ev.kind {
             MouseEventKind::ScrollUp if region != Region::Other => self.scroll_up(3),
             MouseEventKind::ScrollDown if region != Region::Other => {
@@ -352,6 +352,16 @@ impl App {
     fn handle_insert(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.input.push('\n');
+            }
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.push('\n');
+            }
             KeyCode::Enter => {
                 let text = self.input.trim().to_string();
                 if text.is_empty() {
@@ -607,6 +617,17 @@ mod tests {
         app.sessions.push(s);
         app.sessions[0].status = Status::Idle;
         (app, perm_rx)
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline() {
+        let (mut app, _) = app_with_session();
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(key(KeyCode::Char('a')));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.handle_key(key(KeyCode::Char('b')));
+        assert_eq!(app.input, "a\nb");
+        assert_eq!(app.sessions[0].status, Status::Idle);
     }
 
     #[test]

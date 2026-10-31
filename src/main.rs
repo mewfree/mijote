@@ -135,6 +135,7 @@ fn tui() -> Result<()> {
 
     use crossterm::event::{
         self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyEventKind,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     };
     use crossterm::execute;
 
@@ -147,6 +148,14 @@ fn tui() -> Result<()> {
     );
     app.restore();
     let mut terminal = ratatui::init();
+    // Without the kitty protocol Shift+Enter is indistinguishable from Enter.
+    let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if enhanced {
+        let _ = execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
     let mut mouse_on = false;
     let result = (|| -> Result<()> {
         while !app.should_quit {
@@ -174,6 +183,9 @@ fn tui() -> Result<()> {
     })();
     if mouse_on {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    }
+    if enhanced {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }
     ratatui::restore();
 

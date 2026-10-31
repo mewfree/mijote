@@ -55,7 +55,7 @@ Sidebar of sessions, transcript pane, prompt line, permission modal, new-session
 ** DONE TUI: floating session switcher
 The always-on sidebar is gone; the transcript uses the full width. =s= or =Tab= (normal mode) opens a floating list of sessions (status glyph, agent, branch or live state); =j/k=, =1-9=, =Enter= switch, =Esc= cancels. The header shows a badge when a background session needs permission. Mouse hit-testing lost its session region. Supersedes the sidebar parts of the redesign and of the "sidebar labels and attention" / "rename" tasks below, which now apply to the switcher.
 ** TODO TUI: multi-line input and editing
-Prompt box is single-line, append-only. Use tui-textarea (as rugit does): cursor movement, multi-line, paste.
+Shift+Enter (also Alt+Enter, Ctrl+J) inserts a newline; the prompt box grows to 6 rows. Shift+Enter needs a terminal with the kitty keyboard protocol (kitty, WezTerm, Ghostty, iTerm2, recent Alacritty); elsewhere use Alt+Enter or Ctrl+J. Still append-only: want cursor movement and paste, e.g. tui-textarea (as rugit does).
 ** DONE TUI: markdown rendering
 Agent messages render through =ui/markdown.rs= (pulldown-cmark): headings, bold/italic/strikethrough, inline and fenced code, bullet/numbered/task lists, block quotes, rules, links (destination shown after the text). Wrapped to the transcript width with hanging indents. Tables and syntax highlighting are not handled; tables show as plain text.
 ** TODO TUI: tool call detail

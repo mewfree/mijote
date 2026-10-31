@@ -26,13 +26,17 @@ const CODE_FG: Color = Color::Indexed(250);
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 
+const MAX_INPUT_ROWS: u16 = 6;
+
 /// Screen areas: header, transcript, prompt box, status bar. Shared by
 /// rendering and mouse hit-testing so they cannot drift apart.
-fn layout(area: Rect) -> [Rect; 4] {
+fn layout(area: Rect, input: &str) -> [Rect; 4] {
+    // The prompt box grows with the number of lines typed, up to a cap.
+    let rows = (input.split('\n').count() as u16).min(MAX_INPUT_ROWS);
     Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(3),
-        Constraint::Length(3),
+        Constraint::Length(rows + 2),
         Constraint::Length(1),
     ])
     .areas(area)
@@ -47,8 +51,8 @@ pub enum Region {
 }
 
 /// Map a terminal cell to the region it falls in, for a terminal of `area`.
-pub fn locate(area: Rect, col: u16, row: u16) -> Region {
-    let [_, transcript, input, _] = layout(area);
+pub fn locate(area: Rect, input: &str, col: u16, row: u16) -> Region {
+    let [_, transcript, input, _] = layout(area, input);
     let at = |r: Rect| r.contains((col, row).into());
     if at(transcript) {
         Region::Transcript
@@ -60,7 +64,7 @@ pub fn locate(area: Rect, col: u16, row: u16) -> Region {
 }
 
 pub fn render(f: &mut Frame, app: &App) {
-    let [header, transcript, input, status] = layout(f.area());
+    let [header, transcript, input, status] = layout(f.area(), &app.input);
     render_header(f, app, header);
     render_transcript(f, app, transcript);
     render_input(f, app, input);
@@ -391,21 +395,34 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
         let n = t.chars().count();
         t.chars().skip(n.saturating_sub(room)).collect::<String>()
     };
-    let line = if app.input.is_empty() && !active {
-        Line::from(vec![
-            Span::styled("› ", DIM),
+    let prompt = |style: Style| Span::styled("› ", style);
+    let lines: Vec<Line> = if app.input.is_empty() && !active {
+        vec![Line::from(vec![
+            prompt(DIM),
             Span::styled("press i to write a prompt", DIM),
-        ])
-    } else if active {
-        Line::from(vec![
-            Span::styled("› ", Style::new().fg(ACCENT)),
-            Span::raw(tail(&app.input)),
-            Span::styled("▏", Style::new().fg(ACCENT)),
-        ])
+        ])]
     } else {
-        Line::from(vec![Span::styled("› ", DIM), Span::raw(tail(&app.input))])
+        let parts: Vec<&str> = app.input.split('\n').collect();
+        let last = parts.len() - 1;
+        let first = last.saturating_sub(MAX_INPUT_ROWS as usize - 1);
+        parts[first..]
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let lead = if first + i == 0 {
+                    prompt(if active { Style::new().fg(ACCENT) } else { DIM })
+                } else {
+                    Span::raw("  ")
+                };
+                let mut spans = vec![lead, Span::raw(tail(p))];
+                if active && first + i == last {
+                    spans.push(Span::styled("▏", Style::new().fg(ACCENT)));
+                }
+                Line::from(spans)
+            })
+            .collect()
     };
-    f.render_widget(Paragraph::new(line), inner);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
@@ -467,7 +484,12 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             ("^C", "cancel turn"),
             ("Esc", "normal"),
         ],
-        Mode::Insert => &[("Enter", "send"), ("Esc", "normal"), ("^C", "quit")],
+        Mode::Insert => &[
+            ("Enter", "send"),
+            ("S-Enter", "newline"),
+            ("Esc", "normal"),
+            ("^C", "quit"),
+        ],
         Mode::Picker | Mode::Model | Mode::Switcher => {
             &[("j/k", "move"), ("Enter/1-9", "choose"), ("Esc", "close")]
         }
