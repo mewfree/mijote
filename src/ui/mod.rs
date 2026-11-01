@@ -30,9 +30,9 @@ const MAX_INPUT_ROWS: u16 = 6;
 
 /// Screen areas: header, transcript, prompt box, status bar. Shared by
 /// rendering and mouse hit-testing so they cannot drift apart.
-fn layout(area: Rect, input: &str) -> [Rect; 4] {
+fn layout(area: Rect, input_lines: usize) -> [Rect; 4] {
     // The prompt box grows with the number of lines typed, up to a cap.
-    let rows = (input.split('\n').count() as u16).min(MAX_INPUT_ROWS);
+    let rows = (input_lines as u16).min(MAX_INPUT_ROWS);
     Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(3),
@@ -51,8 +51,8 @@ pub enum Region {
 }
 
 /// Map a terminal cell to the region it falls in, for a terminal of `area`.
-pub fn locate(area: Rect, input: &str, col: u16, row: u16) -> Region {
-    let [_, transcript, input, _] = layout(area, input);
+pub fn locate(area: Rect, input_lines: usize, col: u16, row: u16) -> Region {
+    let [_, transcript, input, _] = layout(area, input_lines);
     let at = |r: Rect| r.contains((col, row).into());
     if at(transcript) {
         Region::Transcript
@@ -64,7 +64,7 @@ pub fn locate(area: Rect, input: &str, col: u16, row: u16) -> Region {
 }
 
 pub fn render(f: &mut Frame, app: &App) {
-    let [header, transcript, input, status] = layout(f.area(), &app.input);
+    let [header, transcript, input, status] = layout(f.area(), app.input.line_count());
     render_header(f, app, header);
     render_transcript(f, app, transcript);
     render_input(f, app, input);
@@ -390,11 +390,6 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let room = (inner.width as usize).saturating_sub(3);
-    let tail = |t: &str| {
-        let n = t.chars().count();
-        t.chars().skip(n.saturating_sub(room)).collect::<String>()
-    };
     let prompt = |style: Style| Span::styled("› ", style);
     let lines: Vec<Line> = if app.input.is_empty() && !active {
         vec![Line::from(vec![
@@ -402,21 +397,45 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("press i to write a prompt", DIM),
         ])]
     } else {
-        let parts: Vec<&str> = app.input.split('\n').collect();
-        let last = parts.len() - 1;
-        let first = last.saturating_sub(MAX_INPUT_ROWS as usize - 1);
-        parts[first..]
-            .iter()
+        // Scroll sideways and vertically just enough to keep the cursor in view.
+        let room = (inner.width as usize).saturating_sub(3).max(1);
+        let (crow, ccol) = app.input.cursor_pos();
+        let off = (ccol + 1).saturating_sub(room);
+        let rows = app.input.line_count().min(MAX_INPUT_ROWS as usize);
+        let first = (crow + 1).saturating_sub(rows);
+        // Insert mode uses the terminal cursor; normal mode paints a block.
+        let paint_block = app.mode == Mode::Normal && !app.sessions.is_empty();
+        if active {
+            let x = inner.x + 2 + (ccol - off) as u16;
+            if x < inner.right() {
+                f.set_cursor_position((x, inner.y + (crow - first) as u16));
+            }
+        }
+        app.input
+            .text()
+            .split('\n')
             .enumerate()
+            .skip(first)
+            .take(rows)
             .map(|(i, p)| {
-                let lead = if first + i == 0 {
+                let lead = if i == 0 {
                     prompt(if active { Style::new().fg(ACCENT) } else { DIM })
                 } else {
                     Span::raw("  ")
                 };
-                let mut spans = vec![lead, Span::raw(tail(p))];
-                if active && first + i == last {
-                    spans.push(Span::styled("▏", Style::new().fg(ACCENT)));
+                let chars: Vec<char> = p.chars().skip(off).collect();
+                let mut spans = vec![lead];
+                if paint_block && i == crow {
+                    let at = (ccol - off).min(chars.len());
+                    let under = chars.get(at).copied().unwrap_or(' ');
+                    spans.push(Span::raw(chars[..at].iter().collect::<String>()));
+                    spans.push(Span::styled(
+                        under.to_string(),
+                        Style::new().add_modifier(Modifier::REVERSED),
+                    ));
+                    spans.push(Span::raw(chars.iter().skip(at + 1).collect::<String>()));
+                } else {
+                    spans.push(Span::raw(chars.into_iter().collect::<String>()));
                 }
                 Line::from(spans)
             })
@@ -427,6 +446,7 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
     let (badge, badge_bg) = match app.mode {
+        _ if app.leader => (" LEADER ", ASK),
         Mode::Normal => (" NORMAL ", ACCENT),
         Mode::Insert => (" INSERT ", OK),
         Mode::Picker => (" PICK ", ASK),
@@ -443,6 +463,10 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::raw("  "),
     ];
+    let pending = app.input.pending();
+    if !pending.is_empty() {
+        spans.push(Span::styled(format!("{pending}  "), Style::new().fg(WARN)));
+    }
     if let Some(m) = &app.message {
         spans.push(Span::styled(m.clone(), Style::new().fg(WARN)));
         f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -454,41 +478,53 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         .is_some_and(|s| matches!(s.status, Status::Running | Status::AwaitingPermission));
     let hints: &[(&'static str, &'static str)] = match app.mode {
         _ if app.confirm.is_some() => &[("y", "confirm"), ("any other key", "cancel")],
-        Mode::Normal if app.scroll > 0 => &[
-            ("G", "follow"),
-            ("PgUp/PgDn", "scroll"),
-            ("i", "prompt"),
-            ("n", "new"),
-            ("q", "quit"),
-        ],
-        Mode::Normal if busy => &[
-            ("^C", "cancel turn"),
-            ("s", "sessions"),
-            ("PgUp/PgDn", "scroll"),
-            ("n", "new"),
-            ("q", "quit"),
-        ],
-        Mode::Normal => &[
-            ("i", "prompt"),
+        _ if app.leader => &[
             ("n", "new"),
             ("N", "new here"),
             ("d", "close"),
             ("M", "model"),
             ("s", "sessions"),
-            ("PgUp/PgDn", "scroll"),
+            ("j/k", "select"),
+            ("g/G", "top/bottom"),
             ("m", "mouse"),
             ("q", "quit"),
+            ("Esc", "cancel"),
+        ],
+        Mode::Normal if app.sessions.is_empty() => &[
+            ("n", "new"),
+            ("N", "new here"),
+            ("m", "mouse"),
+            ("q", "quit"),
+        ],
+        Mode::Normal if app.scroll > 0 => &[
+            ("␣G", "follow"),
+            ("PgUp/PgDn", "scroll"),
+            ("i", "insert"),
+            ("␣", "commands"),
+        ],
+        Mode::Normal if busy => &[
+            ("^C", "cancel turn"),
+            ("␣", "commands"),
+            ("PgUp/PgDn", "scroll"),
+            ("i", "insert"),
+        ],
+        Mode::Normal => &[
+            ("i", "insert"),
+            ("␣", "commands"),
+            ("PgUp/PgDn", "scroll"),
+            ("^C", "quit"),
         ],
         Mode::Insert if busy => &[
             ("Enter", "send when idle"),
             ("^C", "cancel turn"),
+            ("^A", "commands"),
             ("Esc", "normal"),
         ],
         Mode::Insert => &[
             ("Enter", "send"),
             ("S-Enter", "newline"),
+            ("^A", "commands"),
             ("Esc", "normal"),
-            ("^C", "quit"),
         ],
         Mode::Picker | Mode::Model | Mode::Switcher => {
             &[("j/k", "move"), ("Enter/1-9", "choose"), ("Esc", "close")]
@@ -797,6 +833,33 @@ mod tests {
         app.confirm = Some(Confirm::Quit);
         term.draw(|f| render(f, &app)).unwrap();
         assert!(dump(&term).contains("Quit and stop it?"));
+    }
+
+    #[test]
+    fn prompt_shows_a_block_cursor_in_normal_mode() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.status = Status::Idle;
+        app.sessions.push(s);
+        app.input.set_text("ab\ncd");
+        app.input.normal('0');
+        app.input.normal('l');
+        let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let buf = term.backend().buffer();
+        let reversed: Vec<&str> = buf
+            .content()
+            .iter()
+            .filter(|c| c.modifier.contains(Modifier::REVERSED))
+            .map(|c| c.symbol())
+            .collect();
+        assert_eq!(reversed, vec!["d"], "{}", dump(&term));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 mod agent;
 mod app;
+mod editor;
 mod session;
 mod store;
 mod ui;

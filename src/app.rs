@@ -8,6 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 
 use crate::agent::{self, AgentSpec};
+use crate::editor::Editor;
 use crate::session::{Entry, Msg, Session, Status, UiMsg};
 use crate::store::Store;
 use crate::ui::{self, Region};
@@ -35,7 +36,9 @@ pub struct App {
     pub sessions: Vec<Session>,
     pub selected: usize,
     pub mode: Mode,
-    pub input: String,
+    pub input: Editor,
+    /// The leader key was pressed; the next key is an app-level command.
+    pub leader: bool,
     /// Agents offered by the new-session picker.
     pub picker: Vec<&'static AgentSpec>,
     pub picker_cursor: usize,
@@ -70,7 +73,8 @@ impl App {
             sessions: Vec::new(),
             selected: 0,
             mode: Mode::Normal,
-            input: String::new(),
+            input: Editor::default(),
+            leader: false,
             picker: Vec::new(),
             picker_cursor: 0,
             picker_isolated: true,
@@ -226,6 +230,20 @@ impl App {
             }
             return;
         }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.leader {
+            self.leader = false;
+            self.handle_command(key);
+            return;
+        }
+        if matches!(self.mode, Mode::Normal | Mode::Insert)
+            && !self.sessions.is_empty()
+            && (ctrl && key.code == KeyCode::Char('a')
+                || self.mode == Mode::Normal && key.code == KeyCode::Char(' '))
+        {
+            self.leader = true;
+            return;
+        }
         match self.mode {
             Mode::Normal => self.handle_normal(key),
             Mode::Insert => self.handle_insert(key),
@@ -244,14 +262,19 @@ impl App {
         {
             return;
         }
-        let region = ui::locate(area, &self.input, ev.column, ev.row);
+        let region = ui::locate(area, self.input.line_count(), ev.column, ev.row);
         match ev.kind {
             MouseEventKind::ScrollUp if region != Region::Other => self.scroll_up(3),
             MouseEventKind::ScrollDown if region != Region::Other => {
                 self.scroll = self.scroll.saturating_sub(3)
             }
             MouseEventKind::Down(MouseButton::Left) => match region {
-                Region::Input if !self.sessions.is_empty() => self.mode = Mode::Insert,
+                Region::Input if !self.sessions.is_empty() => {
+                    if self.mode != Mode::Insert {
+                        self.input.checkpoint();
+                    }
+                    self.mode = Mode::Insert;
+                }
                 _ => {}
             },
             _ => {}
@@ -283,7 +306,47 @@ impl App {
         }
     }
 
+    /// Normal mode edits the prompt vim-style; app-level commands sit behind
+    /// the leader key. With no session there is no prompt, so they are direct.
     fn handle_normal(&mut self, key: KeyEvent) {
+        if self.sessions.is_empty() {
+            self.handle_command(key);
+            return;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let motion = match key.code {
+            KeyCode::Char(c) if !ctrl => Some(c),
+            KeyCode::Left => Some('h'),
+            KeyCode::Right => Some('l'),
+            KeyCode::Up => Some('k'),
+            KeyCode::Down => Some('j'),
+            KeyCode::Home => Some('0'),
+            KeyCode::End => Some('$'),
+            _ => None,
+        };
+        if let Some(c) = motion {
+            if self.input.normal(c) {
+                self.mode = Mode::Insert;
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => self.input.cancel_pending(),
+            KeyCode::Char('r') if ctrl => self.input.redo(),
+            KeyCode::Enter => {
+                self.input.checkpoint();
+                self.mode = Mode::Insert;
+            }
+            KeyCode::Tab => self.open_switcher(),
+            KeyCode::PageUp => self.scroll_up(10),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
+            _ => {}
+        }
+    }
+
+    /// App-level commands: the key after the leader, or any key in normal mode
+    /// when there is no session.
+    fn handle_command(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('n') => self.open_picker(true),
@@ -302,11 +365,6 @@ impl App {
                     .into(),
                 );
             }
-            KeyCode::Char('i') | KeyCode::Enter => {
-                if !self.sessions.is_empty() {
-                    self.mode = Mode::Insert;
-                }
-            }
             KeyCode::Char('j') => self.select(1),
             KeyCode::Char('k') => self.select(-1),
             // Terminals without mouse capture turn the wheel into arrow
@@ -317,6 +375,10 @@ impl App {
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::Char('g') | KeyCode::Home => self.scroll = self.max_scroll.get(),
             KeyCode::Char('G') | KeyCode::End => self.scroll = 0,
+            KeyCode::Char('i') | KeyCode::Enter if !self.sessions.is_empty() => {
+                self.input.checkpoint();
+                self.mode = Mode::Insert;
+            }
             _ => {}
         }
     }
@@ -350,20 +412,24 @@ impl App {
     }
 
     fn handle_insert(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Esc => {
+                self.input.leave_insert();
+                self.mode = Mode::Normal;
+            }
             KeyCode::Enter
                 if key
                     .modifiers
                     .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
             {
-                self.input.push('\n');
+                self.input.insert('\n');
             }
-            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.input.push('\n');
-            }
+            KeyCode::Char('j') if ctrl => self.input.insert('\n'),
+            KeyCode::Char('w') if ctrl => self.input.delete_word_back(),
+            KeyCode::Char('u') if ctrl => self.input.kill_line_back(),
             KeyCode::Enter => {
-                let text = self.input.trim().to_string();
+                let text = self.input.text().trim().to_string();
                 if text.is_empty() {
                     return;
                 }
@@ -386,10 +452,15 @@ impl App {
             }
             KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
-            KeyCode::Char(c) => self.input.push(c),
+            KeyCode::Backspace => self.input.backspace(),
+            KeyCode::Delete => self.input.delete_forward(),
+            KeyCode::Left => self.input.left(),
+            KeyCode::Right => self.input.right(),
+            KeyCode::Up => self.input.up(),
+            KeyCode::Down => self.input.down(),
+            KeyCode::Home => self.input.home(),
+            KeyCode::End => self.input.end(),
+            KeyCode::Char(c) if !ctrl => self.input.insert(c),
             _ => {}
         }
     }
@@ -626,7 +697,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('a')));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
         app.handle_key(key(KeyCode::Char('b')));
-        assert_eq!(app.input, "a\nb");
+        assert_eq!(app.input.text(), "a\nb");
         assert_eq!(app.sessions[0].status, Status::Idle);
     }
 
@@ -685,6 +756,7 @@ mod tests {
     #[test]
     fn q_quits_from_normal_mode() {
         let (mut app, _) = app_with_session();
+        app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Char('q')));
         assert!(app.should_quit);
     }
@@ -693,11 +765,13 @@ mod tests {
     fn q_asks_before_quitting_a_running_turn() {
         let (mut app, _) = app_with_session();
         app.sessions[0].status = Status::Running;
+        app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Char('q')));
         assert!(!app.should_quit);
         assert_eq!(app.confirm, Some(Confirm::Quit));
         app.handle_key(key(KeyCode::Char('n')));
         assert!(!app.should_quit && app.confirm.is_none());
+        app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Char('q')));
         app.handle_key(key(KeyCode::Char('y')));
         assert!(app.should_quit);
@@ -706,6 +780,7 @@ mod tests {
     #[test]
     fn d_confirms_when_session_has_history() {
         let (mut app, _) = app_with_session();
+        app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Char('d')));
         assert_eq!(app.sessions.len(), 0);
 
@@ -713,6 +788,7 @@ mod tests {
         app.sessions[0]
             .entries
             .push(crate::session::Entry::Agent("x".into()));
+        app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Char('d')));
         assert_eq!(app.sessions.len(), 1);
         assert_eq!(app.confirm, Some(Confirm::CloseSession));
@@ -736,6 +812,7 @@ mod tests {
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].1.entries, vec![Entry::Agent("hi".into())]);
 
+        app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Char('d')));
         app.handle_key(key(KeyCode::Char('y')));
         assert!(app.store.load(app.cwd()).is_empty());
@@ -756,6 +833,7 @@ mod tests {
         let (mut app, _) = app_with_session();
         let (s, _) = Session::detached(1, agent::find("gemini").unwrap());
         app.sessions.push(s);
+        app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Char('s')));
         assert_eq!(app.mode, Mode::Switcher);
         app.handle_key(key(KeyCode::Char('j')));
@@ -787,6 +865,7 @@ mod tests {
     fn model_picker_selects_between_turns() {
         use crate::agent::acp::{ModelInfo, ModelState};
         let (mut app, _) = app_with_session();
+        app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Char('M')));
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.message.is_some());
@@ -805,6 +884,7 @@ mod tests {
             ],
             ..Default::default()
         };
+        app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Char('M')));
         assert_eq!(app.mode, Mode::Model);
         assert_eq!(app.model_cursor, 1, "starts on the current model");
@@ -833,7 +913,7 @@ mod tests {
         };
         let say = |app: &mut App, t: &str| {
             app.mode = Mode::Insert;
-            app.input = t.into();
+            app.input.set_text(t);
             app.handle_key(key(KeyCode::Enter));
         };
         say(&mut app, "/model");
@@ -857,6 +937,7 @@ mod tests {
     fn m_toggles_mouse_capture() {
         let (mut app, _) = app_with_session();
         assert!(app.mouse);
+        app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Char('m')));
         assert!(!app.mouse);
     }
@@ -867,6 +948,71 @@ mod tests {
         app.sessions[0].status = Status::Running;
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.sessions[0].status, Status::Running);
+    }
+
+    fn type_keys(app: &mut App, ks: &str) {
+        for c in ks.chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn vim_keys_edit_the_prompt_instead_of_closing_the_session() {
+        let (mut app, _) = app_with_session();
+        app.input.set_text("one\ntwo");
+        app.sessions[0]
+            .entries
+            .push(crate::session::Entry::Agent("x".into()));
+        type_keys(&mut app, "ddq");
+        assert_eq!(app.input.text(), "one");
+        assert!(app.confirm.is_none() && !app.should_quit);
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn leader_runs_app_commands_from_both_modes() {
+        let (mut app, _) = app_with_session();
+        app.sessions[0]
+            .entries
+            .push(crate::session::Entry::Agent("x".into()));
+        type_keys(&mut app, " d");
+        assert_eq!(app.confirm, Some(Confirm::CloseSession));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.sessions.len(), 1);
+
+        // From insert mode via Ctrl-A; the mode survives a command that
+        // does not change it, and the next key types normally again.
+        type_keys(&mut app, "i");
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(app.leader);
+        type_keys(&mut app, "m");
+        assert!(!app.mouse && !app.leader);
+        assert_eq!(app.mode, Mode::Insert);
+        type_keys(&mut app, "d");
+        assert_eq!(app.input.text(), "d");
+    }
+
+    #[test]
+    fn normal_mode_edits_then_returns_to_insert() {
+        let (mut app, _) = app_with_session();
+        type_keys(&mut app, "ihello world");
+        app.handle_key(key(KeyCode::Esc));
+        type_keys(&mut app, "bcwthere");
+        assert_eq!(app.mode, Mode::Insert);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.input.text(), "hello there");
+        type_keys(&mut app, "u");
+        assert_eq!(app.input.text(), "hello world");
+    }
+
+    #[test]
+    fn app_keys_are_direct_without_sessions() {
+        let (tx, _rx) = mpsc::channel();
+        let store = Store::new(tempfile::tempdir().unwrap().keep());
+        let mut app = App::new(PathBuf::from("."), PathBuf::from("."), store, tx);
+        app.handle_key(key(KeyCode::Char('q')));
+        assert!(app.should_quit);
     }
 
     #[test]

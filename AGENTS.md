@@ -11,6 +11,7 @@ mark tasks `** DONE` when finished. Do not add features without a task entry.
 | `src/app.rs` | app state (planned) |
 | `src/config.rs` | config loading (planned) |
 | `src/agent/` | agent trait, registry, ACP and stream-json transports |
+| `src/editor.rs` | prompt buffer, cursor, vim normal mode (no ui deps) |
 | `src/session.rs` | task -> session -> transcript (planned) |
 | `src/worktree.rs` | git worktree per task (planned) |
 | `src/ui/` | ratatui rendering (planned) |
