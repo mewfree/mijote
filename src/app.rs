@@ -1,6 +1,6 @@
 //! TUI application state and key handling. No rendering here.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 
 use crate::agent::{self, AgentSpec};
 use crate::editor::Editor;
+use crate::selection::Selection;
 use crate::session::{Entry, Msg, Session, Status, UiMsg};
 use crate::store::Store;
 use crate::ui::{self, Region};
@@ -52,6 +53,12 @@ pub struct App {
     /// Largest useful `scroll`, reported by the last render so scrolling
     /// stops at the top instead of piling up invisible overscroll.
     pub max_scroll: Cell<u16>,
+    /// Mouse selection over the transcript, in content coordinates.
+    pub selection: Option<Selection>,
+    /// Plain text of the transcript lines from the last render, for copying.
+    pub transcript_text: RefCell<Vec<String>>,
+    /// Text to put on the clipboard; the event loop owns the terminal I/O.
+    pub pending_copy: Option<String>,
     pub should_quit: bool,
     /// Whether the terminal reports mouse events (`m` toggles; off lets the
     /// terminal select text natively).
@@ -82,6 +89,9 @@ impl App {
             switcher_cursor: 0,
             scroll: 0,
             max_scroll: Cell::new(u16::MAX),
+            selection: None,
+            transcript_text: RefCell::new(Vec::new()),
+            pending_copy: None,
             should_quit: false,
             mouse: true,
             confirm: None,
@@ -203,6 +213,7 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         self.message = None;
+        self.selection = None;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             match self.current_mut() {
                 Some(s) if matches!(s.status, Status::Running | Status::AwaitingPermission) => {
@@ -268,17 +279,63 @@ impl App {
             MouseEventKind::ScrollDown if region != Region::Other => {
                 self.scroll = self.scroll.saturating_sub(3)
             }
-            MouseEventKind::Down(MouseButton::Left) => match region {
-                Region::Input if !self.sessions.is_empty() => {
-                    if self.mode != Mode::Insert {
-                        self.input.checkpoint();
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.selection = None;
+                match region {
+                    Region::Transcript => {
+                        self.selection = self.content_pos(area, ev).map(Selection::new)
                     }
-                    self.mode = Mode::Insert;
+                    Region::Input if !self.sessions.is_empty() => {
+                        if self.mode != Mode::Insert {
+                            self.input.checkpoint();
+                        }
+                        self.mode = Mode::Insert;
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.selection.is_some() => {
+                // Dragging past an edge scrolls, so a selection can grow
+                // beyond one screen.
+                let view = ui::transcript_area(area, self.input.line_count());
+                if ev.row < view.y {
+                    self.scroll_up(1);
+                } else if ev.row >= view.bottom() {
+                    self.scroll = self.scroll.saturating_sub(1);
+                }
+                if let (Some(pos), Some(sel)) = (self.content_pos(area, ev), &mut self.selection) {
+                    sel.head = pos;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(sel) = self.selection {
+                    if sel.is_empty() {
+                        self.selection = None;
+                    } else {
+                        let text = sel.extract(&self.transcript_text.borrow());
+                        if !text.is_empty() {
+                            self.pending_copy = Some(text);
+                            self.message = Some("copied selection".into());
+                        }
+                    }
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Transcript content position under the mouse, clamping to the
+    /// transcript area so drags past its edges keep extending the selection.
+    fn content_pos(&self, area: Rect, ev: MouseEvent) -> Option<(usize, u16)> {
+        let view = ui::transcript_area(area, self.input.line_count());
+        if view.height == 0 || view.width == 0 {
+            return None;
+        }
+        let row = ev.row.clamp(view.y, view.bottom() - 1) - view.y;
+        let col = ev.column.clamp(view.x, view.right() - 1) - view.x;
+        let max = self.max_scroll.get();
+        let top = max.saturating_sub(self.scroll.min(max));
+        Some((top as usize + row as usize, col))
     }
 
     fn handle_permission_key(&mut self, key: KeyEvent) {
@@ -825,6 +882,27 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    #[test]
+    fn dragging_over_the_transcript_selects_and_queues_a_copy() {
+        let (mut app, _) = app_with_session();
+        *app.transcript_text.borrow_mut() = vec!["hello world".into(), "second".into()];
+        app.max_scroll.set(0);
+        let area = Rect::new(0, 0, 80, 30);
+        let mouse = |kind, col, row| MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // The transcript starts below the 2-row header.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, 2), area);
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2, 3), area);
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2, 3), area);
+        assert_eq!(app.pending_copy.as_deref(), Some("world\nsec"));
+        app.handle_key(key(KeyCode::Char('x')));
+        assert!(app.selection.is_none());
     }
 
     #[test]

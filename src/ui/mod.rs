@@ -50,6 +50,11 @@ pub enum Region {
     Other,
 }
 
+/// The transcript's screen rectangle.
+pub fn transcript_area(area: Rect, input_lines: usize) -> Rect {
+    layout(area, input_lines)[1]
+}
+
 /// Map a terminal cell to the region it falls in, for a terminal of `area`.
 pub fn locate(area: Rect, input_lines: usize, col: u16, row: u16) -> Region {
     let [_, transcript, input, _] = layout(area, input_lines);
@@ -376,7 +381,28 @@ fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
     let max_scroll = total.saturating_sub(inner.height);
     app.max_scroll.set(max_scroll);
     let from_top = max_scroll.saturating_sub(app.scroll.min(max_scroll));
+    let text: Vec<String> = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
     f.render_widget(Paragraph::new(lines).scroll((from_top, 0)), inner);
+
+    if let Some(sel) = app.selection {
+        for y in 0..inner.height {
+            let line = from_top as usize + y as usize;
+            let Some(t) = text.get(line) else {
+                break;
+            };
+            if let Some((from, to)) = sel.content_cols_on(line, t) {
+                for x in from..to.min(inner.width) {
+                    if let Some(cell) = f.buffer_mut().cell_mut((inner.x + x, inner.y + y)) {
+                        cell.set_style(Style::new().add_modifier(Modifier::REVERSED));
+                    }
+                }
+            }
+        }
+    }
+    *app.transcript_text.borrow_mut() = text;
 }
 
 fn render_input(f: &mut Frame, app: &App, area: Rect) {

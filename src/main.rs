@@ -1,6 +1,8 @@
 mod agent;
 mod app;
+mod clipboard;
 mod editor;
+mod selection;
 mod session;
 mod store;
 mod ui;
@@ -172,6 +174,11 @@ fn tui() -> Result<()> {
                 app.handle_msg(msg);
             }
             terminal.draw(|f| ui::render(f, &app))?;
+            if let Some(text) = app.pending_copy.take() {
+                if clipboard::copy(&text).is_err() {
+                    app.message = Some("copy failed".into());
+                }
+            }
             if event::poll(Duration::from_millis(50))? {
                 match event::read()? {
                     TermEvent::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
