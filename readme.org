@@ -8,6 +8,8 @@ one place to review diffs and approve tool calls.
 It does *not* replace the agents. Each backend spawns the official CLI, so your
 existing subscriptions, logins and quotas keep working untouched.
 
+[[file:demo.gif]]
+
 * status
 
 Early scaffold. See =project.org= for the plan.

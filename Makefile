@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help install run test lint fmt
+.PHONY: help install run test lint fmt demo
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  %-8s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -18,3 +18,7 @@ lint: ## Clippy, warnings as errors
 
 fmt: ## Format the code
 	cargo fmt --all
+
+demo: ## Record demo.gif with VHS (scripted fake agents)
+	cargo build --release
+	vhs demo.tape

@@ -95,3 +95,5 @@ Normal/Insert/Picker modes exist but the keys are ad hoc. Make it a real vim-sty
 Same prompt to N agents, compare resulting diffs.
 ** TODO Config (=~/.config/mijote/config.toml=)
 Enabled agents, binary paths, default permissions.
+** DONE README demo recording
+=demo.tape= (VHS), =demo-setup.sh= (throwaway git repo, =MIJOTE_HOME=, fake agents on =PATH=) and =demo-agent.py= (scripted ACP agent, no subscription used). =make demo= builds release and records =demo.gif=.
