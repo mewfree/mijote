@@ -12,7 +12,10 @@ existing subscriptions, logins and quotas keep working untouched.
 
 * status
 
-Early scaffold. See =project.org= for the plan.
+Early but usable: the TUI, ACP transport, session persistence, model
+selection and per-session worktrees work. Still open: ACP authentication,
+resuming agent context, and a review/merge flow for session branches. See
+=project.org= for the plan.
 
 * usage
 
@@ -23,10 +26,34 @@ mijote install claude
 mijote ask claude "explain this repo"
 #+end_src
 
-Keys: =n= new session (own worktree), =N= new session in the current
-directory/branch, =d= close it, =j=/=k= switch, =i= prompt, =Enter= send,
-=Esc=/=Ctrl-c= cancel a running turn, =q= quit. Permission requests pop up as
-a modal: =1-9= choose, =Esc= rejects.
+** keys
+
+The prompt is a vim-style editor: =i= / =Enter= insert, =Esc= back to normal,
+=Enter= send, =Shift-Enter= (or =Alt-Enter=, =Ctrl-J=) newline. Normal mode has
+motions (=h l j k 0 ^ $ w b e gg G=), operators (=d c y= + motion), =x p u
+Ctrl-r= and counts.
+
+App commands sit behind a leader, =Space= in normal mode or =Ctrl-a= anywhere
+(no leader needed while no session is open):
+
+| key           | action                                              |
+|---------------+-----------------------------------------------------|
+| =n=           | new session in its own worktree                     |
+| =N=           | new session in the current directory and branch     |
+| =d=           | close session                                       |
+| =s= / =Tab=   | floating session switcher (=j/k=, =1-9=, =Enter=)   |
+| =j= / =k=     | previous / next session                             |
+| =M=           | model picker (also =/model= in the prompt)          |
+| =m=           | toggle mouse capture                                |
+| =q=           | quit                                                |
+
+=Ctrl-c= cancels a running turn (or quits when idle). Permission requests pop
+up as a modal: =1-9= choose, =Esc= rejects. Scroll with the wheel, PgUp/PgDn or
+leader + arrows; drag with the mouse to select transcript text, which is
+copied to the clipboard on release. Sessions are saved under
+=~/.local/share/mijote/sessions= and reopened (transcript only) when you start
+mijote in the same directory again. =Shift-Enter= needs a terminal with the
+kitty keyboard protocol.
 
 By default each session runs in its own git worktree and branch (=mijote/<agent>-<n>=),
 stored under =~/.local/share/mijote/worktrees=. Untouched worktrees are deleted
@@ -45,4 +72,5 @@ make test
   stay in the vendor CLIs.
 - *transport*: Agent Client Protocol (ACP) over stdio, via each agent's native flag or adapter.
 - *isolation*: one git worktree per task, so agents never step on each other.
-- *ux*: ratatui TUI, keyboard first.
+- *ux*: ratatui TUI, keyboard first, vim-style prompt editing.
+- *persistence*: one JSON record per session; the agent restarts cold behind the old transcript.
