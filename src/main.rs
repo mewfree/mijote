@@ -137,8 +137,9 @@ fn tui() -> Result<()> {
     use std::time::Duration;
 
     use crossterm::event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyEventKind,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event as TermEvent, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     };
     use crossterm::execute;
 
@@ -159,6 +160,7 @@ fn tui() -> Result<()> {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
     }
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let mut mouse_on = false;
     let result = (|| -> Result<()> {
         while !app.should_quit {
@@ -182,6 +184,7 @@ fn tui() -> Result<()> {
             if event::poll(Duration::from_millis(50))? {
                 match event::read()? {
                     TermEvent::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+                    TermEvent::Paste(text) => app.handle_paste(&text),
                     TermEvent::Mouse(m) => app.handle_mouse(m, terminal.size()?.into()),
                     _ => {}
                 }
@@ -189,6 +192,7 @@ fn tui() -> Result<()> {
         }
         Ok(())
     })();
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     if mouse_on {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
     }

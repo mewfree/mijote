@@ -33,11 +33,18 @@ pub enum Confirm {
     Quit,
 }
 
+/// A paste with more lines or characters than this is collapsed to a placeholder.
+const PASTE_COLLAPSE_LINES: usize = 3;
+const PASTE_COLLAPSE_CHARS: usize = 500;
+
 pub struct App {
     pub sessions: Vec<Session>,
     pub selected: usize,
     pub mode: Mode,
     pub input: Editor,
+    /// Large pastes shown in `input` as a placeholder: (placeholder, text).
+    /// Expanded on submit.
+    pastes: Vec<(String, String)>,
     /// The leader key was pressed; the next key is an app-level command.
     pub leader: bool,
     /// Agents offered by the new-session picker.
@@ -81,6 +88,7 @@ impl App {
             selected: 0,
             mode: Mode::Normal,
             input: Editor::default(),
+            pastes: Vec::new(),
             leader: false,
             picker: Vec::new(),
             picker_cursor: 0,
@@ -262,6 +270,47 @@ impl App {
             Mode::Model => self.handle_model(key),
             Mode::Switcher => self.handle_switcher(key),
         }
+    }
+
+    /// Insert bracketed-paste `text` into the prompt. Pastes longer than
+    /// `PASTE_COLLAPSE_LINES` lines or `PASTE_COLLAPSE_CHARS` chars show as
+    /// `[Pasted text #1 +12 lines]` and are expanded when the prompt is sent.
+    pub fn handle_paste(&mut self, text: &str) {
+        if self.mode != Mode::Insert
+            || self.sessions.is_empty()
+            || self.confirm.is_some()
+            || self.current().is_some_and(|s| s.pending.is_some())
+        {
+            return;
+        }
+        self.message = None;
+        self.selection = None;
+        // Terminals send \r or \r\n for line breaks; tabs would break the
+        // cursor column maths, and other control chars can corrupt the screen.
+        let text: String = text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\t', "    ")
+            .chars()
+            .filter(|&c| c == '\n' || !c.is_control())
+            .collect();
+        let lines = text.matches('\n').count() + 1;
+        if lines <= PASTE_COLLAPSE_LINES && text.chars().count() <= PASTE_COLLAPSE_CHARS {
+            self.input.insert_str(&text);
+            return;
+        }
+        let n = self.pastes.len() + 1;
+        let placeholder = format!("[Pasted text #{n} +{lines} lines]");
+        self.input.insert_str(&placeholder);
+        self.pastes.push((placeholder, text));
+    }
+
+    /// `text` with paste placeholders replaced by what was pasted. A
+    /// placeholder the user edited or deleted is left alone.
+    fn expand_pastes(&self, text: &str) -> String {
+        self.pastes
+            .iter()
+            .fold(text.to_string(), |t, (ph, full)| t.replacen(ph, full, 1))
     }
 
     /// React to a mouse event on a terminal of `area`. Modals (picker,
@@ -492,8 +541,10 @@ impl App {
                 }
                 if self.slash_model(&text) {
                     self.input.clear();
+                    self.pastes.clear();
                     return;
                 }
+                let text = self.expand_pastes(&text);
                 let mut sent = None;
                 if let Some(s) = self.current_mut() {
                     if s.can_prompt() {
@@ -503,6 +554,7 @@ impl App {
                 }
                 if let Some(id) = sent {
                     self.input.clear();
+                    self.pastes.clear();
                     self.scroll = 0;
                     self.persist(id);
                 }
@@ -756,6 +808,40 @@ mod tests {
         app.handle_key(key(KeyCode::Char('b')));
         assert_eq!(app.input.text(), "a\nb");
         assert_eq!(app.sessions[0].status, Status::Idle);
+    }
+
+    #[test]
+    fn small_paste_is_inserted_verbatim() {
+        let (mut app, _) = app_with_session();
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_paste("a\r\nb\tc");
+        assert_eq!(app.input.text(), "a\nb    c");
+        assert_eq!(app.sessions[0].status, Status::Idle);
+    }
+
+    #[test]
+    fn large_paste_collapses_and_expands_on_send() {
+        let (mut app, _) = app_with_session();
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(key(KeyCode::Char('x')));
+        let big = "1\n2\n3\n4\n5";
+        app.handle_paste(big);
+        assert_eq!(app.input.text(), "x[Pasted text #1 +5 lines]");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.input.is_empty());
+        assert_eq!(app.sessions[0].status, Status::Running);
+        let sent = format!("x{big}");
+        assert!(app.sessions[0]
+            .entries
+            .iter()
+            .any(|e| matches!(e, Entry::User(t) if *t == sent)));
+    }
+
+    #[test]
+    fn paste_ignored_outside_insert_mode() {
+        let (mut app, _) = app_with_session();
+        app.handle_paste("hello");
+        assert!(app.input.is_empty());
     }
 
     #[test]

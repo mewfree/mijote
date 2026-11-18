@@ -115,6 +115,14 @@ impl Editor {
         self.cur += 1;
     }
 
+    /// Insert `s` at the cursor, cursor after it.
+    pub fn insert_str(&mut self, s: &str) {
+        self.want_col = None;
+        let n = s.chars().count();
+        self.buf.splice(self.cur..self.cur, s.chars());
+        self.cur += n;
+    }
+
     pub fn backspace(&mut self) {
         self.want_col = None;
         if self.cur > 0 {
@@ -707,6 +715,16 @@ mod tests {
         assert_eq!(e.text(), "lo ");
         assert!(keys(&mut e, "C"));
         assert_eq!(e.text(), "lo");
+    }
+
+    #[test]
+    fn insert_str_puts_cursor_after_text() {
+        let mut e = Editor::default();
+        e.set_text("ad");
+        e.left();
+        e.insert_str("bc\n");
+        assert_eq!(e.text(), "abc\nd");
+        assert_eq!(e.cursor_pos(), (1, 0));
     }
 
     #[test]
