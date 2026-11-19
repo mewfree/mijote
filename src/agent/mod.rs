@@ -17,6 +17,7 @@ pub enum Install {
         version: &'static str,
     },
     /// Not auto-installed; show this hint instead.
+    #[allow(dead_code)]
     Manual(&'static str),
 }
 
@@ -67,12 +68,10 @@ pub const KNOWN: &[AgentSpec] = &[
     AgentSpec {
         id: "antigravity",
         name: "Antigravity",
-        bin: "antigravity-acp",
-        args: &[],
-        install: Install::Manual(
-            "install https://github.com/shubzkothekar/antigravity-acp (needs Bun or a prebuilt binary, plus `agy`)",
-        ),
-        note: "community adapter around `agy`; Google's ToS may forbid third-party access",
+        bin: "agy",
+        args: &["acp"],
+        install: Install::None,
+        note: "native ACP subcommand",
     },
 ];
 

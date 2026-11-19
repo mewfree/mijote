@@ -7,7 +7,7 @@
 Reusing subscriptions means driving the official CLIs. Writing our own agent loop would force API-key billing and lose vendor tuning. We own the UX, sessions and worktrees; vendors own the loop.
 
 ** DONE Antigravity entry point
-Community adapter =antigravity-acp= wraps the =agy= CLI over ACP. Works technically; ToS risk noted above.
+Official =agy= CLI ships a native ACP stdio server (=agy acp=), configured with =Install::None= in =src/agent/mod.rs= (no third-party adapter). Verified end to end with =mijote ask antigravity= and =session/set_config_option= model switching.
 
 * Tasks
 
@@ -20,8 +20,8 @@ Community adapter =antigravity-acp= wraps the =agy= CLI over ACP. Works technica
 =session/cancel= needs a non-blocking prompt loop (comes with the TUI event loop). Then =session/load= and =session/set_mode=.
 ** DONE Managed adapter install
 =src/agent/install.rs=: resolves an agent binary from PATH or =$MIJOTE_HOME= (default =~/.local/share/mijote=), otherwise =npm install --prefix= of a pinned adapter version (claude: =@agentclientprotocol/claude-agent-acp=, codex: =@agentclientprotocol/codex-acp=). =mijote install <agent>= does it explicitly; =mijote ask= does it on first use. Requires Node/npm. Verified: =mijote ask claude= completes a real turn.
-** TODO Verify codex and antigravity end to end
-Exercise =codex-acp= (needs Codex login or API key). Antigravity stays manual (Bun or prebuilt binary + =agy=); Google's ToS prohibits third-party access with personal accounts.
+** TODO Verify codex end to end
+Exercise =codex-acp= (needs Codex login or API key).
 ** TODO Adapter updates
 Pinned versions drift. Add =mijote update= (or a version check) and decide how to handle a missing Node (download a managed runtime?).
 ** TODO Stream-JSON fallback transport (only if an agent lacks an ACP adapter)

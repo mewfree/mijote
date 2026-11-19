@@ -99,15 +99,18 @@ fn npm_install(dir: &Path, package: &'static str, version: &str) -> Result<(), I
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::find;
 
     #[test]
     fn manual_agent_reports_hint_instead_of_installing() {
-        let spec = find("antigravity").unwrap();
-        // Only meaningful when the adapter is absent, which is the CI case.
-        if locate(spec).is_none() {
-            let err = ensure(spec).unwrap_err();
-            assert!(matches!(err, InstallError::Manual(..)));
-        }
+        let spec = AgentSpec {
+            id: "manual-test",
+            name: "Manual Test",
+            bin: "mijote-nonexistent-manual-bin",
+            args: &[],
+            install: Install::Manual("install manually"),
+            note: "",
+        };
+        let err = ensure(&spec).unwrap_err();
+        assert!(matches!(err, InstallError::Manual(_, "install manually")));
     }
 }
