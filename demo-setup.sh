@@ -8,8 +8,8 @@ rm -rf "$DEMO"
 mkdir -p "$DEMO/bin" "$DEMO/home" "$DEMO/repo/src"
 
 printf '#!/bin/sh\nexec python3 %s "Claude Code"\n' "$SRC/demo-agent.py" > "$DEMO/bin/claude-agent-acp"
-printf '#!/bin/sh\nexec python3 %s "Gemini CLI"\n' "$SRC/demo-agent.py" > "$DEMO/bin/gemini"
-chmod +x "$DEMO/bin/claude-agent-acp" "$DEMO/bin/gemini"
+printf '#!/bin/sh\nexec python3 %s "Codex CLI"\n' "$SRC/demo-agent.py" > "$DEMO/bin/codex-acp"
+chmod +x "$DEMO/bin/claude-agent-acp" "$DEMO/bin/codex-acp"
 
 export MIJOTE_HOME="$DEMO/home"
 export PATH="$SRC/target/release:$DEMO/bin:$PATH"

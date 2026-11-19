@@ -1002,7 +1002,7 @@ mod tests {
     fn switcher_picks_a_session_and_mouse_scrolls() {
         let area = Rect::new(0, 0, 100, 30);
         let (mut app, _) = app_with_session();
-        let (s, _) = Session::detached(1, agent::find("gemini").unwrap());
+        let (s, _) = Session::detached(1, agent::find("antigravity").unwrap());
         app.sessions.push(s);
         app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Char('s')));

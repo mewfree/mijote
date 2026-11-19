@@ -1,8 +1,8 @@
 #+title: mijote
 #+description: A keyboard-driven TUI orchestrator for the coding agents you already pay for
 
-mijote runs several coding agents side by side (Claude Code, Gemini CLI,
-Codex...) behind one interface: shared sessions, isolated git worktrees,
+mijote runs several coding agents side by side (Claude Code, Codex,
+Antigravity...) behind one interface: shared sessions, isolated git worktrees,
 one place to review diffs and approve tool calls.
 
 It does *not* replace the agents. Each backend spawns the official CLI, so your

@@ -9,6 +9,9 @@ Reusing subscriptions means driving the official CLIs. Writing our own agent loo
 ** DONE Antigravity entry point
 Official =agy= CLI ships a native ACP stdio server (=agy acp=), configured with =Install::None= in =src/agent/mod.rs= (no third-party adapter). Verified end to end with =mijote ask antigravity= and =session/set_config_option= model switching.
 
+** DONE Remove Gemini CLI backend
+Removed the =gemini= entry from =agent::KNOWN= in =src/agent/mod.rs= now that Antigravity (=agy acp=) is supported. Updated =readme.org=, =demo-setup.sh=, and the switcher test in =src/app.rs=.
+
 * Tasks
 
 ** DONE Scaffold crate, Makefile, readme.org, project.org

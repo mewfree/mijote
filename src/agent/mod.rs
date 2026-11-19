@@ -47,14 +47,6 @@ pub const KNOWN: &[AgentSpec] = &[
         note: "ACP adapter around the Claude Agent SDK",
     },
     AgentSpec {
-        id: "gemini",
-        name: "Gemini CLI",
-        bin: "gemini",
-        args: &["--experimental-acp"],
-        install: Install::None,
-        note: "native ACP flag",
-    },
-    AgentSpec {
         id: "codex",
         name: "Codex CLI",
         bin: "codex-acp",
