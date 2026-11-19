@@ -104,3 +104,5 @@ Same prompt to N agents, compare resulting diffs.
 Enabled agents, binary paths, default permissions.
 ** DONE README demo recording
 =demo.tape= (VHS), =demo-setup.sh= (throwaway git repo, =MIJOTE_HOME=, fake agents on =PATH=) and =demo-agent.py= (scripted ACP agent, no subscription used). =make demo= builds release and records =demo.gif=.
+** DONE TUI: ASCII logo on the welcome screen
+=render_logo= in =src/ui/mod.rs= draws a small pot with a face and the name at the top-left of the main pane (welcome screen and empty sessions). Static; no animation yet. The empty-session hint no longer says "press i" when already in insert mode.

@@ -333,17 +333,40 @@ fn key_hint(key: &'static str, what: &'static str) -> Vec<Span<'static>> {
     ]
 }
 
+fn logo_lines() -> Vec<Line<'static>> {
+    let pot = Style::new().fg(ACCENT);
+    vec![
+        Line::styled("   ° ˚ °", DIM),
+        Line::styled(" ╭───────╮", pot),
+        Line::from(vec![
+            Span::styled("━┥ ", pot),
+            Span::styled("◕ ‿ ◕", Style::new().fg(WARN)),
+            Span::styled(" ┝━", pot),
+            Span::styled("  mijote", BOLD),
+        ]),
+        Line::styled(" ╰───────╯", pot),
+    ]
+}
+
+fn render_logo(f: &mut Frame, area: Rect) {
+    let lines = logo_lines();
+    let r = Rect {
+        x: area.x + 1,
+        y: area.y,
+        width: area.width.saturating_sub(1),
+        height: (lines.len() as u16).min(area.height),
+    };
+    f.render_widget(Paragraph::new(lines), r);
+}
+
 fn render_welcome(f: &mut Frame, area: Rect) {
     let rows = [
         ("n", "new isolated session (git worktree)"),
         ("N", "new session in the current directory"),
         ("q", "quit"),
     ];
+    render_logo(f, area);
     let mut lines = vec![
-        Line::from(vec![
-            Span::styled("◆ ", Style::new().fg(ACCENT)),
-            Span::styled("mijote", BOLD),
-        ]),
         Line::styled("the coding agents you already pay for, in one place", DIM),
         Line::from(""),
     ];
@@ -369,9 +392,12 @@ fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
         let msg = match s.status {
             Status::Starting => "starting agent (first run may install the adapter)…",
             Status::Failed => "agent failed to start",
+            _ if app.mode == Mode::Insert => "type a prompt, Enter to send, Esc for normal mode",
             _ => "press i to write a prompt, Enter to send",
         };
-        f.render_widget(Paragraph::new(Line::styled(format!("  {msg}"), DIM)), inner);
+        render_logo(f, inner);
+        let r = centered(inner, 52, 1);
+        f.render_widget(Paragraph::new(Line::styled(msg, DIM)), r);
         return;
     }
 
