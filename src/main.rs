@@ -18,6 +18,9 @@ use agent::acp::{AcpClient, Event, StopReason};
 #[derive(Parser)]
 #[command(name = "mijote", version, about)]
 struct Cli {
+    /// Reopen saved sessions for the current directory instead of starting a new one
+    #[arg(short, long)]
+    resume: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -25,7 +28,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Open the TUI (default)
-    Tui,
+    Tui {
+        /// Reopen saved sessions for the current directory instead of starting a new one
+        #[arg(short, long)]
+        resume: bool,
+    },
     /// List known agent backends and whether they are on PATH
     Agents,
     /// Install an agent's ACP adapter into mijote's data dir
@@ -43,8 +50,9 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().command.unwrap_or(Command::Tui) {
-        Command::Tui => tui(),
+    let cli = Cli::parse();
+    match cli.command.unwrap_or(Command::Tui { resume: false }) {
+        Command::Tui { resume } => tui(cli.resume || resume),
         Command::Agents => list_agents(),
         Command::Install { agent } => install(&agent),
         Command::Ask { agent, prompt } => ask(&agent, &prompt),
@@ -132,7 +140,7 @@ fn ask(id: &str, prompt: &str) -> Result<()> {
     Ok(())
 }
 
-fn tui() -> Result<()> {
+fn tui(resume: bool) -> Result<()> {
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -150,7 +158,11 @@ fn tui() -> Result<()> {
         store::Store::new(agent::install::data_dir().join("sessions")),
         tx,
     );
-    app.restore();
+    if resume {
+        app.restore();
+    } else {
+        app.open_default_session();
+    }
     let mut terminal = ratatui::init();
     // Without the kitty protocol Shift+Enter is indistinguishable from Enter.
     let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
@@ -217,4 +229,25 @@ fn tui() -> Result<()> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_defaults_to_new_session_and_supports_resume() {
+        let cli = Cli::try_parse_from(["mijote"]).unwrap();
+        assert!(!cli.resume);
+        assert!(cli.command.is_none());
+
+        let cli = Cli::try_parse_from(["mijote", "--resume"]).unwrap();
+        assert!(cli.resume);
+
+        let cli = Cli::try_parse_from(["mijote", "-r"]).unwrap();
+        assert!(cli.resume);
+
+        let cli = Cli::try_parse_from(["mijote", "tui", "--resume"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Tui { resume: true })));
+    }
 }

@@ -219,6 +219,13 @@ impl App {
         self.mode = Mode::Insert;
     }
 
+    /// Open a default session in the current directory (no worktree).
+    pub fn open_default_session(&mut self) {
+        if let Some(spec) = agent::default_agent() {
+            self.open_session(spec, false);
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
         self.message = None;
         self.selection = None;

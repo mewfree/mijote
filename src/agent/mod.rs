@@ -80,10 +80,35 @@ pub fn find(id: &str) -> Option<&'static AgentSpec> {
     KNOWN.iter().find(|a| a.id == id)
 }
 
+/// Default agent for a new session: the first known backend already installed
+/// (in mijote's data dir or on `PATH`), falling back to the first
+/// auto-installable backend (Claude Code).
+pub fn default_agent() -> Option<&'static AgentSpec> {
+    KNOWN
+        .iter()
+        .find(|a| install::locate(a).is_some())
+        .or_else(|| {
+            KNOWN
+                .iter()
+                .find(|a| !matches!(a.install, Install::Manual(_)))
+        })
+}
+
 /// Locate `bin` on `PATH`.
 pub fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join(bin))
         .find(|p| p.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_agent_returns_known_spec() {
+        let spec = default_agent().expect("KNOWN has auto-installable agents");
+        assert!(find(spec.id).is_some());
+    }
 }

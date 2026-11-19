@@ -73,8 +73,10 @@ Mouse capture is on by default: wheel scrolls the transcript, a click on a sideb
 Left-drag over the transcript highlights text (reverse video) and copies it on release. Positions are kept in transcript content coordinates (=src/selection.rs=), so the highlight follows the text when scrolling; dragging past the top or bottom edge scrolls. A click or key press clears it. Copy goes through =src/clipboard.rs=: OSC 52 (works over ssh in iTerm2, kitty, WezTerm, Ghostty, tmux with =set-clipboard on=) plus =pbcopy= on macOS for Terminal.app. Selection is by line, so gutter glyphs (=▎=, =┊=) are copied with the text. Not verified in a live terminal.
 ** TODO TUI: transcript scrolling and search
 PgUp/PgDn (also in insert mode), =g=/Home top, =G=/End follow, wheel; scroll clamps to the transcript. Still want half-page and =/= search.
+** DONE TUI: start on a new session by default
+On startup, mijote no longer auto-restores saved sessions; instead it immediately opens a new session in the current directory (no worktree) using the first installed backend (=agent::default_agent=, falling back to Claude Code). Pass =--resume= / =-r= to reopen saved sessions for the current directory.
 ** TODO TUI: open the picker when there is no session
-Don't auto-spawn: an agent must be chosen and spawning launches/installs an external CLI. Instead (1) with no sessions at startup, open the picker directly; (2) =i=/=Enter= with no sessions opens the picker (currently a silent no-op in =handle_normal=); (3) if =open_picker= yields exactly one agent, spawn it directly and skip the picker.
+When all sessions are closed (or =--resume= finds none): (1) =i=/=Enter= with no sessions opens the picker (currently a silent no-op in =handle_normal=); (2) if =open_picker= yields exactly one agent, spawn it directly and skip the picker.
 ** DONE TUI: Ctrl-D quits
 =Ctrl-D= sets =should_quit= from any mode, ahead of the permission modal (same path as idle =Ctrl-C=). Conflicts with the planned =Ctrl-u/d= half-page scroll in the vim task; resolve there.
 ** DONE TUI: working indicator
