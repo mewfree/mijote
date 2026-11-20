@@ -219,9 +219,18 @@ impl App {
         self.mode = Mode::Insert;
     }
 
+    /// Agent to open on startup: the one used in the previous conversation
+    /// (if still known), falling back to `agent::default_agent`.
+    pub fn default_agent(&self) -> Option<&'static AgentSpec> {
+        self.store
+            .last_agent()
+            .and_then(|id| agent::find(&id))
+            .or_else(agent::default_agent)
+    }
+
     /// Open a default session in the current directory (no worktree).
     pub fn open_default_session(&mut self) {
-        if let Some(spec) = agent::default_agent() {
+        if let Some(spec) = self.default_agent() {
             self.open_session(spec, false);
         }
     }
@@ -556,14 +565,15 @@ impl App {
                 if let Some(s) = self.current_mut() {
                     if s.can_prompt() {
                         s.send_prompt(text);
-                        sent = Some(s.id);
+                        sent = Some((s.id, s.spec.id));
                     }
                 }
-                if let Some(id) = sent {
+                if let Some((id, agent)) = sent {
                     self.input.clear();
                     self.pastes.clear();
                     self.scroll = 0;
                     self.persist(id);
+                    let _ = self.store.save_last_agent(agent);
                 }
             }
             KeyCode::PageUp => self.scroll_up(10),
@@ -1192,5 +1202,82 @@ mod tests {
         app.mode = Mode::Insert;
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn default_agent_uses_previous_convo_and_survives_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("sessions"));
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/repo-a"),
+            PathBuf::from("."),
+            store.clone(),
+            tx,
+        );
+
+        // No prior conversation: falls back to agent::default_agent().
+        assert_eq!(
+            app.default_agent().map(|s| s.id),
+            agent::default_agent().map(|s| s.id)
+        );
+
+        // Sending a prompt in an Antigravity session records it as the default.
+        let (mut s0, _) = Session::detached(0, agent::find("claude").unwrap());
+        s0.status = Status::Idle;
+        let (mut s1, _) = Session::detached(1, agent::find("antigravity").unwrap());
+        s1.status = Status::Idle;
+        app.sessions.push(s0);
+        app.sessions.push(s1);
+        app.selected = 1;
+        app.mode = Mode::Insert;
+        app.input.set_text("hello");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.default_agent().map(|s| s.id), Some("antigravity"));
+
+        // Closing the session deletes its transcript, but keeps the last agent.
+        app.mode = Mode::Normal;
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(app.default_agent().map(|s| s.id), Some("antigravity"));
+
+        // A fresh App in another directory still defaults to Antigravity.
+        let (tx2, _rx2) = mpsc::channel();
+        let app2 = App::new(
+            PathBuf::from("/repo-b"),
+            PathBuf::from("."),
+            store.clone(),
+            tx2,
+        );
+        assert_eq!(app2.default_agent().map(|s| s.id), Some("antigravity"));
+
+        // Unknown / removed agent ids fall back to agent::default_agent().
+        store.save_last_agent("removed-agent").unwrap();
+        assert_eq!(
+            app2.default_agent().map(|s| s.id),
+            agent::default_agent().map(|s| s.id)
+        );
+    }
+
+    #[test]
+    fn default_agent_picks_up_existing_session_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("sessions"));
+        store
+            .save(
+                "100-codex",
+                &crate::store::Record {
+                    agent: "codex".into(),
+                    cwd: PathBuf::from("/earlier"),
+                    worktree: None,
+                    entries: vec![Entry::User("hi".into())],
+                    model: None,
+                },
+            )
+            .unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let app = App::new(PathBuf::from("/now"), PathBuf::from("."), store, tx);
+        assert_eq!(app.default_agent().map(|s| s.id), Some("codex"));
     }
 }
