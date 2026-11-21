@@ -60,11 +60,51 @@ pub struct PermissionOption {
     pub kind: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionDiff {
+    pub path: String,
+    pub old_text: Option<String>,
+    pub new_text: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PermissionRequest {
     pub tool_call_id: String,
     pub title: Option<String>,
+    pub kind: Option<String>,
+    pub command: Option<String>,
+    pub locations: Vec<String>,
+    pub diffs: Vec<PermissionDiff>,
+    pub preview_text: Option<String>,
     pub options: Vec<PermissionOption>,
+}
+
+impl PermissionRequest {
+    /// Index of the option chosen by the `a` shortcut: first `allow_once`,
+    /// else first `allow*`.
+    pub fn allow_index(&self) -> Option<usize> {
+        self.options
+            .iter()
+            .position(|o| o.kind == "allow_once")
+            .or_else(|| {
+                self.options
+                    .iter()
+                    .position(|o| o.kind.starts_with("allow"))
+            })
+    }
+
+    /// Index of the option chosen by the `r` / `Esc` shortcut: first
+    /// `reject_once`, else first `reject*`.
+    pub fn reject_index(&self) -> Option<usize> {
+        self.options
+            .iter()
+            .position(|o| o.kind == "reject_once")
+            .or_else(|| {
+                self.options
+                    .iter()
+                    .position(|o| o.kind.starts_with("reject"))
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -468,17 +508,163 @@ fn parse_update(u: &Value) -> Event {
     }
 }
 
+fn non_empty_str(v: &Value) -> Option<&str> {
+    v.as_str().map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn string_array(v: &Value) -> Option<Vec<&str>> {
+    let arr = v.as_array()?;
+    let parts: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts)
+    }
+}
+
+fn extract_command(raw: &Value) -> Option<String> {
+    if let Some(s) = non_empty_str(raw) {
+        return Some(s.to_string());
+    }
+    let obj = raw.as_object()?;
+    if let Some(cmd) = obj.get("command").or_else(|| obj.get("cmd")) {
+        if let Some(s) = non_empty_str(cmd) {
+            if let Some(args) = obj.get("args").and_then(string_array) {
+                return Some(format!("{s} {}", args.join(" ")));
+            }
+            return Some(s.to_string());
+        }
+        if let Some(parts) = string_array(cmd) {
+            return Some(parts.join(" "));
+        }
+    }
+    if let Some(parts) = obj.get("args").and_then(string_array) {
+        return Some(parts.join(" "));
+    }
+    for key in ["path", "file_path", "filePath"] {
+        if let Some(s) = obj.get(key).and_then(non_empty_str) {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+fn format_raw_input(raw: &Value) -> Option<String> {
+    match raw {
+        Value::Null => None,
+        Value::String(s) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Value::Object(map) if !map.is_empty() => {
+            let mut lines = Vec::new();
+            for (k, v) in map {
+                let val = match v {
+                    Value::Null => continue,
+                    Value::String(s) if s.trim().is_empty() => continue,
+                    Value::String(s) => s.trim().to_string(),
+                    other => other.to_string(),
+                };
+                lines.push(format!("{k}: {val}"));
+            }
+            (!lines.is_empty()).then(|| lines.join("\n"))
+        }
+        Value::Array(arr) if !arr.is_empty() => Some(raw.to_string()),
+        Value::Bool(_) | Value::Number(_) => Some(raw.to_string()),
+        _ => None,
+    }
+}
+
 fn parse_permission(p: &Value) -> PermissionRequest {
+    let tc = p.get("toolCall");
+    let command = tc.and_then(|t| t.get("rawInput")).and_then(extract_command);
+    let locations = tc
+        .and_then(|t| t.get("locations"))
+        .and_then(Value::as_array)
+        .map(|locs| {
+            locs.iter()
+                .filter_map(|loc| {
+                    if let Some(s) = non_empty_str(loc) {
+                        return Some(s.to_string());
+                    }
+                    let path = loc.get("path").and_then(non_empty_str)?;
+                    match loc.get("line").and_then(Value::as_u64) {
+                        Some(line) => Some(format!("{path}:{line}")),
+                        None => Some(path.to_string()),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut diffs = Vec::new();
+    let mut content_texts = Vec::new();
+    if let Some(items) = tc.and_then(|t| t.get("content")).and_then(Value::as_array) {
+        for item in items {
+            match item.get("type").and_then(Value::as_str) {
+                Some("diff") => {
+                    let path = str_of(item, "path");
+                    let old_text = item
+                        .get("oldText")
+                        .or_else(|| item.get("old_text"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let new_text = item
+                        .get("newText")
+                        .or_else(|| item.get("new_text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    diffs.push(PermissionDiff {
+                        path,
+                        old_text,
+                        new_text,
+                    });
+                }
+                Some("text") => {
+                    if let Some(t) = item.get("text").and_then(non_empty_str) {
+                        content_texts.push(t.to_string());
+                    }
+                }
+                Some("content") => {
+                    if let Some(t) = item.pointer("/content/text").and_then(non_empty_str) {
+                        content_texts.push(t.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let preview_text = if diffs.is_empty() && command.is_none() {
+        if !content_texts.is_empty() {
+            Some(content_texts.join("\n"))
+        } else {
+            tc.and_then(|t| t.get("rawInput"))
+                .and_then(format_raw_input)
+        }
+    } else {
+        None
+    };
+
     PermissionRequest {
-        tool_call_id: p
-            .pointer("/toolCall/toolCallId")
+        tool_call_id: tc
+            .and_then(|t| t.get("toolCallId"))
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
-        title: p
-            .pointer("/toolCall/title")
+        title: tc
+            .and_then(|t| t.get("title"))
             .and_then(Value::as_str)
             .map(str::to_string),
+        kind: tc
+            .and_then(|t| t.get("kind"))
+            .and_then(non_empty_str)
+            .map(str::to_string),
+        command,
+        locations,
+        diffs,
+        preview_text,
         options: p
             .get("options")
             .and_then(Value::as_array)
@@ -592,5 +778,99 @@ case "$l" in *'"modelId":"b"'*) echo '{"jsonrpc":"2.0","id":2,"result":{}}';; *)
     fn spawn_failure_is_reported() {
         let r = AcpClient::spawn("definitely-not-a-binary-xyz", &[], Path::new("."));
         assert!(matches!(r, Err(AcpError::Spawn(..))));
+    }
+
+    #[test]
+    fn parse_permission_extracts_command_locations_and_diffs() {
+        let exec = parse_permission(&json!({
+            "toolCall": {
+                "toolCallId": "c1",
+                "title": "Run tests",
+                "kind": "execute",
+                "rawInput": {"command": "cargo", "args": ["test", "--all"]},
+                "locations": [{"path": "Cargo.toml", "line": 12}, {"path": "src/lib.rs"}],
+            },
+            "options": [
+                {"optionId": "a1", "name": "Allow once", "kind": "allow_once"},
+                {"optionId": "r1", "name": "Reject", "kind": "reject_once"}
+            ]
+        }));
+        assert_eq!(exec.tool_call_id, "c1");
+        assert_eq!(exec.title.as_deref(), Some("Run tests"));
+        assert_eq!(exec.kind.as_deref(), Some("execute"));
+        assert_eq!(exec.command.as_deref(), Some("cargo test --all"));
+        assert_eq!(exec.locations, vec!["Cargo.toml:12", "src/lib.rs"]);
+        assert!(exec.diffs.is_empty());
+        assert!(exec.preview_text.is_none());
+
+        let array_cmd = parse_permission(&json!({
+            "toolCall": {
+                "toolCallId": "c2",
+                "rawInput": {"cmd": ["git", "status", "-s"]}
+            }
+        }));
+        assert_eq!(array_cmd.command.as_deref(), Some("git status -s"));
+
+        let path_fallback = parse_permission(&json!({
+            "toolCall": {
+                "toolCallId": "c3",
+                "kind": "read",
+                "rawInput": {"file_path": "src/main.rs"}
+            }
+        }));
+        assert_eq!(path_fallback.command.as_deref(), Some("src/main.rs"));
+
+        let diff_req = parse_permission(&json!({
+            "toolCall": {
+                "toolCallId": "c4",
+                "title": "Edit client",
+                "kind": "edit",
+                "locations": [{"path": "src/client.rs", "line": 5}],
+                "content": [{
+                    "type": "diff",
+                    "path": "src/client.rs",
+                    "oldText": "let x = 1;\n",
+                    "newText": "let x = 2;\n"
+                }]
+            }
+        }));
+        assert_eq!(diff_req.kind.as_deref(), Some("edit"));
+        assert_eq!(
+            diff_req.diffs,
+            vec![PermissionDiff {
+                path: "src/client.rs".into(),
+                old_text: Some("let x = 1;\n".into()),
+                new_text: "let x = 2;\n".into(),
+            }]
+        );
+        assert!(diff_req.preview_text.is_none());
+    }
+
+    #[test]
+    fn parse_permission_extracts_preview_text_from_content_or_raw_input() {
+        let wrapped = parse_permission(&json!({
+            "toolCall": {
+                "toolCallId": "c5",
+                "content": [
+                    {"type": "content", "content": {"type": "text", "text": "first line"}},
+                    {"type": "text", "text": "second line"}
+                ]
+            }
+        }));
+        assert_eq!(
+            wrapped.preview_text.as_deref(),
+            Some("first line\nsecond line")
+        );
+
+        let raw_summary = parse_permission(&json!({
+            "toolCall": {
+                "toolCallId": "c6",
+                "rawInput": {"query": "retry", "limit": 5}
+            }
+        }));
+        assert_eq!(
+            raw_summary.preview_text.as_deref(),
+            Some("limit: 5\nquery: retry")
+        );
     }
 }
