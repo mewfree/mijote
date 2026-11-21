@@ -24,6 +24,9 @@ pub struct Record {
     /// Model id the user last had selected, re-applied on restore.
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional user-assigned session label, restored across `--resume`.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +146,7 @@ mod tests {
             worktree: None,
             entries: vec![Entry::User("hi".into()), Entry::Agent("hello".into())],
             model: None,
+            label: None,
         }
     }
 
@@ -192,5 +196,32 @@ mod tests {
         assert_eq!(store.last_agent().as_deref(), Some("codex"));
         // The last-agent file must not interfere with loading session records.
         assert_eq!(store.load(Path::new("/p")).len(), 1);
+    }
+
+    #[test]
+    fn label_persists_and_old_records_without_label_deserialize() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("sessions"));
+
+        let mut labeled = record("/p");
+        labeled.label = Some("fix-retry".into());
+        store.save("1-claude", &labeled).unwrap();
+
+        // Simulate an older on-disk JSON record that lacks the `label` field.
+        let legacy_json = r#"{
+            "agent": "codex",
+            "cwd": "/p",
+            "worktree": null,
+            "entries": [{ "User": "old" }],
+            "model": null
+        }"#;
+        std::fs::write(dir.path().join("sessions/2-codex.json"), legacy_json).unwrap();
+
+        let loaded = store.load(Path::new("/p"));
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].0, "1-claude");
+        assert_eq!(loaded[0].1.label.as_deref(), Some("fix-retry"));
+        assert_eq!(loaded[1].0, "2-codex");
+        assert_eq!(loaded[1].1.label, None);
     }
 }

@@ -90,6 +90,9 @@ pub fn render(f: &mut Frame, app: &App) {
     if app.mode == Mode::Help {
         render_help(f);
     }
+    if app.mode == Mode::Rename {
+        render_rename(f, app);
+    }
     if let Some(s) = app.current() {
         if s.pending.is_some() {
             render_permission(f, s);
@@ -196,52 +199,104 @@ fn wrap_code(text: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
+fn worktree_state_spans(s: &Session) -> Vec<Span<'static>> {
+    let Some(st) = s.worktree_state else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    if st.dirty {
+        spans.push(Span::styled(
+            " *",
+            Style::new().fg(WARN).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if st.commits > 0 {
+        spans.push(Span::styled(
+            format!(" +{}", st.commits),
+            Style::new().fg(OK).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans
+}
+
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default().borders(Borders::BOTTOM).border_style(DIM);
     let inner = block.inner(area);
     f.render_widget(block, area);
     let Some(s) = app.current() else { return };
 
-    let place = match &s.worktree {
-        Some(w) => format!("⎇ {}", w.branch),
-        None => "current directory".to_string(),
-    };
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(s.spec.name, BOLD),
-            Span::styled(format!("  {place}"), DIM),
-            Span::styled(
-                s.model_name().map_or(String::new(), |m| format!("  · {m}")),
-                DIM,
-            ),
-        ])),
-        inner,
-    );
+    let mut left = vec![Span::raw("  ")];
+    match &s.label {
+        Some(label) => {
+            left.push(Span::styled(label.as_str(), BOLD));
+            left.push(Span::styled(format!(" · {}", s.spec.name), DIM));
+        }
+        None => {
+            left.push(Span::styled(s.spec.name, BOLD));
+        }
+    }
+    match &s.worktree {
+        Some(w) => {
+            left.push(Span::styled(format!("  ⎇ {}", w.branch), DIM));
+            left.extend(worktree_state_spans(s));
+        }
+        None => {
+            left.push(Span::styled("  current directory", DIM));
+        }
+    }
+    if let Some(m) = s.model_name() {
+        left.push(Span::styled(format!("  · {m}"), DIM));
+    }
+    f.render_widget(Paragraph::new(Line::from(left)), inner);
 
     let (label, color) = status_label(s);
-    let mut right = vec![Span::styled(label, Style::new().fg(color))];
     let waiting = app
         .sessions
         .iter()
         .enumerate()
         .filter(|(i, s)| *i != app.selected && s.status == Status::AwaitingPermission)
         .count();
-    if waiting > 0 {
-        right.insert(
-            0,
-            Span::styled(
-                format!("◆ {waiting} waiting · s switch   "),
-                Style::new().fg(ASK),
-            ),
-        );
-    }
+    let done = app
+        .sessions
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| {
+            *i != app.selected && s.attention && s.status != Status::AwaitingPermission
+        })
+        .count();
+    let mut right = Vec::new();
     if app.scroll > 0 {
-        right.insert(
-            0,
-            Span::styled("↓ scrolled · G follows   ", Style::new().fg(WARN)),
-        );
+        right.push(Span::styled(
+            "↓ scrolled · G follows   ",
+            Style::new().fg(WARN),
+        ));
     }
+    if waiting > 0 {
+        let badge = if done == 0 {
+            format!(" ◆ {waiting} waiting · s switch ")
+        } else {
+            format!(" ◆ {waiting} waiting ")
+        };
+        right.push(Span::styled(
+            badge,
+            Style::new()
+                .fg(Color::Black)
+                .bg(ASK)
+                .add_modifier(Modifier::BOLD),
+        ));
+        right.push(Span::raw(if done == 0 { "  " } else { " " }));
+    }
+    if done > 0 {
+        right.push(Span::styled(
+            format!(" ★ {done} done · s switch "),
+            Style::new()
+                .fg(Color::Black)
+                .bg(OK)
+                .add_modifier(Modifier::BOLD),
+        ));
+        right.push(Span::raw("  "));
+    }
+    right.push(Span::styled(label, Style::new().fg(color)));
     right.push(Span::raw("  "));
     f.render_widget(
         Paragraph::new(Line::from(right)).alignment(Alignment::Right),
@@ -662,6 +717,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         Mode::Model => (" MODEL ", ASK),
         Mode::Switcher => (" SESSIONS ", ASK),
         Mode::Help => (" HELP ", ASK),
+        Mode::Rename => (" RENAME ", ASK),
     };
     let mut spans = vec![
         Span::styled(
@@ -700,6 +756,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             ("n", "new"),
             ("N", "new here"),
             ("d", "close"),
+            ("r", "rename"),
             ("M", "model"),
             ("s", "sessions"),
             ("t", "tools"),
@@ -750,10 +807,15 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             ("^A", "commands"),
             ("Esc", "normal"),
         ],
-        Mode::Picker | Mode::Model | Mode::Switcher => {
-            &[("j/k", "move"), ("Enter/1-9", "choose"), ("Esc", "close")]
-        }
+        Mode::Picker | Mode::Model => &[("j/k", "move"), ("Enter/1-9", "choose"), ("Esc", "close")],
+        Mode::Switcher => &[
+            ("j/k", "move"),
+            ("Enter/1-9", "switch"),
+            ("r", "rename"),
+            ("Esc", "close"),
+        ],
         Mode::Help => &[("Esc/q/?", "close")],
+        Mode::Rename => &[("Enter", "save"), ("^U", "clear"), ("Esc", "cancel")],
     };
     for (i, (k, what)) in hints.iter().enumerate() {
         if i > 0 {
@@ -858,41 +920,99 @@ fn render_picker(f: &mut Frame, app: &App) {
 
 fn render_switcher(f: &mut Frame, app: &App) {
     let rows = app.sessions.len() as u16;
-    let area = centered(f.area(), 56, rows + 4);
-    let w = area.width.saturating_sub(10) as usize;
+    let area = centered(f.area(), 74, rows + 4);
+    // 2 borders + 4 horizontal padding + 2 highlight symbol ("▌ ").
+    let inner_w = area.width.saturating_sub(8) as usize;
     let items: Vec<ListItem> = app
         .sessions
         .iter()
         .enumerate()
         .map(|(i, s)| {
             let (g, c) = status_glyph(s.status);
-            let g = if s.status == Status::Running {
-                spinner(s)
+            let (glyph, glyph_style) = if s.status == Status::AwaitingPermission {
+                ("◆", Style::new().fg(ASK).add_modifier(Modifier::BOLD))
+            } else if s.attention {
+                ("★", Style::new().fg(OK).add_modifier(Modifier::BOLD))
+            } else if s.status == Status::Running {
+                (spinner(s), Style::new().fg(c))
             } else {
-                g
+                (g, Style::new().fg(c))
             };
-            let detail = match s.status {
-                Status::Idle => match &s.worktree {
-                    Some(wt) => format!("⎇ {}", wt.branch),
-                    None => "current directory".to_string(),
-                },
-                _ => status_label(s).0,
+
+            let wt_spans = worktree_state_spans(s);
+            let wt_w: usize = wt_spans.iter().map(|sp| sp.content.chars().count()).sum();
+
+            let trailing: Option<(String, Style)> = if s.status == Status::AwaitingPermission {
+                Some((
+                    "◆ needs permission".into(),
+                    Style::new().fg(ASK).add_modifier(Modifier::BOLD),
+                ))
+            } else if s.attention {
+                Some((
+                    "★ done".into(),
+                    Style::new().fg(OK).add_modifier(Modifier::BOLD),
+                ))
+            } else if s.status != Status::Idle {
+                Some((status_label(s).0, Style::new().fg(c)))
+            } else {
+                None
             };
-            let detail_color = match s.status {
-                Status::Idle | Status::Starting => Color::DarkGray,
-                _ => c,
+            let trailing_w = trailing.as_ref().map_or(0, |(t, _)| 2 + t.chars().count());
+
+            let idx_str = format!("{} ", i + 1);
+            let avail = inner_w.saturating_sub(idx_str.chars().count() + 2 + wt_w + trailing_w);
+
+            let title = s.display_title();
+            let place = match &s.worktree {
+                Some(wt) => format!("⎇ {}", wt.branch),
+                None => "current directory".to_string(),
             };
-            let name = s.spec.name;
-            let room = w.saturating_sub(name.chars().count() + 2);
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{} ", i + 1), DIM),
-                Span::styled(format!("{g} "), Style::new().fg(c)),
-                Span::raw(name),
-                Span::styled(
-                    format!("  {}", fit(&detail, room)),
-                    Style::new().fg(detail_color),
-                ),
-            ]))
+            let title_w = title.chars().count();
+            let place_w = place.chars().count();
+            let (title_room, place_room) = if title_w + 2 + place_w <= avail {
+                (title_w, place_w)
+            } else {
+                let tr = avail
+                    .saturating_sub(place_w.min(avail / 2) + 2)
+                    .max(8)
+                    .min(avail);
+                let shown_t = title_w.min(tr);
+                let pr = avail.saturating_sub(shown_t + 2);
+                (tr, pr)
+            };
+
+            let mut spans = vec![
+                Span::styled(idx_str, DIM),
+                Span::styled(format!("{glyph} "), glyph_style),
+            ];
+            if title_w <= title_room {
+                match &s.label {
+                    Some(lbl) => {
+                        spans.push(Span::raw(lbl.clone()));
+                        spans.push(Span::styled(format!(" · {}", s.spec.name), DIM));
+                    }
+                    None => spans.push(Span::raw(s.spec.name)),
+                }
+            } else {
+                spans.push(Span::raw(fit(&title, title_room)));
+            }
+            if place_room >= 3 {
+                let place_style = if s.label.is_none() && s.worktree.is_some() {
+                    Style::new().fg(CODE_FG)
+                } else {
+                    DIM
+                };
+                spans.push(Span::styled(
+                    format!("  {}", fit(&place, place_room)),
+                    place_style,
+                ));
+            }
+            spans.extend(wt_spans);
+            if let Some((text, style)) = trailing {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(text, style));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let mut state = ListState::default();
@@ -901,12 +1021,45 @@ fn render_switcher(f: &mut Frame, app: &App) {
         .block(modal(
             "sessions",
             ACCENT,
-            hint_line(&[("Enter", "switch"), ("Esc", "close")]),
+            hint_line(&[("Enter", "switch"), ("r", "rename"), ("Esc", "close")]),
         ))
         .highlight_symbol("▌ ")
         .highlight_style(BOLD.fg(ACCENT).bg(SELECTED_BG));
     f.render_widget(Clear, area);
     f.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_rename(f: &mut Frame, app: &App) {
+    let area = centered(f.area(), 52, 5);
+    let block = modal(
+        "rename session",
+        ACCENT,
+        hint_line(&[("Enter", "save"), ("Esc", "cancel")]),
+    );
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+
+    let room = (inner.width as usize).saturating_sub(3).max(1);
+    let len = app.rename_buf.chars().count();
+    let off = (len + 1).saturating_sub(room);
+    let visible: String = app.rename_buf.chars().skip(off).collect();
+    let line = if app.rename_buf.is_empty() {
+        Line::from(vec![
+            Span::styled("› ", Style::new().fg(ACCENT)),
+            Span::styled("session label (empty clears)", DIM),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("› ", Style::new().fg(ACCENT)),
+            Span::raw(visible),
+        ])
+    };
+    f.render_widget(Paragraph::new(line), inner);
+    let x = inner.x + 2 + (len - off) as u16;
+    if x < inner.right() && inner.height > 0 {
+        f.set_cursor_position((x, inner.y));
+    }
 }
 
 fn render_models(f: &mut Frame, app: &App) {
@@ -972,9 +1125,10 @@ fn render_help(f: &mut Frame) {
         heading("commands (Space in normal · C-a anywhere)"),
         pair("n", "new worktree", "N", "new here"),
         pair("s / Tab", "switcher", "j / k", "next / prev"),
-        pair("d", "close session", "M", "model (/model)"),
-        pair("g / G", "top / bottom", "t", "tool details"),
-        pair("m", "toggle mouse", "? / q", "help / quit"),
+        pair("d", "close session", "r", "rename session"),
+        pair("M", "model (/model)", "t", "tool details"),
+        pair("g / G", "top / bottom", "m", "toggle mouse"),
+        pair("?", "help", "q", "quit"),
         Line::from(""),
         heading("session & scroll"),
         row("PgUp / PgDn", "scroll transcript (or mouse wheel)"),
@@ -1579,5 +1733,87 @@ mod tests {
         assert!(lines.iter().any(|l| l == "    - before"));
         assert!(lines.iter().any(|l| l == "    + after"));
         assert!(!lines.iter().any(|l| l == "      keep 1"));
+    }
+
+    fn fake_worktree(branch: &str) -> crate::worktree::Worktree {
+        serde_json::from_value(serde_json::json!({
+            "path": "/tmp/wt",
+            "branch": branch,
+            "repo": "/tmp/repo",
+            "base": "deadbeef"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn header_and_switcher_render_labels_worktree_state_and_attention() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+
+        let (mut s0, _) = Session::detached(0, find("claude").unwrap());
+        s0.status = Status::Idle;
+        s0.label = Some("fix-retry".into());
+        s0.worktree = Some(fake_worktree("mijote/claude-1"));
+        s0.worktree_state = Some(crate::worktree::State {
+            dirty: true,
+            commits: 2,
+        });
+
+        let (mut s1, _) = Session::detached(1, find("claude").unwrap());
+        s1.status = Status::AwaitingPermission;
+        s1.worktree = Some(fake_worktree("mijote/claude-2"));
+        s1.worktree_state = Some(crate::worktree::State {
+            dirty: true,
+            commits: 0,
+        });
+
+        let (mut s2, _) = Session::detached(2, find("codex").unwrap());
+        s2.status = Status::Idle;
+        s2.attention = true;
+        s2.worktree = Some(fake_worktree("mijote/codex-1"));
+        s2.worktree_state = Some(crate::worktree::State {
+            dirty: false,
+            commits: 3,
+        });
+
+        app.sessions.push(s0);
+        app.sessions.push(s1);
+        app.sessions.push(s2);
+        app.selected = 0;
+
+        let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("fix-retry · Claude Code"), "{screen}");
+        assert!(screen.contains("⎇ mijote/claude-1 * +2"), "{screen}");
+        assert!(screen.contains("◆ 1 waiting"), "{screen}");
+        assert!(screen.contains("★ 1 done · s switch"), "{screen}");
+
+        // Switcher shows all labels/branches, worktree badges, attention states, and rename hint.
+        app.mode = Mode::Switcher;
+        term.draw(|f| render(f, &app)).unwrap();
+        let switcher = dump(&term);
+        assert!(switcher.contains("fix-retry · Claude Code"), "{switcher}");
+        assert!(switcher.contains("⎇ mijote/claude-1 * +2"), "{switcher}");
+        assert!(switcher.contains("⎇ mijote/claude-2 *"), "{switcher}");
+        assert!(switcher.contains("◆ needs permission"), "{switcher}");
+        assert!(switcher.contains("⎇ mijote/codex-1 +3"), "{switcher}");
+        assert!(switcher.contains("★ done"), "{switcher}");
+        assert!(switcher.contains("r rename"), "{switcher}");
+
+        // Rename modal renders buffer and hints.
+        app.mode = Mode::Rename;
+        app.rename_buf = "api-cleanup".into();
+        term.draw(|f| render(f, &app)).unwrap();
+        let rename = dump(&term);
+        assert!(rename.contains("rename session"), "{rename}");
+        assert!(rename.contains("api-cleanup"), "{rename}");
+        assert!(rename.contains("Enter save"), "{rename}");
+        assert!(rename.contains("Esc cancel"), "{rename}");
     }
 }

@@ -27,6 +27,8 @@ pub enum Mode {
     Switcher,
     /// Key-binding help overlay.
     Help,
+    /// Renaming a session's label.
+    Rename,
 }
 
 /// A destructive action waiting for the user to confirm it.
@@ -66,6 +68,12 @@ pub struct App {
     pub picker_isolated: bool,
     pub model_cursor: usize,
     pub switcher_cursor: usize,
+    /// Buffer edited while in `Mode::Rename`.
+    pub rename_buf: String,
+    /// Index in `sessions` being renamed in `Mode::Rename`.
+    pub rename_target: usize,
+    /// Mode to return to once `Mode::Rename` closes.
+    rename_return: Mode,
     /// Lines scrolled up from the bottom of the transcript (0 = follow).
     pub scroll: u16,
     /// Largest useful `scroll`, reported by the last render so scrolling
@@ -77,6 +85,8 @@ pub struct App {
     pub transcript_text: RefCell<Vec<String>>,
     /// Text to put on the clipboard; the event loop owns the terminal I/O.
     pub pending_copy: Option<String>,
+    /// Set when a background session needs attention; the event loop rings BEL.
+    pub pending_bell: bool,
     pub should_quit: bool,
     /// Whether the terminal reports mouse events (`m` toggles; off lets the
     /// terminal select text natively).
@@ -109,11 +119,15 @@ impl App {
             picker_isolated: true,
             model_cursor: 0,
             switcher_cursor: 0,
+            rename_buf: String::new(),
+            rename_target: 0,
+            rename_return: Mode::Normal,
             scroll: 0,
             max_scroll: Cell::new(u16::MAX),
             selection: None,
             transcript_text: RefCell::new(Vec::new()),
             pending_copy: None,
+            pending_bell: false,
             should_quit: false,
             mouse: true,
             show_tool_details: true,
@@ -171,12 +185,26 @@ impl App {
             self.set_message(text);
             return;
         }
-        let settled = matches!(msg.body, UiMsg::TurnDone(_) | UiMsg::Error(_));
-        if let Some(s) = self.sessions.iter_mut().find(|s| s.id == msg.session) {
-            s.apply(msg.body);
-            if settled {
-                self.persist(msg.session);
+        let is_turn_done = matches!(msg.body, UiMsg::TurnDone(_));
+        let is_permission = matches!(msg.body, UiMsg::Permission(_));
+        let settled = is_turn_done || matches!(msg.body, UiMsg::Error(_));
+        let Some(idx) = self.sessions.iter().position(|s| s.id == msg.session) else {
+            return;
+        };
+        let background = idx != self.selected;
+        let s = &mut self.sessions[idx];
+        s.apply(msg.body);
+        if is_turn_done && s.worktree.is_some() {
+            s.refresh_worktree_state();
+        }
+        if background && (is_turn_done || is_permission) {
+            if is_turn_done {
+                s.attention = true;
             }
+            self.pending_bell = true;
+        }
+        if settled {
+            self.persist(msg.session);
         }
     }
 
@@ -185,7 +213,7 @@ impl App {
         let Some(s) = self.sessions.iter().find(|s| s.id == id) else {
             return;
         };
-        if s.entries.is_empty() {
+        if s.entries.is_empty() && s.label.is_none() {
             return;
         }
         if let Err(e) = self.store.save(&s.key, &s.record(&self.cwd)) {
@@ -224,6 +252,7 @@ impl App {
                 self.ui_tx.clone(),
             );
             s.key = key;
+            s.label = rec.label;
             s.entries = rec.entries;
             s.entries.push(Entry::Notice(note));
             self.sessions.push(s);
@@ -327,6 +356,7 @@ impl App {
             Mode::Model => self.handle_model(key),
             Mode::Switcher => self.handle_switcher(key),
             Mode::Help => self.handle_help(key),
+            Mode::Rename => self.handle_rename(key),
         }
     }
 
@@ -375,7 +405,7 @@ impl App {
     pub fn handle_mouse(&mut self, ev: MouseEvent, area: Rect) {
         if matches!(
             self.mode,
-            Mode::Picker | Mode::Model | Mode::Switcher | Mode::Help
+            Mode::Picker | Mode::Model | Mode::Switcher | Mode::Help | Mode::Rename
         ) || self.confirm.is_some()
             || self.current().is_some_and(|s| s.pending.is_some())
         {
@@ -523,6 +553,7 @@ impl App {
             KeyCode::Char('n') => self.open_picker(true),
             KeyCode::Char('N') => self.open_picker(false),
             KeyCode::Char('d') => self.request_close(),
+            KeyCode::Char('r') => self.open_rename(self.selected, Mode::Normal),
             KeyCode::Char('M') => self.open_models(),
             KeyCode::Char('s') | KeyCode::Tab => self.open_switcher(),
             KeyCode::Char('?') => self.mode = Mode::Help,
@@ -742,6 +773,11 @@ impl App {
         if self.sessions.is_empty() {
             return;
         }
+        for s in &mut self.sessions {
+            if s.worktree.is_some() {
+                s.refresh_worktree_state();
+            }
+        }
         self.switcher_cursor = self.selected;
         self.mode = Mode::Switcher;
     }
@@ -758,6 +794,7 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up if n > 0 => {
                 self.switcher_cursor = (self.switcher_cursor + n - 1) % n
             }
+            KeyCode::Char('r') if n > 0 => self.open_rename(self.switcher_cursor, Mode::Switcher),
             KeyCode::Enter => self.switch_to(self.switcher_cursor),
             KeyCode::Char(c) => {
                 if let Some(i) = c.to_digit(10).and_then(|d| (d as usize).checked_sub(1)) {
@@ -774,6 +811,10 @@ impl App {
                 self.selected = i;
                 self.scroll = 0;
             }
+            self.sessions[i].attention = false;
+            if self.sessions[i].worktree.is_some() {
+                self.sessions[i].refresh_worktree_state();
+            }
             self.mode = Mode::Normal;
         }
     }
@@ -787,6 +828,51 @@ impl App {
         }
     }
 
+    fn open_rename(&mut self, target: usize, return_mode: Mode) {
+        let Some(s) = self.sessions.get(target) else {
+            return;
+        };
+        self.rename_target = target;
+        self.rename_buf = s.label.clone().unwrap_or_default();
+        self.rename_return = return_mode;
+        self.mode = Mode::Rename;
+    }
+
+    fn handle_rename(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.mode = self.rename_return,
+            KeyCode::Enter => self.apply_rename(),
+            KeyCode::Backspace => {
+                self.rename_buf.pop();
+            }
+            KeyCode::Char('u') if ctrl => self.rename_buf.clear(),
+            KeyCode::Char(c) if !ctrl && !c.is_control() => self.rename_buf.push(c),
+            _ => {}
+        }
+    }
+
+    fn apply_rename(&mut self) {
+        let trimmed = self.rename_buf.trim();
+        let label = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        let mut persist_id = None;
+        let mut remove_key = None;
+        if let Some(s) = self.sessions.get_mut(self.rename_target) {
+            s.label = label;
+            if !s.entries.is_empty() || s.label.is_some() {
+                persist_id = Some(s.id);
+            } else {
+                remove_key = Some(s.key.clone());
+            }
+        }
+        if let Some(id) = persist_id {
+            self.persist(id);
+        }
+        if let Some(key) = remove_key {
+            self.store.remove(&key);
+        }
+        self.mode = self.rename_return;
+    }
     fn open_picker(&mut self, isolated: bool) {
         let agents = agent::KNOWN
             .iter()
@@ -859,11 +945,14 @@ impl App {
             .selected
             .saturating_sub(1)
             .min(self.sessions.len().saturating_sub(1));
+        if let Some(cur) = self.sessions.get_mut(self.selected) {
+            cur.attention = false;
+        }
         self.scroll = 0;
         if self.sessions.is_empty() {
             self.mode = Mode::Normal;
         }
-        self.set_message(format!("closing {}…", s.spec.name));
+        self.set_message(format!("closing {}…", s.display_title()));
         s.close(self.ui_tx.clone());
     }
 
@@ -873,6 +962,10 @@ impl App {
             return;
         }
         self.selected = (self.selected as isize + delta).rem_euclid(n as isize) as usize;
+        self.sessions[self.selected].attention = false;
+        if self.sessions[self.selected].worktree.is_some() {
+            self.sessions[self.selected].refresh_worktree_state();
+        }
         self.scroll = 0;
     }
 }
@@ -1462,6 +1555,7 @@ mod tests {
                     worktree: None,
                     entries: vec![Entry::User("hi".into())],
                     model: None,
+                    label: None,
                 },
             )
             .unwrap();
@@ -1596,5 +1690,129 @@ mod tests {
         app.handle_key(key(KeyCode::Char('?')));
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.input.text(), "?");
+    }
+
+    #[test]
+    fn leader_r_renames_session_persists_and_clears_when_empty() {
+        let (mut app, _) = app_with_session();
+        app.sessions[0].key = "k-rename".into();
+        app.sessions[0].entries.push(Entry::User("hi".into()));
+
+        // Open rename via leader + r, type a label, fix a typo, save.
+        type_keys(&mut app, " r");
+        assert_eq!(app.mode, Mode::Rename);
+        assert_eq!(app.rename_target, 0);
+        type_keys(&mut app, "fix-retryx");
+        app.handle_key(key(KeyCode::Backspace));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.sessions[0].label.as_deref(), Some("fix-retry"));
+        let saved = app.store.load(app.cwd());
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].1.label.as_deref(), Some("fix-retry"));
+
+        // Opening again pre-fills the existing label; Esc cancels changes.
+        type_keys(&mut app, " r");
+        assert_eq!(app.rename_buf, "fix-retry");
+        type_keys(&mut app, "-extra");
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.sessions[0].label.as_deref(), Some("fix-retry"));
+
+        // Ctrl-u clears the buffer; Enter with empty string clears the label.
+        type_keys(&mut app, " r");
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(app.rename_buf.is_empty());
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.sessions[0].label, None);
+        let saved = app.store.load(app.cwd());
+        assert_eq!(saved[0].1.label, None);
+    }
+
+    #[test]
+    fn switcher_r_renames_highlighted_background_session() {
+        let (mut app, _) = app_with_session();
+        let (s1, _) = Session::detached(1, agent::find("claude").unwrap());
+        app.sessions.push(s1);
+        assert_eq!(app.selected, 0);
+
+        // Open switcher, highlight session 1, press r, rename it.
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.mode, Mode::Switcher);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.switcher_cursor, 1);
+        app.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(app.mode, Mode::Rename);
+        assert_eq!(app.rename_target, 1);
+        type_keys(&mut app, "  bg-task  ");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.mode, Mode::Switcher);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.sessions[0].label, None);
+        assert_eq!(app.sessions[1].label.as_deref(), Some("bg-task"));
+    }
+
+    #[test]
+    fn background_turn_done_and_permission_set_attention_and_bell() {
+        let (mut app, _) = app_with_session();
+        let (mut s1, _) = Session::detached(1, agent::find("claude").unwrap());
+        s1.status = Status::Running;
+        app.sessions.push(s1);
+        app.selected = 0;
+
+        // Foreground TurnDone does not set attention or ring the bell.
+        app.sessions[0].status = Status::Running;
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::TurnDone(crate::agent::acp::StopReason::EndTurn),
+        });
+        assert!(!app.sessions[0].attention);
+        assert!(!app.pending_bell);
+
+        // Background TurnDone sets attention on session 1 and pending_bell.
+        app.handle_msg(Msg {
+            session: 1,
+            body: UiMsg::TurnDone(crate::agent::acp::StopReason::EndTurn),
+        });
+        assert!(app.sessions[1].attention);
+        assert!(app.pending_bell);
+        app.pending_bell = false;
+
+        // Switching to session 1 via switcher clears its attention.
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char('2')));
+        assert_eq!(app.selected, 1);
+        assert!(!app.sessions[1].attention);
+
+        // Background Permission on session 0 sets AwaitingPermission and rings bell.
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::Permission(PermissionRequest {
+                tool_call_id: "c1".into(),
+                title: Some("run tests".into()),
+                options: vec![PermissionOption {
+                    id: "ok".into(),
+                    name: "Allow".into(),
+                    kind: "allow_once".into(),
+                }],
+                ..Default::default()
+            }),
+        });
+        assert_eq!(app.sessions[0].status, Status::AwaitingPermission);
+        assert!(app.pending_bell);
+
+        // Background TurnDone on session 0 cleared when switching via leader+j.
+        app.pending_bell = false;
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::TurnDone(crate::agent::acp::StopReason::EndTurn),
+        });
+        assert!(app.sessions[0].attention);
+        assert!(app.pending_bell);
+        type_keys(&mut app, " j");
+        assert_eq!(app.selected, 0);
+        assert!(!app.sessions[0].attention);
     }
 }
