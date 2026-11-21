@@ -9,7 +9,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::acp::{
-    AcpClient, CancelHandle, Event, ModelState, PermissionRequest, StopReason, ToolContent,
+    AcpClient, CancelHandle, ElicitationRequest, ElicitationResponse, Event, ModelState,
+    PermissionRequest, StopReason, ToolContent,
 };
 use crate::agent::{install, AgentSpec};
 use crate::store::{self, Record};
@@ -37,6 +38,7 @@ pub enum Status {
     Idle,
     Running,
     AwaitingPermission,
+    AwaitingQuestion,
     Failed,
 }
 
@@ -48,6 +50,7 @@ pub enum UiMsg {
     ModelFailed(String),
     Event(Event),
     Permission(PermissionRequest),
+    Question(ElicitationRequest),
     TurnDone(StopReason),
     Error(String),
     /// A closed session finished shutting down (agent stopped, worktree
@@ -80,6 +83,7 @@ pub struct Session {
     /// cleared once the user switches to it.
     pub attention: bool,
     pub pending: Option<PermissionRequest>,
+    pub pending_question: Option<ElicitationRequest>,
     pub worktree: Option<Worktree>,
     /// Cached git dirty/ahead counts for `worktree`.
     pub worktree_state: Option<WorktreeState>,
@@ -92,6 +96,7 @@ pub struct Session {
     cancel: Option<CancelHandle>,
     cmd_tx: Sender<WorkerCmd>,
     perm_tx: Sender<Option<String>>,
+    question_tx: Sender<ElicitationResponse>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -109,11 +114,22 @@ impl Session {
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (perm_tx, perm_rx) = mpsc::channel();
+        let (question_tx, question_rx) = mpsc::channel();
         let dir = worktree.as_ref().map_or(cwd, |w| w.path.clone());
         let preferred = model.clone();
-        let handle =
-            thread::spawn(move || worker(id, spec, dir, preferred, ui_tx, cmd_rx, perm_rx));
-        let mut s = Self::new(id, spec, cmd_tx, perm_tx);
+        let handle = thread::spawn(move || {
+            worker(
+                id,
+                spec,
+                dir,
+                preferred,
+                ui_tx,
+                cmd_rx,
+                perm_rx,
+                question_rx,
+            )
+        });
+        let mut s = Self::new(id, spec, cmd_tx, perm_tx, question_tx);
         s.worktree = worktree;
         s.refresh_worktree_state();
         s.preferred_model = model;
@@ -126,6 +142,7 @@ impl Session {
         spec: &'static AgentSpec,
         cmd_tx: Sender<WorkerCmd>,
         perm_tx: Sender<Option<String>>,
+        question_tx: Sender<ElicitationResponse>,
     ) -> Self {
         Self {
             id,
@@ -136,6 +153,7 @@ impl Session {
             status: Status::Starting,
             attention: false,
             pending: None,
+            pending_question: None,
             worktree: None,
             worktree_state: None,
             turn_started: None,
@@ -144,6 +162,7 @@ impl Session {
             cancel: None,
             cmd_tx,
             perm_tx,
+            question_tx,
             thread: None,
         }
     }
@@ -151,9 +170,28 @@ impl Session {
     /// A session with no worker, for tests.
     #[cfg(test)]
     pub fn detached(id: usize, spec: &'static AgentSpec) -> (Self, Receiver<Option<String>>) {
+        let (s, perm_rx, _question_rx) = Self::detached_with_questions(id, spec);
+        (s, perm_rx)
+    }
+
+    /// A session with no worker exposing both permission and question channels, for tests.
+    #[cfg(test)]
+    pub fn detached_with_questions(
+        id: usize,
+        spec: &'static AgentSpec,
+    ) -> (
+        Self,
+        Receiver<Option<String>>,
+        Receiver<ElicitationResponse>,
+    ) {
         let (cmd_tx, _cmd_rx) = mpsc::channel();
         let (perm_tx, perm_rx) = mpsc::channel();
-        (Self::new(id, spec, cmd_tx, perm_tx), perm_rx)
+        let (question_tx, question_rx) = mpsc::channel();
+        (
+            Self::new(id, spec, cmd_tx, perm_tx, question_tx),
+            perm_rx,
+            question_rx,
+        )
     }
 
     /// Directory this session operates in (its worktree if isolated, else `fallback`).
@@ -240,13 +278,25 @@ impl Session {
         }
     }
 
+    /// Answer a pending interactive question (`elicitation/create`).
+    pub fn answer_question(&mut self, response: ElicitationResponse) {
+        if self.pending_question.take().is_some() {
+            self.status = Status::Running;
+            let _ = self.question_tx.send(response);
+        }
+    }
+
     /// Interrupt the running turn.
     pub fn cancel(&mut self) {
-        if self.status != Status::Running && self.status != Status::AwaitingPermission {
+        if !matches!(
+            self.status,
+            Status::Running | Status::AwaitingPermission | Status::AwaitingQuestion
+        ) {
             return;
         }
-        // A pending permission must be answered `cancelled` first.
+        // Any pending permission or question must be answered cancelled first.
         self.answer_permission(None);
+        self.answer_question(ElicitationResponse::Cancel);
         if let Some(h) = &self.cancel {
             let _ = h.cancel();
         }
@@ -297,10 +347,15 @@ impl Session {
                 self.pending = Some(req);
                 self.status = Status::AwaitingPermission;
             }
+            UiMsg::Question(req) => {
+                self.pending_question = Some(req);
+                self.status = Status::AwaitingQuestion;
+            }
             UiMsg::TurnDone(stop) => {
                 self.status = Status::Idle;
                 self.turn_started = None;
                 self.pending = None;
+                self.pending_question = None;
                 if stop != StopReason::EndTurn {
                     self.entries
                         .push(Entry::Notice(format!("stopped: {stop:?}")));
@@ -310,6 +365,7 @@ impl Session {
                 self.status = Status::Failed;
                 self.turn_started = None;
                 self.pending = None;
+                self.pending_question = None;
                 self.entries.push(Entry::Notice(format!("error: {e}")));
             }
         }
@@ -392,6 +448,7 @@ impl Drop for Session {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker(
     id: usize,
     spec: &'static AgentSpec,
@@ -400,6 +457,7 @@ fn worker(
     ui_tx: Sender<Msg>,
     cmd_rx: Receiver<WorkerCmd>,
     perm_rx: Receiver<Option<String>>,
+    question_rx: Receiver<ElicitationResponse>,
 ) {
     let send = |body: UiMsg| {
         let _ = ui_tx.send(Msg { session: id, body });
@@ -443,6 +501,10 @@ fn worker(
                     |req| {
                         send(UiMsg::Permission(req.clone()));
                         perm_rx.recv().ok().flatten()
+                    },
+                    |req| {
+                        send(UiMsg::Question(req.clone()));
+                        question_rx.recv().unwrap_or(ElicitationResponse::Cancel)
                     },
                 )
                 .map_err(|e| e.to_string())?;
@@ -545,6 +607,31 @@ mod tests {
         }));
         s.cancel();
         assert_eq!(perm_rx.try_recv().unwrap(), None);
+    }
+
+    #[test]
+    fn question_round_trip_and_cancel() {
+        let (mut s, _, question_rx) = Session::detached_with_questions(0, find("claude").unwrap());
+        s.apply(UiMsg::Question(ElicitationRequest {
+            message: "Pick one".into(),
+            fields: vec![],
+        }));
+        assert_eq!(s.status, Status::AwaitingQuestion);
+        let mut content = serde_json::Map::new();
+        content.insert("k".into(), serde_json::json!("v"));
+        s.answer_question(ElicitationResponse::Accept(content.clone()));
+        assert_eq!(
+            question_rx.try_recv().unwrap(),
+            ElicitationResponse::Accept(content)
+        );
+        assert_eq!(s.status, Status::Running);
+
+        s.apply(UiMsg::Question(ElicitationRequest {
+            message: "Another".into(),
+            fields: vec![],
+        }));
+        s.cancel();
+        assert_eq!(question_rx.try_recv().unwrap(), ElicitationResponse::Cancel);
     }
 
     #[test]
