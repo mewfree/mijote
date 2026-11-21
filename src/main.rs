@@ -189,6 +189,12 @@ fn tui(resume: bool) -> Result<()> {
                 app.handle_msg(msg);
             }
             app.tick();
+            if app.pending_bell {
+                app.pending_bell = false;
+                let mut out = std::io::stdout();
+                let _ = out.write_all(b"\x07");
+                let _ = out.flush();
+            }
             terminal.draw(|f| ui::render(f, &app))?;
             if let Some(text) = app.pending_copy.take() {
                 if clipboard::copy(&text).is_err() {

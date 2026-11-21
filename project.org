@@ -68,8 +68,8 @@ Bracketed paste is enabled in =main.rs=; =App::handle_paste= inserts the text at
 Agent messages render through =ui/markdown.rs= (pulldown-cmark): headings, bold/italic/strikethrough, inline and fenced code, bullet/numbered/task lists, block quotes, rules, links (destination shown after the text). Wrapped to the transcript width with hanging indents. Tables and syntax highlighting are not handled; tables show as plain text.
 ** DONE TUI: tool call detail
 =ToolContent= in =src/agent/acp.rs= parses text, terminal output, and diff blocks from ACP =tool_call= and =tool_call_update= (=content= and optional =title=). =Entry::Tool= in =src/session.rs= stores =detail= with =#[serde(default)]= so older session records stay readable, and =tool_call_update= replaces =detail= when non-empty while preserving it across status-only updates. =src/ui/mod.rs= renders tool diffs (path header, compact line diff in red/green/dim, capped at 16 lines) and text output (dim =│= gutter, capped at 10 lines) beneath tool rows with =▾=/=▸= indicators; =leader + t= in =src/app.rs= toggles =show_tool_details= (expanded by default).
-** TODO TUI: rename sessions, show worktree state
-=d= closes (done); still want rename, and live dirty/ahead counts per session in the sidebar.
+** DONE TUI: rename sessions, show worktree state
+=leader + r= (or =r= inside the session switcher to rename the highlighted session) opens a rename modal (=Mode::Rename=); labels persist in =store::Record= (backwards-compatible via =#[serde(default)]=) and empty input clears the custom name. =Session::refresh_worktree_state= tracks live dirty (=*=) and ahead (=+N=) counts from =Worktree::state()=, refreshed on spawn/restore, turn completion, switcher open, and session switch, and displayed beside the branch in both the header and the switcher.
 ** DONE TUI: mouse mode
 Mouse capture is on by default: wheel scrolls the transcript, a click on a sidebar row selects that session, a click on the prompt box enters insert mode. =m= (normal mode) toggles capture off so the terminal's own text selection works. Hit-testing lives in =ui::locate= beside the layout; modals (picker, permission, confirm) ignore the mouse.
 ** DONE TUI: mouse text selection and copy
@@ -90,8 +90,8 @@ Running turns show an animated spinner in the sidebar and a trailing =working…
 =q= (while any agent is mid-turn) and =d= (running or non-empty session) open a y/n confirm modal. Normal-mode =Esc= no longer cancels the turn; use =Ctrl-C=. =Ctrl-D= still quits immediately.
 ** DONE TUI: context-aware status bar
 Key hints depend on state (idle, running, scrolled, insert, confirm); cwd is shown only when it fits.
-** TODO TUI: sidebar labels and attention
-Show branch/label per session so parallel sessions of one agent are distinguishable; loud highlight (and optional bell) when a background session needs permission or finishes.
+** DONE TUI: sidebar labels and attention
+Applied to the floating session switcher and header: every session shows its custom label (=<label> · <agent>=) or worktree branch alongside the agent name regardless of run state so parallel sessions are always distinguishable. Background =TurnDone= sets =Session.attention= (cleared when switching to the session) and both background =TurnDone= and =Permission= ring the terminal bell (=\x07= via =App.pending_bell=). The header shows high-contrast =◆ N waiting= and =★ N done · s switch= badges; the switcher highlights =◆ needs permission= and =★ done= rows.
 ** DONE TUI: richer permission modal
 =PermissionRequest= in =src/agent/acp.rs= now parses =toolCall.kind=, =rawInput= commands/paths, =locations= (with line numbers), =content= diffs (=PermissionDiff=), and fallback preview text. =App::handle_permission_key= adds =a= (prefer =allow_once=, else =allow*=) and =r= (prefer =reject_once=, else =reject*=, else cancel turn) alongside =1-9= and =Esc=. =render_permission= displays the kind badge, locations, =$ command= lines, colorized/capped diff previews, deduplicated human-readable option labels, =[a]=/=[r]= badges, and dynamic modal sizing.
 ** TODO TUI: picker shows install/login state

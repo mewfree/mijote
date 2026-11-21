@@ -13,7 +13,7 @@ use crate::agent::acp::{
 };
 use crate::agent::{install, AgentSpec};
 use crate::store::{self, Record};
-use crate::worktree::{Released, Worktree};
+use crate::worktree::{Released, State as WorktreeState, Worktree};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Entry {
@@ -72,10 +72,17 @@ pub struct Session {
     /// Key of this session's on-disk record (see `store`).
     pub key: String,
     pub spec: &'static AgentSpec,
+    /// Optional user-assigned label for distinguishing parallel sessions.
+    pub label: Option<String>,
     pub entries: Vec<Entry>,
     pub status: Status,
+    /// Set when a turn completes while this session is in the background;
+    /// cleared once the user switches to it.
+    pub attention: bool,
     pub pending: Option<PermissionRequest>,
     pub worktree: Option<Worktree>,
+    /// Cached git dirty/ahead counts for `worktree`.
+    pub worktree_state: Option<WorktreeState>,
     /// When the current turn started; `None` while not running.
     pub turn_started: Option<Instant>,
     /// Models the agent advertised; empty until it is ready.
@@ -108,6 +115,7 @@ impl Session {
             thread::spawn(move || worker(id, spec, dir, preferred, ui_tx, cmd_rx, perm_rx));
         let mut s = Self::new(id, spec, cmd_tx, perm_tx);
         s.worktree = worktree;
+        s.refresh_worktree_state();
         s.preferred_model = model;
         s.thread = Some(handle);
         s
@@ -123,10 +131,13 @@ impl Session {
             id,
             key: store::new_key(spec.id),
             spec,
+            label: None,
             entries: Vec::new(),
             status: Status::Starting,
+            attention: false,
             pending: None,
             worktree: None,
+            worktree_state: None,
             turn_started: None,
             models: ModelState::default(),
             preferred_model: None,
@@ -145,6 +156,19 @@ impl Session {
         (Self::new(id, spec, cmd_tx, perm_tx), perm_rx)
     }
 
+    /// Human-friendly title: `<label> · <agent>` when renamed, else `<agent>`.
+    pub fn display_title(&self) -> String {
+        match &self.label {
+            Some(label) => format!("{label} · {}", self.spec.name),
+            None => self.spec.name.to_string(),
+        }
+    }
+
+    /// Refresh cached dirty/ahead counts from the session's git worktree.
+    pub fn refresh_worktree_state(&mut self) {
+        self.worktree_state = self.worktree.as_ref().and_then(|w| w.state().ok());
+    }
+
     /// What to persist for this session.
     pub fn record(&self, cwd: &std::path::Path) -> Record {
         Record {
@@ -157,6 +181,7 @@ impl Session {
                 .current
                 .clone()
                 .or_else(|| self.preferred_model.clone()),
+            label: self.label.clone(),
         }
     }
 
@@ -195,6 +220,7 @@ impl Session {
         }
         self.entries.push(Entry::User(text.clone()));
         self.status = Status::Running;
+        self.attention = false;
         self.turn_started = Some(Instant::now());
         let _ = self.cmd_tx.send(WorkerCmd::Prompt(text));
     }
@@ -227,7 +253,7 @@ impl Session {
         let id = self.id;
         let thread = self.thread.take();
         let worktree = self.worktree.take();
-        let name = self.spec.name;
+        let name = self.display_title();
         thread::spawn(move || {
             if let Some(t) = thread {
                 let _ = t.join();
@@ -550,5 +576,83 @@ mod tests {
         s.send_prompt("yes".into());
         assert_eq!(s.entries, vec![Entry::User("yes".into())]);
         assert_eq!(s.status, Status::Running);
+    }
+
+    #[test]
+    fn display_title_and_record_include_custom_label() {
+        let (mut s, _) = session();
+        assert_eq!(s.display_title(), "Claude Code");
+        assert_eq!(s.record(std::path::Path::new(".")).label, None);
+
+        s.label = Some("fix-retry".into());
+        assert_eq!(s.display_title(), "fix-retry · Claude Code");
+        assert_eq!(
+            s.record(std::path::Path::new(".")).label.as_deref(),
+            Some("fix-retry")
+        );
+    }
+
+    #[test]
+    fn refresh_worktree_state_tracks_dirty_and_ahead_commits() {
+        use std::process::Command;
+
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let st = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?}");
+        };
+
+        let repo = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        run(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.path().join("a.txt"), "a").unwrap();
+        run(repo.path(), &["add", "."]);
+        run(repo.path(), &["commit", "-q", "-m", "init"]);
+
+        let wt = Worktree::create(repo.path(), root.path(), "claude").unwrap();
+        let (mut s, _) = session();
+        s.worktree = Some(wt);
+        s.refresh_worktree_state();
+        assert_eq!(
+            s.worktree_state,
+            Some(WorktreeState {
+                dirty: false,
+                commits: 0
+            })
+        );
+
+        let wt_path = s.worktree.as_ref().unwrap().path.clone();
+        std::fs::write(wt_path.join("b.txt"), "b").unwrap();
+        s.refresh_worktree_state();
+        assert_eq!(
+            s.worktree_state,
+            Some(WorktreeState {
+                dirty: true,
+                commits: 0
+            })
+        );
+
+        run(&wt_path, &["add", "."]);
+        run(&wt_path, &["commit", "-q", "-m", "work"]);
+        s.refresh_worktree_state();
+        assert_eq!(
+            s.worktree_state,
+            Some(WorktreeState {
+                dirty: false,
+                commits: 1
+            })
+        );
     }
 }
