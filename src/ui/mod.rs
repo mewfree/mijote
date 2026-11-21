@@ -84,6 +84,9 @@ pub fn render(f: &mut Frame, app: &App) {
     if app.mode == Mode::Switcher {
         render_switcher(f, app);
     }
+    if app.mode == Mode::Help {
+        render_help(f);
+    }
     if let Some(s) = app.current() {
         if s.pending.is_some() {
             render_permission(f, s);
@@ -363,6 +366,7 @@ fn render_welcome(f: &mut Frame, area: Rect) {
     let rows = [
         ("n", "new isolated session (git worktree)"),
         ("N", "new session in the current directory (i / Enter)"),
+        ("?", "key help"),
         ("q", "quit"),
     ];
     render_logo(f, area);
@@ -506,6 +510,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         Mode::Picker => (" PICK ", ASK),
         Mode::Model => (" MODEL ", ASK),
         Mode::Switcher => (" SESSIONS ", ASK),
+        Mode::Help => (" HELP ", ASK),
     };
     let mut spans = vec![
         Span::styled(
@@ -521,10 +526,12 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
     if !pending.is_empty() {
         spans.push(Span::styled(format!("{pending}  "), Style::new().fg(WARN)));
     }
-    if let Some(m) = &app.message {
-        spans.push(Span::styled(m.clone(), Style::new().fg(WARN)));
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
-        return;
+    if !app.leader && app.confirm.is_none() && app.current().is_none_or(|s| s.pending.is_none()) {
+        if let Some(m) = app.message() {
+            spans.push(Span::styled(m, Style::new().fg(WARN)));
+            f.render_widget(Paragraph::new(Line::from(spans)), area);
+            return;
+        }
     }
 
     let busy = app
@@ -547,6 +554,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             ("j/k", "select"),
             ("g/G", "top/bottom"),
             ("m", "mouse"),
+            ("?", "help"),
             ("q", "quit"),
             ("Esc", "cancel"),
         ],
@@ -554,6 +562,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             ("n", "new"),
             ("N/Enter", "new here"),
             ("m", "mouse"),
+            ("?", "help"),
             ("q", "quit"),
         ],
         Mode::Normal if app.scroll > 0 => &[
@@ -561,17 +570,20 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             ("PgUp/PgDn", "scroll"),
             ("i", "insert"),
             ("␣", "commands"),
+            ("?", "help"),
         ],
         Mode::Normal if busy => &[
             ("^C", "cancel turn"),
             ("␣", "commands"),
             ("PgUp/PgDn", "scroll"),
             ("i", "insert"),
+            ("?", "help"),
         ],
         Mode::Normal => &[
             ("i", "insert"),
             ("␣", "commands"),
             ("PgUp/PgDn", "scroll"),
+            ("?", "help"),
             ("^C", "quit"),
         ],
         Mode::Insert if busy => &[
@@ -589,6 +601,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         Mode::Picker | Mode::Model | Mode::Switcher => {
             &[("j/k", "move"), ("Enter/1-9", "choose"), ("Esc", "close")]
         }
+        Mode::Help => &[("Esc/q/?", "close")],
     };
     for (i, (k, what)) in hints.iter().enumerate() {
         if i > 0 {
@@ -777,6 +790,52 @@ fn render_models(f: &mut Frame, app: &App) {
         .highlight_style(BOLD.fg(ACCENT).bg(SELECTED_BG));
     f.render_widget(Clear, area);
     f.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_help(f: &mut Frame) {
+    let heading = |title: &'static str| {
+        Line::styled(title, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
+    };
+    let row = |key: &'static str, what: &'static str| {
+        Line::from(vec![
+            Span::styled(format!("  {key:<14} "), BOLD),
+            Span::raw(what),
+        ])
+    };
+    let pair = |k1: &'static str, d1: &'static str, k2: &'static str, d2: &'static str| {
+        Line::from(vec![
+            Span::styled(format!("  {k1:<9} "), BOLD),
+            Span::raw(format!("{d1:<20}")),
+            Span::styled(format!("{k2:<7} "), BOLD),
+            Span::raw(d2),
+        ])
+    };
+
+    let lines = vec![
+        heading("prompt (vim)"),
+        row("i / Enter", "insert mode, Esc for normal"),
+        row("S-Enter / C-j", "insert newline (also Alt-Enter)"),
+        row("d c y u C-r", "operators, undo/redo & vim motions"),
+        Line::from(""),
+        heading("commands (Space in normal · C-a anywhere)"),
+        pair("n", "new worktree", "N", "new here"),
+        pair("s / Tab", "switcher", "j / k", "next / prev"),
+        pair("d", "close session", "M", "model (/model)"),
+        pair("g / G", "top / bottom", "m", "toggle mouse"),
+        pair("?", "help", "q", "quit"),
+        Line::from(""),
+        heading("session & scroll"),
+        row("PgUp / PgDn", "scroll transcript (or mouse wheel)"),
+        row("drag", "select and copy transcript text"),
+        row("C-c / C-d", "cancel turn or quit / quit now"),
+    ];
+
+    let area = centered(f.area(), 68, lines.len() as u16 + 4);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(modal("help", ACCENT, hint_line(&[("Esc/q/?", "close")]))),
+        area,
+    );
 }
 
 fn render_confirm(f: &mut Frame, c: Confirm) {
@@ -1074,6 +1133,35 @@ mod tests {
         app.confirm = Some(Confirm::Quit);
         term.draw(|f| render(f, &app)).unwrap();
         assert!(dump(&term).contains("Quit and stop it?"));
+    }
+
+    #[test]
+    fn renders_help_overlay_and_persistent_notice() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+        app.set_message("copied selection");
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("copied selection"), "{screen}");
+
+        app.mode = Mode::Help;
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains(" HELP "), "{screen}");
+        assert!(screen.contains("prompt (vim)"), "{screen}");
+        assert!(
+            screen.contains("commands (Space in normal · C-a anywhere)"),
+            "{screen}"
+        );
+        assert!(screen.contains("session & scroll"), "{screen}");
+        assert!(screen.contains("Esc/q/? close"), "{screen}");
     }
 
     #[test]

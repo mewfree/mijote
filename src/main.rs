@@ -187,10 +187,11 @@ fn tui(resume: bool) -> Result<()> {
             while let Ok(msg) = rx.try_recv() {
                 app.handle_msg(msg);
             }
+            app.tick();
             terminal.draw(|f| ui::render(f, &app))?;
             if let Some(text) = app.pending_copy.take() {
                 if clipboard::copy(&text).is_err() {
-                    app.message = Some("copy failed".into());
+                    app.set_message("copy failed");
                 }
             }
             if event::poll(Duration::from_millis(50))? {
