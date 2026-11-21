@@ -434,12 +434,12 @@ mod tests {
         let (mut s, perm_rx) = session();
         s.apply(UiMsg::Permission(PermissionRequest {
             tool_call_id: "c".into(),
-            title: None,
             options: vec![PermissionOption {
                 id: "ok".into(),
                 name: "Allow".into(),
                 kind: "allow_once".into(),
             }],
+            ..Default::default()
         }));
         assert_eq!(s.status, Status::AwaitingPermission);
         s.answer_permission(Some("ok".into()));
@@ -448,8 +448,7 @@ mod tests {
 
         s.apply(UiMsg::Permission(PermissionRequest {
             tool_call_id: "c2".into(),
-            title: None,
-            options: vec![],
+            ..Default::default()
         }));
         s.cancel();
         assert_eq!(perm_rx.try_recv().unwrap(), None);

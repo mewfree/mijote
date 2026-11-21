@@ -92,8 +92,8 @@ Running turns show an animated spinner in the sidebar and a trailing =working…
 Key hints depend on state (idle, running, scrolled, insert, confirm); cwd is shown only when it fits.
 ** TODO TUI: sidebar labels and attention
 Show branch/label per session so parallel sessions of one agent are distinguishable; loud highlight (and optional bell) when a background session needs permission or finishes.
-** TODO TUI: richer permission modal
-Show the command/path/diff from the request, =a=/=r= shortcuts, human option labels instead of raw kinds.
+** DONE TUI: richer permission modal
+=PermissionRequest= in =src/agent/acp.rs= now parses =toolCall.kind=, =rawInput= commands/paths, =locations= (with line numbers), =content= diffs (=PermissionDiff=), and fallback preview text. =App::handle_permission_key= adds =a= (prefer =allow_once=, else =allow*=) and =r= (prefer =reject_once=, else =reject*=, else cancel turn) alongside =1-9= and =Esc=. =render_permission= displays the kind badge, locations, =$ command= lines, colorized/capped diff previews, deduplicated human-readable option labels, =[a]=/=[r]= badges, and dynamic modal sizing.
 ** TODO TUI: picker shows install/login state
 Mark each agent installed / needs install / needs login.
 ** TODO TUI: persistent notices and help overlay

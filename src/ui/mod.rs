@@ -531,6 +531,12 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         .current()
         .is_some_and(|s| matches!(s.status, Status::Running | Status::AwaitingPermission));
     let hints: &[(&'static str, &'static str)] = match app.mode {
+        _ if app.current().is_some_and(|s| s.pending.is_some()) => &[
+            ("a", "allow"),
+            ("r", "reject"),
+            ("1-9", "choose"),
+            ("Esc", "cancel"),
+        ],
         _ if app.confirm.is_some() => &[("y", "confirm"), ("any other key", "cancel")],
         _ if app.leader => &[
             ("n", "new"),
@@ -792,37 +798,218 @@ fn render_confirm(f: &mut Frame, c: Confirm) {
     );
 }
 
+const MAX_PERMISSION_WIDTH: u16 = 78;
+const MAX_PERMISSION_DETAIL_LINES: usize = 12;
+
+fn permission_kind_label(kind: &str) -> Option<&str> {
+    match kind {
+        "allow_once" => Some("allow once"),
+        "allow_always" => Some("always allow"),
+        "reject_once" => Some("reject once"),
+        "reject_always" => Some("always reject"),
+        "" => None,
+        other => Some(other),
+    }
+}
+
+enum DiffLine<'a> {
+    Context(&'a str),
+    Removed(&'a str),
+    Added(&'a str),
+}
+
+fn diff_lines<'a>(old: Option<&'a str>, new: &'a str) -> Vec<DiffLine<'a>> {
+    let new_lines: Vec<&str> = new.lines().collect();
+    let Some(old_str) = old.filter(|s| !s.is_empty()) else {
+        return new_lines.into_iter().map(DiffLine::Added).collect();
+    };
+    let old_lines: Vec<&str> = old_str.lines().collect();
+    let prefix = old_lines
+        .iter()
+        .zip(new_lines.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let old_rem = &old_lines[prefix..];
+    let new_rem = &new_lines[prefix..];
+    let suffix = old_rem
+        .iter()
+        .rev()
+        .zip(new_rem.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut out = Vec::new();
+    if prefix > 0 && (prefix < old_lines.len() || prefix < new_lines.len()) {
+        out.push(DiffLine::Context(old_lines[prefix - 1]));
+    }
+    for &l in &old_rem[..old_rem.len() - suffix] {
+        out.push(DiffLine::Removed(l));
+    }
+    for &l in &new_rem[..new_rem.len() - suffix] {
+        out.push(DiffLine::Added(l));
+    }
+    if suffix > 0 {
+        out.push(DiffLine::Context(old_rem[old_rem.len() - suffix]));
+    }
+    out
+}
+
 fn render_permission(f: &mut Frame, s: &Session) {
     let Some(req) = &s.pending else { return };
-    let mut lines = vec![
-        Line::styled(
-            req.title
-                .clone()
-                .unwrap_or_else(|| req.tool_call_id.clone()),
-            BOLD,
-        ),
-        Line::from(""),
-    ];
-    for (i, o) in req.options.iter().enumerate() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{} ", i + 1),
-                Style::new().fg(ASK).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(o.name.clone()),
-            Span::styled(format!("  {}", o.kind), DIM),
-        ]));
+    let term = f.area();
+    let max_w = if term.width > 4 {
+        (term.width - 4).min(MAX_PERMISSION_WIDTH)
+    } else {
+        term.width
+    };
+    let max_h = term.height.saturating_sub(4);
+    let inner_w = (max_w.saturating_sub(6) as usize).max(1);
+    let inner_max_h = max_h.saturating_sub(4) as usize;
+
+    let title = req
+        .title
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .unwrap_or(&req.tool_call_id);
+    let title_line = if let Some(kind) = &req.kind {
+        let badge = format!("[{kind}]");
+        let room = inner_w.saturating_sub(badge.chars().count() + 2).max(1);
+        Line::from(vec![
+            Span::styled(fit(title, room), BOLD),
+            Span::raw("  "),
+            Span::styled(badge, Style::new().fg(WARN)),
+        ])
+    } else {
+        Line::styled(fit(title, inner_w), BOLD)
+    };
+
+    let mut detail_lines: Vec<Line<'static>> = Vec::new();
+    for loc in &req.locations {
+        detail_lines.push(Line::styled(fit(loc, inner_w), Style::new().fg(CODE_FG)));
     }
-    let area = centered(f.area(), 68, lines.len() as u16 + 4);
+    if let Some(cmd) = &req.command {
+        let already_in_locations = req
+            .locations
+            .iter()
+            .any(|l| l == cmd || l.starts_with(&format!("{cmd}:")));
+        if !already_in_locations {
+            let is_file_tool = matches!(
+                req.kind.as_deref(),
+                Some("edit" | "read" | "delete" | "move")
+            );
+            if is_file_tool {
+                detail_lines.push(Line::styled(fit(cmd, inner_w), Style::new().fg(CODE_FG)));
+            } else {
+                let cmd_w = inner_w.saturating_sub(2).max(1);
+                let mut first = true;
+                for raw in cmd.lines() {
+                    for chunk in wrap_code(raw, cmd_w) {
+                        let prefix = if first { "$ " } else { "  " };
+                        first = false;
+                        detail_lines.push(Line::styled(
+                            format!("{prefix}{chunk}"),
+                            Style::new().fg(ACCENT),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    for diff in &req.diffs {
+        let show_path = !diff.path.is_empty()
+            && (req.diffs.len() > 1
+                || !req
+                    .locations
+                    .iter()
+                    .any(|l| l == &diff.path || l.starts_with(&format!("{}:", diff.path))));
+        if show_path {
+            detail_lines.push(Line::styled(fit(&diff.path, inner_w), DIM));
+        }
+        for dl in diff_lines(diff.old_text.as_deref(), &diff.new_text) {
+            let (text, style) = match dl {
+                DiffLine::Context(l) => (format!("  {l}"), DIM),
+                DiffLine::Removed(l) => (format!("- {l}"), Style::new().fg(ERR)),
+                DiffLine::Added(l) => (format!("+ {l}"), Style::new().fg(OK)),
+            };
+            detail_lines.push(Line::styled(fit(&text, inner_w), style));
+        }
+    }
+    if req.diffs.is_empty() {
+        if let Some(preview) = &req.preview_text {
+            for raw in preview.lines() {
+                for chunk in wrap_code(raw, inner_w) {
+                    detail_lines.push(Line::styled(chunk, Style::new().fg(CODE_FG)));
+                }
+            }
+        }
+    }
+
+    let mut lines = vec![title_line];
+    let fixed_rows = 1 + 1 + req.options.len();
+    if !detail_lines.is_empty() {
+        let avail = inner_max_h.saturating_sub(fixed_rows);
+        if avail >= 2 {
+            let cap = (avail - 1).min(MAX_PERMISSION_DETAIL_LINES);
+            if detail_lines.len() > cap {
+                let keep = cap.saturating_sub(1);
+                let remaining = detail_lines.len() - keep;
+                let noun = if remaining == 1 { "line" } else { "lines" };
+                detail_lines.truncate(keep);
+                detail_lines.push(Line::styled(format!("… ({remaining} more {noun})"), DIM));
+            }
+            lines.push(Line::from(""));
+            lines.extend(detail_lines);
+        }
+    }
+    lines.push(Line::from(""));
+
+    let allow_idx = req.allow_index();
+    let reject_idx = req.reject_index();
+    let has_shortcut = allow_idx.is_some() || reject_idx.is_some();
+    for (i, o) in req.options.iter().enumerate() {
+        let mut spans = vec![Span::styled(
+            format!("{} ", i + 1),
+            Style::new().fg(ASK).add_modifier(Modifier::BOLD),
+        )];
+        if Some(i) == allow_idx {
+            spans.push(Span::styled(
+                "[a] ",
+                Style::new().fg(OK).add_modifier(Modifier::BOLD),
+            ));
+        } else if Some(i) == reject_idx {
+            spans.push(Span::styled(
+                "[r] ",
+                Style::new().fg(ERR).add_modifier(Modifier::BOLD),
+            ));
+        } else if has_shortcut {
+            spans.push(Span::raw("    "));
+        }
+        spans.push(Span::raw(o.name.clone()));
+        if let Some(label) = permission_kind_label(&o.kind) {
+            let name_norm = o.name.trim();
+            let raw_spaced = o.kind.replace('_', " ");
+            if !name_norm.eq_ignore_ascii_case(label)
+                && !name_norm.eq_ignore_ascii_case(&raw_spaced)
+            {
+                spans.push(Span::styled(format!("  {label}"), DIM));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let hint = hint_line(&[
+        ("a", "allow"),
+        ("r", "reject"),
+        ("1-9", "choose"),
+        ("Esc", "cancel"),
+    ]);
+    let min_w = (hint.width() as u16 + 4).max(56).min(max_w);
+    let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let width = (content_w + 6).clamp(min_w, max_w);
+    let height = (lines.len() as u16 + 4).min(max_h);
+    let area = centered(term, width, height);
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(lines)
-            .wrap(ratatui::widgets::Wrap { trim: false })
-            .block(modal(
-                "permission requested",
-                ASK,
-                hint_line(&[("1-9", "choose"), ("Esc", "reject")]),
-            )),
+        Paragraph::new(lines).block(modal("permission requested", ASK, hint)),
         area,
     );
 }
@@ -923,5 +1110,135 @@ mod tests {
         assert_eq!(wrap("a\n\nb", 5), vec!["a", "", "b"]);
         assert_eq!(wrap_code("  x = 1", 4), vec!["  x ", "= 1"]);
         assert_eq!(fit("abcdef", 4), "abc…");
+    }
+
+    #[test]
+    fn render_permission_shows_command_human_labels_and_hints() {
+        use crate::agent::acp::{PermissionOption, PermissionRequest};
+
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.status = Status::AwaitingPermission;
+        s.pending = Some(PermissionRequest {
+            tool_call_id: "c1".into(),
+            title: Some("Run cargo test".into()),
+            kind: Some("execute".into()),
+            command: Some("cargo test --all".into()),
+            options: vec![
+                PermissionOption {
+                    id: "a1".into(),
+                    name: "Allow once".into(),
+                    kind: "allow_once".into(),
+                },
+                PermissionOption {
+                    id: "a2".into(),
+                    name: "Allow".into(),
+                    kind: "allow_always".into(),
+                },
+                PermissionOption {
+                    id: "r1".into(),
+                    name: "Reject".into(),
+                    kind: "reject_once".into(),
+                },
+            ],
+            ..Default::default()
+        });
+        app.sessions.push(s);
+
+        let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+
+        assert!(screen.contains("Run cargo test"), "{screen}");
+        assert!(screen.contains("[execute]"), "{screen}");
+        assert!(screen.contains("$ cargo test --all"), "{screen}");
+        assert!(screen.contains("1 [a] Allow once"), "{screen}");
+        assert!(screen.contains("2     Allow  always allow"), "{screen}");
+        assert!(screen.contains("3 [r] Reject  reject once"), "{screen}");
+        // No raw ACP kind strings and no duplicate `Allow once  allow once`.
+        assert!(!screen.contains("allow_once"), "{screen}");
+        assert!(!screen.contains("allow_always"), "{screen}");
+        assert!(!screen.contains("reject_once"), "{screen}");
+        assert!(!screen.contains("Allow once  allow once"), "{screen}");
+        assert!(
+            screen.contains("a allow · r reject · 1-9 choose · Esc cancel"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn render_permission_shows_diff_lines_and_truncates_long_diffs() {
+        use crate::agent::acp::{PermissionDiff, PermissionOption, PermissionRequest};
+
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.status = Status::AwaitingPermission;
+        let many_new = (1..=20)
+            .map(|i| format!("let line_{i} = {i};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        s.pending = Some(PermissionRequest {
+            tool_call_id: "c2".into(),
+            title: Some("Edit src/client.rs".into()),
+            kind: Some("edit".into()),
+            locations: vec!["src/client.rs:10".into()],
+            diffs: vec![PermissionDiff {
+                path: "src/client.rs".into(),
+                old_text: Some("let old_val = 0;\n".into()),
+                new_text: many_new,
+            }],
+            options: vec![
+                PermissionOption {
+                    id: "ok".into(),
+                    name: "Allow once".into(),
+                    kind: "allow_once".into(),
+                },
+                PermissionOption {
+                    id: "no".into(),
+                    name: "Reject once".into(),
+                    kind: "reject_once".into(),
+                },
+            ],
+            ..Default::default()
+        });
+        app.sessions.push(s);
+
+        let mut term = Terminal::new(TestBackend::new(90, 22)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+
+        assert!(screen.contains("[edit]"), "{screen}");
+        assert!(screen.contains("src/client.rs:10"), "{screen}");
+        assert!(screen.contains("- let old_val = 0;"), "{screen}");
+        assert!(screen.contains("+ let line_1 = 1;"), "{screen}");
+        assert!(screen.contains("more lines)"), "{screen}");
+        // Options remain visible even when diff is truncated.
+        assert!(screen.contains("1 [a] Allow once"), "{screen}");
+        assert!(screen.contains("2 [r] Reject once"), "{screen}");
+
+        // Verify diff colors: removed line is Red, added line is Green.
+        let buf = term.backend().buffer();
+        let has_red_minus = buf
+            .content()
+            .iter()
+            .any(|c| c.symbol() == "-" && c.fg == ERR);
+        let has_green_plus = buf
+            .content()
+            .iter()
+            .any(|c| c.symbol() == "+" && c.fg == OK);
+        assert!(has_red_minus, "expected red '-' in diff:\n{screen}");
+        assert!(has_green_plus, "expected green '+' in diff:\n{screen}");
     }
 }

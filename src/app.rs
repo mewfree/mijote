@@ -406,18 +406,20 @@ impl App {
     fn handle_permission_key(&mut self, key: KeyEvent) {
         let Some(s) = self.current_mut() else { return };
         let Some(req) = &s.pending else { return };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let choice = match key.code {
-            KeyCode::Char(c) => c
+            KeyCode::Char('a') if !ctrl => {
+                req.allow_index().map(|i| Some(req.options[i].id.clone()))
+            }
+            KeyCode::Char('r') if !ctrl => {
+                Some(req.reject_index().map(|i| req.options[i].id.clone()))
+            }
+            KeyCode::Char(c) if !ctrl => c
                 .to_digit(10)
                 .and_then(|n| (n as usize).checked_sub(1))
                 .and_then(|i| req.options.get(i))
                 .map(|o| Some(o.id.clone())),
-            KeyCode::Esc => Some(
-                req.options
-                    .iter()
-                    .find(|o| o.kind.starts_with("reject"))
-                    .map(|o| o.id.clone()),
-            ),
+            KeyCode::Esc => Some(req.reject_index().map(|i| req.options[i].id.clone())),
             _ => None,
         };
         match choice {
@@ -910,6 +912,7 @@ mod tests {
                         kind: "reject_once".into(),
                     },
                 ],
+                ..Default::default()
             }),
         });
         // 'q' must not quit while a permission is pending.
@@ -917,6 +920,94 @@ mod tests {
         assert!(!app.should_quit);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(perm_rx.try_recv().unwrap(), Some("no".into()));
+    }
+
+    #[test]
+    fn permission_shortcuts_a_r_digits_and_cancel() {
+        let (mut app, perm_rx) = app_with_session();
+        let req_all = || PermissionRequest {
+            tool_call_id: "c".into(),
+            title: Some("Edit file".into()),
+            options: vec![
+                PermissionOption {
+                    id: "always".into(),
+                    name: "Always allow".into(),
+                    kind: "allow_always".into(),
+                },
+                PermissionOption {
+                    id: "once".into(),
+                    name: "Allow once".into(),
+                    kind: "allow_once".into(),
+                },
+                PermissionOption {
+                    id: "rej_always".into(),
+                    name: "Always reject".into(),
+                    kind: "reject_always".into(),
+                },
+                PermissionOption {
+                    id: "rej_once".into(),
+                    name: "Reject once".into(),
+                    kind: "reject_once".into(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        // `a` prefers allow_once over allow_always.
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::Permission(req_all()),
+        });
+        app.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(perm_rx.try_recv().unwrap(), Some("once".into()));
+
+        // `r` prefers reject_once over reject_always.
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::Permission(req_all()),
+        });
+        app.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(perm_rx.try_recv().unwrap(), Some("rej_once".into()));
+
+        // `1-9` still chooses by index.
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::Permission(req_all()),
+        });
+        app.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(perm_rx.try_recv().unwrap(), Some("always".into()));
+
+        // `a` falls back to allow_always when allow_once is absent.
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::Permission(PermissionRequest {
+                tool_call_id: "c2".into(),
+                options: vec![PermissionOption {
+                    id: "always".into(),
+                    name: "Always allow".into(),
+                    kind: "allow_always".into(),
+                }],
+                ..Default::default()
+            }),
+        });
+        app.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(perm_rx.try_recv().unwrap(), Some("always".into()));
+
+        // `r` cancels the turn (None) when no reject option is offered.
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::Permission(PermissionRequest {
+                tool_call_id: "c3".into(),
+                options: vec![PermissionOption {
+                    id: "once".into(),
+                    name: "Allow once".into(),
+                    kind: "allow_once".into(),
+                }],
+                ..Default::default()
+            }),
+        });
+        app.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(perm_rx.try_recv().unwrap(), None);
     }
 
     #[test]
