@@ -97,6 +97,10 @@ pub struct App {
     pub selection: Option<Selection>,
     /// Plain text of the transcript lines from the last render, for copying.
     pub transcript_text: RefCell<Vec<String>>,
+    /// Clickable markdown links currently visible on screen (for OSC 8).
+    pub visible_links: RefCell<Vec<ui::ScreenLink>>,
+    /// Cursor position requested during the last render, if visible.
+    pub cursor_pos: Cell<Option<(u16, u16)>>,
     /// Text to put on the clipboard; the event loop owns the terminal I/O.
     pub pending_copy: Option<String>,
     /// Set when a background session needs attention; the event loop rings BEL.
@@ -145,6 +149,8 @@ impl App {
             search_current: None,
             selection: None,
             transcript_text: RefCell::new(Vec::new()),
+            visible_links: RefCell::new(Vec::new()),
+            cursor_pos: Cell::new(None),
             pending_copy: None,
             pending_bell: false,
             should_quit: false,
