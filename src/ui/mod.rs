@@ -592,13 +592,55 @@ fn render_welcome(f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(lines), r);
 }
 
+/// Display column ranges `[from, to)` of every case-insensitive occurrence of
+/// `query` in `line`.
+fn find_match_cols(line: &str, query: &str) -> Vec<(u16, u16)> {
+    use unicode_width::UnicodeWidthChar;
+
+    let needle: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut lowered: Vec<(char, u16, u16)> = Vec::new();
+    let mut col = 0u16;
+    for ch in line.chars() {
+        let w = ch.width().unwrap_or(0) as u16;
+        let end = col.saturating_add(w);
+        for lc in ch.to_lowercase() {
+            lowered.push((lc, col, end));
+        }
+        col = end;
+    }
+    let mut out = Vec::new();
+    let n = needle.len();
+    let mut i = 0;
+    while i + n <= lowered.len() {
+        if (0..n).all(|k| lowered[i + k].0 == needle[k]) {
+            let from = lowered[i].1;
+            let to = lowered[i + n - 1].2;
+            if from < to {
+                out.push((from, to));
+            }
+            i += n;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
     let inner = area;
+    app.transcript_height.set(inner.height);
     let Some(s) = app.current() else {
+        app.max_scroll.set(0);
+        app.transcript_text.borrow_mut().clear();
         render_welcome(f, inner);
         return;
     };
     if s.entries.is_empty() {
+        app.max_scroll.set(0);
+        app.transcript_text.borrow_mut().clear();
         let msg = match s.status {
             Status::Starting => "starting agent (first run may install the adapter)…",
             Status::Failed => "agent failed to start",
@@ -613,7 +655,7 @@ fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
 
     let mut lines = transcript_lines(s, inner.width as usize, app.show_tool_details);
     lines.extend(activity_line(s));
-    let total = lines.len() as u16;
+    let total = lines.len().min(u16::MAX as usize) as u16;
     let max_scroll = total.saturating_sub(inner.height);
     app.max_scroll.set(max_scroll);
     let from_top = max_scroll.saturating_sub(app.scroll.min(max_scroll));
@@ -622,6 +664,35 @@ fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
         .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
         .collect();
     f.render_widget(Paragraph::new(lines).scroll((from_top, 0)), inner);
+
+    if !app.search_query.is_empty() {
+        let current_line = app
+            .search_current
+            .and_then(|i| app.search_matches.get(i).copied());
+        let match_style = Style::new().fg(Color::Black).bg(WARN);
+        let current_style = Style::new()
+            .fg(Color::Black)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD);
+        for y in 0..inner.height {
+            let line = from_top as usize + y as usize;
+            let Some(t) = text.get(line) else {
+                break;
+            };
+            let style = if current_line == Some(line) {
+                current_style
+            } else {
+                match_style
+            };
+            for (from, to) in find_match_cols(t, &app.search_query) {
+                for x in from..to.min(inner.width) {
+                    if let Some(cell) = f.buffer_mut().cell_mut((inner.x + x, inner.y + y)) {
+                        cell.set_style(style);
+                    }
+                }
+            }
+        }
+    }
 
     if let Some(sel) = app.selection {
         for y in 0..inner.height {
@@ -708,6 +779,15 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+fn search_count_span(app: &App) -> Span<'static> {
+    if app.search_matches.is_empty() {
+        Span::styled("no matches", Style::new().fg(ERR))
+    } else {
+        let cur = app.search_current.map_or(0, |i| i + 1);
+        Span::styled(format!("[{cur}/{}]", app.search_matches.len()), DIM)
+    }
+}
+
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
     let (badge, badge_bg) = match app.mode {
         _ if app.leader => (" LEADER ", ASK),
@@ -718,6 +798,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         Mode::Switcher => (" SESSIONS ", ASK),
         Mode::Help => (" HELP ", ASK),
         Mode::Rename => (" RENAME ", ASK),
+        Mode::Search => (" SEARCH ", WARN),
     };
     let mut spans = vec![
         Span::styled(
@@ -729,6 +810,35 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::raw("  "),
     ];
+    let has_pending_perm = app.current().is_some_and(|s| s.pending.is_some());
+    if app.mode == Mode::Search && !has_pending_perm {
+        let prefix_w: u16 = spans
+            .iter()
+            .map(|s| crate::selection::text_width(s.content.as_ref()))
+            .sum();
+        let query_w = crate::selection::text_width(&app.search_query);
+        spans.push(Span::styled("/", BOLD));
+        spans.push(Span::raw(app.search_query.clone()));
+        let cursor_x = area
+            .x
+            .saturating_add(prefix_w)
+            .saturating_add(1)
+            .saturating_add(query_w);
+        if cursor_x < area.right() {
+            f.set_cursor_position((cursor_x, area.y));
+        }
+        spans.push(Span::raw("  "));
+        if !app.search_query.is_empty() {
+            spans.push(search_count_span(app));
+            spans.push(Span::raw("  "));
+        }
+        spans.extend(key_hint("Enter", "jump"));
+        spans.push(Span::styled(" · ", DIM));
+        spans.extend(key_hint("Esc", "clear"));
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+
     let pending = app.input.pending();
     if !pending.is_empty() {
         spans.push(Span::styled(format!("{pending}  "), Style::new().fg(WARN)));
@@ -741,87 +851,124 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let busy = app
-        .current()
-        .is_some_and(|s| matches!(s.status, Status::Running | Status::AwaitingPermission));
-    let hints: &[(&'static str, &'static str)] = match app.mode {
-        _ if app.current().is_some_and(|s| s.pending.is_some()) => &[
-            ("a", "allow"),
-            ("r", "reject"),
-            ("1-9", "choose"),
-            ("Esc", "cancel"),
-        ],
-        _ if app.confirm.is_some() => &[("y", "confirm"), ("any other key", "cancel")],
-        _ if app.leader => &[
-            ("n", "new"),
-            ("N", "new here"),
-            ("d", "close"),
-            ("r", "rename"),
-            ("M", "model"),
-            ("s", "sessions"),
-            ("t", "tools"),
-            ("j/k", "select"),
-            ("g/G", "top/bottom"),
-            ("m", "mouse"),
-            ("?", "help"),
-            ("q", "quit"),
-            ("Esc", "cancel"),
-        ],
-        Mode::Normal if app.sessions.is_empty() => &[
-            ("n", "new"),
-            ("N/Enter", "new here"),
-            ("m", "mouse"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
-        Mode::Normal if app.scroll > 0 => &[
-            ("␣G", "follow"),
-            ("PgUp/PgDn", "scroll"),
-            ("i", "insert"),
-            ("␣", "commands"),
-            ("?", "help"),
-        ],
-        Mode::Normal if busy => &[
-            ("^C", "cancel turn"),
-            ("␣", "commands"),
-            ("PgUp/PgDn", "scroll"),
-            ("i", "insert"),
-            ("?", "help"),
-        ],
-        Mode::Normal => &[
-            ("i", "insert"),
-            ("␣", "commands"),
-            ("PgUp/PgDn", "scroll"),
-            ("?", "help"),
-            ("^C", "quit"),
-        ],
-        Mode::Insert if busy => &[
-            ("Enter", "send when idle"),
-            ("^C", "cancel turn"),
-            ("^A", "commands"),
-            ("Esc", "normal"),
-        ],
-        Mode::Insert => &[
-            ("Enter", "send"),
-            ("S-Enter", "newline"),
-            ("^A", "commands"),
-            ("Esc", "normal"),
-        ],
-        Mode::Picker | Mode::Model => &[("j/k", "move"), ("Enter/1-9", "choose"), ("Esc", "close")],
-        Mode::Switcher => &[
-            ("j/k", "move"),
-            ("Enter/1-9", "switch"),
-            ("r", "rename"),
-            ("Esc", "close"),
-        ],
-        Mode::Help => &[("Esc/q/?", "close")],
-        Mode::Rename => &[("Enter", "save"), ("^U", "clear"), ("Esc", "cancel")],
-    };
-    for (i, (k, what)) in hints.iter().enumerate() {
-        if i > 0 {
+    if !app.search_query.is_empty()
+        && !app.leader
+        && app.confirm.is_none()
+        && !has_pending_perm
+        && app.mode == Mode::Normal
+    {
+        spans.push(Span::styled(
+            format!("/{} ", fit(&app.search_query, 24)),
+            BOLD,
+        ));
+        spans.push(search_count_span(app));
+        spans.push(Span::raw("  "));
+        spans.extend(key_hint("n/N", "next/prev"));
+        spans.push(Span::styled(" · ", DIM));
+        spans.extend(key_hint("Esc", "clear"));
+    } else {
+        if !app.search_query.is_empty()
+            && !app.leader
+            && app.confirm.is_none()
+            && !has_pending_perm
+            && app.mode == Mode::Insert
+        {
+            spans.push(Span::styled(
+                format!("/{} ", fit(&app.search_query, 20)),
+                BOLD,
+            ));
+            spans.push(search_count_span(app));
             spans.push(Span::raw("  "));
         }
-        spans.extend(key_hint(k, what));
+        let busy = app
+            .current()
+            .is_some_and(|s| matches!(s.status, Status::Running | Status::AwaitingPermission));
+        let hints: &[(&'static str, &'static str)] = match app.mode {
+            _ if has_pending_perm => &[
+                ("a", "allow"),
+                ("r", "reject"),
+                ("1-9", "choose"),
+                ("Esc", "cancel"),
+            ],
+            _ if app.confirm.is_some() => &[("y", "confirm"), ("any other key", "cancel")],
+            _ if app.leader => &[
+                ("n", "new"),
+                ("N", "new here"),
+                ("d", "close"),
+                ("r", "rename"),
+                ("M", "model"),
+                ("s", "sessions"),
+                ("t", "tools"),
+                ("j/k", "select"),
+                ("g/G", "top/bottom"),
+                ("/", "search"),
+                ("m", "mouse"),
+                ("?", "help"),
+                ("q", "quit"),
+                ("Esc", "cancel"),
+            ],
+            Mode::Normal if app.sessions.is_empty() => &[
+                ("n", "new"),
+                ("N/Enter", "new here"),
+                ("m", "mouse"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            Mode::Normal if app.scroll > 0 => &[
+                ("␣G", "follow"),
+                ("^U/^D", "half-page"),
+                ("/", "search"),
+                ("i", "insert"),
+                ("␣", "commands"),
+                ("?", "help"),
+            ],
+            Mode::Normal if busy => &[
+                ("^C", "cancel turn"),
+                ("␣", "commands"),
+                ("^U/^D", "half-page"),
+                ("/", "search"),
+                ("i", "insert"),
+                ("?", "help"),
+            ],
+            Mode::Normal => &[
+                ("i", "insert"),
+                ("␣", "commands"),
+                ("^U/^D", "half-page"),
+                ("/", "search"),
+                ("?", "help"),
+                ("^C", "quit"),
+            ],
+            Mode::Insert if busy => &[
+                ("Enter", "send when idle"),
+                ("^C", "cancel turn"),
+                ("^A", "commands"),
+                ("Esc", "normal"),
+            ],
+            Mode::Insert => &[
+                ("Enter", "send"),
+                ("S-Enter", "newline"),
+                ("^A", "commands"),
+                ("Esc", "normal"),
+            ],
+            Mode::Picker | Mode::Model => {
+                &[("j/k", "move"), ("Enter/1-9", "choose"), ("Esc", "close")]
+            }
+            Mode::Switcher => &[
+                ("j/k", "move"),
+                ("Enter/1-9", "switch"),
+                ("r", "rename"),
+                ("Esc", "close"),
+            ],
+            Mode::Help => &[("Esc/q/?", "close")],
+            Mode::Rename => &[("Enter", "save"), ("^U", "clear"), ("Esc", "cancel")],
+            Mode::Search => &[],
+        };
+        for (i, (k, what)) in hints.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("  "));
+            }
+            spans.extend(key_hint(k, what));
+        }
     }
 
     let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
@@ -1131,9 +1278,10 @@ fn render_help(f: &mut Frame) {
         pair("?", "help", "q", "quit"),
         Line::from(""),
         heading("session & scroll"),
-        row("PgUp / PgDn", "scroll transcript (or mouse wheel)"),
+        row("PgUp/Dn C-u/d", "scroll transcript (half-page in normal)"),
+        row("/  n / N", "search transcript, next / prev match"),
         row("drag", "select and copy transcript text"),
-        row("C-c / C-d", "cancel turn or quit / quit now"),
+        row("C-c / C-d", "cancel turn or quit / quit (insert/modal)"),
     ];
 
     let area = centered(f.area(), 68, lines.len() as u16 + 4);
@@ -1815,5 +1963,102 @@ mod tests {
         assert!(rename.contains("api-cleanup"), "{rename}");
         assert!(rename.contains("Enter save"), "{rename}");
         assert!(rename.contains("Esc cancel"), "{rename}");
+    }
+
+    #[test]
+    fn find_match_cols_handles_case_and_wide_chars() {
+        assert_eq!(
+            find_match_cols("  ▎ Fix BUG and bug", "bug"),
+            vec![(8, 11), (16, 19)]
+        );
+        assert_eq!(find_match_cols("日本語abc", "語A"), vec![(4, 7)]);
+        assert!(find_match_cols("hello", "").is_empty());
+        assert!(find_match_cols("hello", "xyz").is_empty());
+    }
+
+    #[test]
+    fn render_highlights_search_matches_and_shows_counts() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.status = Status::Idle;
+        s.entries.push(Entry::User("first bug here".into()));
+        s.entries.push(Entry::Agent("second BUG there".into()));
+        app.sessions.push(s);
+
+        let mut term = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        // Initial draw populates transcript_text and transcript_height.
+        term.draw(|f| render(f, &app)).unwrap();
+        assert_eq!(app.transcript_height.get(), 10);
+
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "bug".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("SEARCH"), "{screen}");
+        assert!(screen.contains("/bug"), "{screen}");
+        assert!(screen.contains("[1/2]"), "{screen}");
+        assert!(screen.contains("Enter jump"), "{screen}");
+
+        let transcript_highlights = |term: &Terminal<TestBackend>, app: &App| {
+            let buf = term.backend().buffer();
+            let view = transcript_area(buf.area, app.input.line_count());
+            let mut cur_hl = String::new();
+            let mut other_hl = String::new();
+            for y in view.y..view.bottom() {
+                for x in view.x..view.right() {
+                    let c = &buf[(x, y)];
+                    if c.bg == ACCENT && c.fg == Color::Black && c.modifier.contains(Modifier::BOLD)
+                    {
+                        cur_hl.push_str(c.symbol());
+                    } else if c.bg == WARN && c.fg == Color::Black {
+                        other_hl.push_str(c.symbol());
+                    }
+                }
+            }
+            (cur_hl, other_hl)
+        };
+
+        // Current match cells use ACCENT + BOLD; other match cells use WARN.
+        assert_eq!(
+            transcript_highlights(&term, &app),
+            ("bug".to_string(), "BUG".to_string())
+        );
+
+        // Enter returns to Normal mode with compact counter and hints.
+        app.handle_key(key(KeyCode::Enter));
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("NORMAL"), "{screen}");
+        assert!(screen.contains("/bug [1/2]"), "{screen}");
+        assert!(screen.contains("n/N next/prev"), "{screen}");
+
+        // Stepping to the next match swaps current highlight to the second line.
+        app.handle_key(key(KeyCode::Char('n')));
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("[2/2]"), "{screen}");
+        assert_eq!(
+            transcript_highlights(&term, &app),
+            ("BUG".to_string(), "bug".to_string())
+        );
+
+        // Non-matching query displays "no matches".
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "zzzz".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        term.draw(|f| render(f, &app)).unwrap();
+        assert!(dump(&term).contains("no matches"));
     }
 }

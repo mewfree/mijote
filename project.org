@@ -74,8 +74,8 @@ Agent messages render through =ui/markdown.rs= (pulldown-cmark): headings, bold/
 Mouse capture is on by default: wheel scrolls the transcript, a click on a sidebar row selects that session, a click on the prompt box enters insert mode. =m= (normal mode) toggles capture off so the terminal's own text selection works. Hit-testing lives in =ui::locate= beside the layout; modals (picker, permission, confirm) ignore the mouse.
 ** DONE TUI: mouse text selection and copy
 Left-drag over the transcript highlights text (reverse video) and copies it on release. Positions are kept in transcript content coordinates (=src/selection.rs=), so the highlight follows the text when scrolling; dragging past the top or bottom edge scrolls. A click or key press clears it. Copy goes through =src/clipboard.rs=: OSC 52 (works over ssh in iTerm2, kitty, WezTerm, Ghostty, tmux with =set-clipboard on=) plus =pbcopy= on macOS for Terminal.app. Selection is by line, so gutter glyphs (=▎=, =┊=) are copied with the text. Not verified in a live terminal.
-** TODO TUI: transcript scrolling and search
-PgUp/PgDn (also in insert mode), =g=/Home top, =G=/End follow, wheel; scroll clamps to the transcript. Still want half-page and =/= search.
+** DONE TUI: transcript scrolling and search
+PgUp/PgDn (also in insert mode), =g=/Home top, =G=/End follow, wheel, and half-page =Ctrl-u=/=Ctrl-d= scrolling (in Normal mode with a session open and no modal, or behind the leader key; =Ctrl-d= still quits everywhere else — Insert mode, modals, and with no sessions open). =/= (and leader + =/=) opens live case-insensitive transcript search (=Mode::Search=) with highlighted matches, status-bar match counter, =Enter= to keep highlights and return to Normal mode, =n=/=N= to cycle matches and scroll them into view, and =Esc= to clear.
 ** DONE TUI: start on a new session by default
 On startup, mijote no longer auto-restores saved sessions; instead it immediately opens a new session in the current directory (no worktree) using the first installed backend (=agent::default_agent=, falling back to Claude Code). Pass =--resume= / =-r= to reopen saved sessions for the current directory.
 ** DONE TUI: default to agent used in previous conversation
@@ -83,7 +83,7 @@ On startup, =App::open_default_session= picks the agent used in the previous con
 ** DONE TUI: open the picker when there is no session
 When all sessions are closed (or =--resume= finds none): (1) =i=/=Enter= in normal mode opens the new-session picker in the current directory (=open_picker(false)=) instead of being a no-op (and closing the last session returns to normal mode); (2) =open_picker= (via =open_picker_with=) spawns the single candidate agent directly and skips =Mode::Picker= when only one agent is available. Updated the welcome screen, prompt placeholder, and status bar hints to advertise =i= / =Enter=.
 ** DONE TUI: Ctrl-D quits
-=Ctrl-D= sets =should_quit= from any mode, ahead of the permission modal (same path as idle =Ctrl-C=). Conflicts with the planned =Ctrl-u/d= half-page scroll in the vim task; resolve there.
+=Ctrl-D= sets =should_quit= from Insert mode, modals (permission/confirm/picker/model/switcher/search), and when no sessions are open (same path as idle =Ctrl-C=). Resolved with =Ctrl-u/d= half-page scroll: in Normal mode with a session open and no modal (or after the leader), =Ctrl-d= scrolls down half a page.
 ** DONE TUI: working indicator
 Running turns show an animated spinner in the sidebar and a trailing =working… 12s= line in the transcript (=Session.turn_started=); a pending permission shows =waiting for your permission=. A long silent turn no longer looks hung.
 ** DONE TUI: confirm destructive actions
