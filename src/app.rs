@@ -3,6 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -24,6 +25,8 @@ pub enum Mode {
     Model,
     /// Floating session list.
     Switcher,
+    /// Key-binding help overlay.
+    Help,
 }
 
 /// A destructive action waiting for the user to confirm it.
@@ -36,6 +39,14 @@ pub enum Confirm {
 /// A paste with more lines or characters than this is collapsed to a placeholder.
 const PASTE_COLLAPSE_LINES: usize = 3;
 const PASTE_COLLAPSE_CHARS: usize = 500;
+
+/// How long a transient status-bar notice stays visible before expiring.
+const NOTICE_TTL: Duration = Duration::from_secs(4);
+
+struct Notice {
+    text: String,
+    expires_at: Instant,
+}
 
 pub struct App {
     pub sessions: Vec<Session>,
@@ -72,8 +83,9 @@ pub struct App {
     pub mouse: bool,
     /// Action awaiting y/n; owns the keyboard while set.
     pub confirm: Option<Confirm>,
-    /// One-line notice shown in the status bar until the next key press.
-    pub message: Option<String>,
+    /// One-line notice shown in the status bar until its TTL expires or a newer
+    /// notice replaces it.
+    notice: Option<Notice>,
     cwd: PathBuf,
     worktrees_root: PathBuf,
     store: Store,
@@ -103,7 +115,7 @@ impl App {
             should_quit: false,
             mouse: true,
             confirm: None,
-            message: None,
+            notice: None,
             cwd,
             worktrees_root,
             store,
@@ -116,6 +128,33 @@ impl App {
         &self.cwd
     }
 
+    /// Show a transient notice in the status bar for `NOTICE_TTL`.
+    pub fn set_message(&mut self, msg: impl Into<String>) {
+        self.notice = Some(Notice {
+            text: msg.into(),
+            expires_at: Instant::now() + NOTICE_TTL,
+        });
+    }
+
+    /// Active status-bar notice, if one is set and has not expired yet.
+    pub fn message(&self) -> Option<&str> {
+        self.notice
+            .as_ref()
+            .filter(|n| Instant::now() < n.expires_at)
+            .map(|n| n.text.as_str())
+    }
+
+    /// Periodic housekeeping called from the event loop (expires old notices).
+    pub fn tick(&mut self) {
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|n| Instant::now() >= n.expires_at)
+        {
+            self.notice = None;
+        }
+    }
+
     pub fn current(&self) -> Option<&Session> {
         self.sessions.get(self.selected)
     }
@@ -126,7 +165,7 @@ impl App {
 
     pub fn handle_msg(&mut self, msg: Msg) {
         if let UiMsg::Closed(text) = msg.body {
-            self.message = Some(text);
+            self.set_message(text);
             return;
         }
         let settled = matches!(msg.body, UiMsg::TurnDone(_) | UiMsg::Error(_));
@@ -147,7 +186,7 @@ impl App {
             return;
         }
         if let Err(e) = self.store.save(&s.key, &s.record(&self.cwd)) {
-            self.message = Some(format!("could not save session: {e}"));
+            self.set_message(format!("could not save session: {e}"));
         }
     }
 
@@ -197,7 +236,7 @@ impl App {
             match Worktree::create(&self.cwd, &self.worktrees_root, spec.id) {
                 Ok(w) => Some(w),
                 Err(e) => {
-                    self.message = Some(format!(
+                    self.set_message(format!(
                         "no worktree ({e}); running in the current directory"
                     ));
                     None
@@ -236,7 +275,6 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
-        self.message = None;
         self.selection = None;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             match self.current_mut() {
@@ -285,6 +323,7 @@ impl App {
             Mode::Picker => self.handle_picker(key),
             Mode::Model => self.handle_model(key),
             Mode::Switcher => self.handle_switcher(key),
+            Mode::Help => self.handle_help(key),
         }
     }
 
@@ -299,7 +338,6 @@ impl App {
         {
             return;
         }
-        self.message = None;
         self.selection = None;
         // Terminals send \r or \r\n for line breaks; tabs would break the
         // cursor column maths, and other control chars can corrupt the screen.
@@ -330,10 +368,12 @@ impl App {
     }
 
     /// React to a mouse event on a terminal of `area`. Modals (picker,
-    /// permission, confirm) own the screen, so the mouse is ignored then.
+    /// permission, confirm, help) own the screen, so the mouse is ignored then.
     pub fn handle_mouse(&mut self, ev: MouseEvent, area: Rect) {
-        if matches!(self.mode, Mode::Picker | Mode::Model | Mode::Switcher)
-            || self.confirm.is_some()
+        if matches!(
+            self.mode,
+            Mode::Picker | Mode::Model | Mode::Switcher | Mode::Help
+        ) || self.confirm.is_some()
             || self.current().is_some_and(|s| s.pending.is_some())
         {
             return;
@@ -380,7 +420,7 @@ impl App {
                         let text = sel.extract(&self.transcript_text.borrow());
                         if !text.is_empty() {
                             self.pending_copy = Some(text);
-                            self.message = Some("copied selection".into());
+                            self.set_message("copied selection");
                         }
                     }
                 }
@@ -438,6 +478,10 @@ impl App {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if !ctrl && key.code == KeyCode::Char('?') && self.input.pending().is_empty() {
+            self.mode = Mode::Help;
+            return;
+        }
         let motion = match key.code {
             KeyCode::Char(c) if !ctrl => Some(c),
             KeyCode::Left => Some('h'),
@@ -478,16 +522,14 @@ impl App {
             KeyCode::Char('d') => self.request_close(),
             KeyCode::Char('M') => self.open_models(),
             KeyCode::Char('s') | KeyCode::Tab => self.open_switcher(),
+            KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('m') => {
                 self.mouse = !self.mouse;
-                self.message = Some(
-                    if self.mouse {
-                        "mouse on"
-                    } else {
-                        "mouse off: terminal text selection works"
-                    }
-                    .into(),
-                );
+                self.set_message(if self.mouse {
+                    "mouse on"
+                } else {
+                    "mouse off: terminal text selection works"
+                });
             }
             KeyCode::Char('j') => self.select(1),
             KeyCode::Char('k') => self.select(-1),
@@ -621,7 +663,7 @@ impl App {
             .iter()
             .find(|m| m.id.eq_ignore_ascii_case(want) || m.name.eq_ignore_ascii_case(want))
             .map(|m| m.id.clone());
-        self.message = Some(if s.models.available.is_empty() {
+        let msg = if s.models.available.is_empty() {
             format!("{} does not offer model selection", s.spec.name)
         } else if !s.can_prompt() {
             "change the model between turns".into()
@@ -631,20 +673,22 @@ impl App {
         } else {
             let names: Vec<_> = s.models.available.iter().map(|m| m.name.as_str()).collect();
             format!("unknown model `{want}`; try: {}", names.join(", "))
-        });
+        };
+        self.set_message(msg);
         true
     }
 
     fn open_models(&mut self) {
         let Some(s) = self.current() else { return };
         if s.models.available.is_empty() {
-            self.message = Some(if s.status == Status::Starting {
+            let msg = if s.status == Status::Starting {
                 "agent is still starting".into()
             } else {
                 format!("{} does not offer model selection", s.spec.name)
-            });
+            };
+            self.set_message(msg);
         } else if !s.can_prompt() {
-            self.message = Some("change the model between turns".into());
+            self.set_message("change the model between turns");
         } else {
             self.model_cursor = s
                 .model()
@@ -719,6 +763,15 @@ impl App {
                 self.selected = i;
                 self.scroll = 0;
             }
+            self.mode = Mode::Normal;
+        }
+    }
+
+    fn handle_help(&mut self, key: KeyEvent) {
+        if matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
+        ) {
             self.mode = Mode::Normal;
         }
     }
@@ -799,7 +852,7 @@ impl App {
         if self.sessions.is_empty() {
             self.mode = Mode::Normal;
         }
-        self.message = Some(format!("closing {}…", s.spec.name));
+        self.set_message(format!("closing {}…", s.spec.name));
         s.close(self.ui_tx.clone());
     }
 
@@ -1017,7 +1070,7 @@ mod tests {
             session: 7,
             body: UiMsg::Closed("done".into()),
         });
-        assert_eq!(app.message.as_deref(), Some("done"));
+        assert_eq!(app.message(), Some("done"));
     }
 
     #[test]
@@ -1156,7 +1209,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Char('M')));
         assert_eq!(app.mode, Mode::Normal);
-        assert!(app.message.is_some());
+        assert!(app.message().is_some());
 
         app.sessions[0].models = ModelState {
             current: Some("b".into()),
@@ -1210,7 +1263,7 @@ mod tests {
         assert!(app.sessions[0].entries.is_empty(), "not sent as a prompt");
 
         say(&mut app, "/model nope");
-        assert!(app.message.as_deref().unwrap().contains("Alpha, Beta"));
+        assert!(app.message().unwrap().contains("Alpha, Beta"));
         assert_eq!(app.sessions[0].status, Status::Idle);
 
         say(&mut app, "/model beta");
@@ -1447,5 +1500,72 @@ mod tests {
         assert_eq!(app.mode, Mode::Normal);
         app.handle_key(key(KeyCode::Char('i')));
         assert_eq!(app.mode, Mode::Picker);
+    }
+
+    #[test]
+    fn notices_persist_across_keys_until_ttl_expires() {
+        let (mut app, _) = app_with_session();
+        app.set_message("mouse off");
+        assert_eq!(app.message(), Some("mouse off"));
+
+        // Subsequent key presses and pastes must not clear an active notice.
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(key(KeyCode::Char('a')));
+        app.handle_paste("bc");
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.message(), Some("mouse off"));
+
+        // A newer notice replaces the current one.
+        app.set_message("copied selection");
+        assert_eq!(app.message(), Some("copied selection"));
+
+        // Once expired, message() returns None and tick() clears storage.
+        app.notice.as_mut().unwrap().expires_at = Instant::now();
+        assert_eq!(app.message(), None);
+        app.tick();
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
+    fn help_overlay_opens_and_closes() {
+        // Empty sessions: `?` directly opens help.
+        let (tx, _rx) = mpsc::channel();
+        let store = Store::new(tempfile::tempdir().unwrap().keep());
+        let mut empty = App::new(PathBuf::from("."), PathBuf::from("."), store, tx);
+        empty.handle_key(key(KeyCode::Char('?')));
+        assert_eq!(empty.mode, Mode::Help);
+        empty.handle_key(key(KeyCode::Esc));
+        assert_eq!(empty.mode, Mode::Normal);
+
+        // With an open session: `?` in normal mode opens help, `q` closes it.
+        let (mut app, _) = app_with_session();
+        app.handle_key(key(KeyCode::Char('?')));
+        assert_eq!(app.mode, Mode::Help);
+        app.handle_key(key(KeyCode::Char('q')));
+        assert_eq!(app.mode, Mode::Normal);
+
+        // Leader + `?` from normal mode opens help, `?` closes it.
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('?')));
+        assert_eq!(app.mode, Mode::Help);
+        app.handle_key(key(KeyCode::Char('?')));
+        assert_eq!(app.mode, Mode::Normal);
+
+        // Leader (Ctrl-A) + `?` from insert mode opens help.
+        app.handle_key(key(KeyCode::Char('i')));
+        assert_eq!(app.mode, Mode::Insert);
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('?')));
+        assert_eq!(app.mode, Mode::Help);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+
+        // Pending vim replace (`r?`) still edits the prompt instead of opening help.
+        app.input.set_text("a");
+        app.input.normal('0');
+        app.handle_key(key(KeyCode::Char('r')));
+        app.handle_key(key(KeyCode::Char('?')));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.input.text(), "?");
     }
 }

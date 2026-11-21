@@ -96,8 +96,8 @@ Show branch/label per session so parallel sessions of one agent are distinguisha
 =PermissionRequest= in =src/agent/acp.rs= now parses =toolCall.kind=, =rawInput= commands/paths, =locations= (with line numbers), =content= diffs (=PermissionDiff=), and fallback preview text. =App::handle_permission_key= adds =a= (prefer =allow_once=, else =allow*=) and =r= (prefer =reject_once=, else =reject*=, else cancel turn) alongside =1-9= and =Esc=. =render_permission= displays the kind badge, locations, =$ command= lines, colorized/capped diff previews, deduplicated human-readable option labels, =[a]=/=[r]= badges, and dynamic modal sizing.
 ** TODO TUI: picker shows install/login state
 Mark each agent installed / needs install / needs login.
-** TODO TUI: persistent notices and help overlay
-Keep transient messages visible a few seconds; =?= opens a key help overlay.
+** DONE TUI: persistent notices and help overlay
+Status-bar notices now carry a 4-second TTL (=Notice= with =App::set_message=, =App::message=, and =App::tick= called from the event loop) instead of being wiped on the next key press or paste, staying visible until expired or replaced. =?= in normal mode (with no pending vim operator) and =leader + ?= from normal or insert mode open a =Mode::Help= rounded modal listing vim prompt, leader command, and session/scroll keys (=Esc=, =q=, or =?= closes it); status bar hints include =? help= and show a =HELP= badge while open.
 ** TODO TUI: vim mode support
 Normal/Insert/Picker modes exist but the keys are ad hoc. Make it a real vim-style layer: motions and operators in the prompt (=h/l/w/b/0/$=, =x=, =dd=, =cw=, =u=), =a/A/I/o= to enter insert, =Ctrl-u/d= half-page in the transcript, =g=/=G=. Likely builds on the tui-textarea task; make it configurable (vim vs. plain) once config exists.
 ** TODO Parallel runs and cross-agent comparison
