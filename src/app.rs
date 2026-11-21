@@ -81,6 +81,8 @@ pub struct App {
     /// Whether the terminal reports mouse events (`m` toggles; off lets the
     /// terminal select text natively).
     pub mouse: bool,
+    /// Whether tool call diffs and text output are expanded in the transcript (`leader + t`).
+    pub show_tool_details: bool,
     /// Action awaiting y/n; owns the keyboard while set.
     pub confirm: Option<Confirm>,
     /// One-line notice shown in the status bar until its TTL expires or a newer
@@ -114,6 +116,7 @@ impl App {
             pending_copy: None,
             should_quit: false,
             mouse: true,
+            show_tool_details: true,
             confirm: None,
             notice: None,
             cwd,
@@ -523,6 +526,14 @@ impl App {
             KeyCode::Char('M') => self.open_models(),
             KeyCode::Char('s') | KeyCode::Tab => self.open_switcher(),
             KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('t') => {
+                self.show_tool_details = !self.show_tool_details;
+                self.set_message(if self.show_tool_details {
+                    "tool details expanded"
+                } else {
+                    "tool details collapsed"
+                });
+            }
             KeyCode::Char('m') => {
                 self.mouse = !self.mouse;
                 self.set_message(if self.mouse {
@@ -1281,6 +1292,24 @@ mod tests {
         app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Char('m')));
         assert!(!app.mouse);
+    }
+
+    #[test]
+    fn leader_t_toggles_tool_details() {
+        let (mut app, _) = app_with_session();
+        assert!(app.show_tool_details);
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('t')));
+        assert!(!app.show_tool_details);
+        assert_eq!(app.message(), Some("tool details collapsed"));
+
+        // Also works from insert mode via Ctrl-A.
+        app.mode = Mode::Insert;
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('t')));
+        assert!(app.show_tool_details);
+        assert_eq!(app.message(), Some("tool details expanded"));
+        assert_eq!(app.mode, Mode::Insert);
     }
 
     #[test]

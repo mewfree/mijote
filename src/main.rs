@@ -115,6 +115,7 @@ fn ask(id: &str, prompt: &str) -> Result<()> {
             Event::ToolUpdate {
                 id,
                 status: Some(s),
+                ..
             } => eprintln!("[tool {id}] {s}"),
             _ => {}
         },

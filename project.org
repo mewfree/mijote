@@ -66,8 +66,8 @@ Unit-tested; not driven in a real terminal yet. Click does not place the cursor.
 Bracketed paste is enabled in =main.rs=; =App::handle_paste= inserts the text at the cursor in insert mode (ignored elsewhere), so pasted newlines no longer submit the prompt. CRLF/CR become =\n=, tabs four spaces, other control chars are dropped. Pastes over 3 lines or 500 chars show as =[Pasted text #1 +12 lines]= and are expanded when the prompt is sent (an edited or deleted placeholder is left as typed). Not covered: image paste, pasted file paths, Normal-mode paste. Unit-tested; not driven in a real terminal.
 ** DONE TUI: markdown rendering
 Agent messages render through =ui/markdown.rs= (pulldown-cmark): headings, bold/italic/strikethrough, inline and fenced code, bullet/numbered/task lists, block quotes, rules, links (destination shown after the text). Wrapped to the transcript width with hanging indents. Tables and syntax highlighting are not handled; tables show as plain text.
-** TODO TUI: tool call detail
-Expand tool call content and diffs (=tool_call_update.content=).
+** DONE TUI: tool call detail
+=ToolContent= in =src/agent/acp.rs= parses text, terminal output, and diff blocks from ACP =tool_call= and =tool_call_update= (=content= and optional =title=). =Entry::Tool= in =src/session.rs= stores =detail= with =#[serde(default)]= so older session records stay readable, and =tool_call_update= replaces =detail= when non-empty while preserving it across status-only updates. =src/ui/mod.rs= renders tool diffs (path header, compact line diff in red/green/dim, capped at 16 lines) and text output (dim =│= gutter, capped at 10 lines) beneath tool rows with =▾=/=▸= indicators; =leader + t= in =src/app.rs= toggles =show_tool_details= (expanded by default).
 ** TODO TUI: rename sessions, show worktree state
 =d= closes (done); still want rename, and live dirty/ahead counts per session in the sidebar.
 ** DONE TUI: mouse mode

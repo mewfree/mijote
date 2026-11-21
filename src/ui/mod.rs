@@ -10,6 +10,7 @@ use ratatui::Frame;
 
 mod markdown;
 
+use crate::agent::acp::ToolContent;
 use crate::app::{App, Confirm, Mode};
 use crate::session::{Entry, Session, Status};
 
@@ -27,6 +28,8 @@ const DIM: Style = Style::new().fg(Color::DarkGray);
 const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 
 const MAX_INPUT_ROWS: u16 = 6;
+const MAX_TOOL_DIFF_LINES: usize = 16;
+const MAX_TOOL_TEXT_LINES: usize = 10;
 
 /// Screen areas: header, transcript, prompt box, status bar. Shared by
 /// rendering and mouse hit-testing so they cannot drift apart.
@@ -255,9 +258,146 @@ fn tool_glyph(s: &Session, status: &str) -> (&'static str, Color) {
     }
 }
 
+enum DiffLine<'a> {
+    Context(&'a str),
+    Removed(&'a str),
+    Added(&'a str),
+}
+
+/// Compute a compact line diff between optional `old` and `new`, keeping up to
+/// a couple of unchanged context lines around the changed span so large-file
+/// edits always show the actual changes before hitting the display cap.
+fn diff_lines<'a>(old: Option<&'a str>, new: &'a str) -> Vec<DiffLine<'a>> {
+    const CONTEXT: usize = 2;
+    const MAX_LCS_CELLS: usize = 20_000;
+
+    let new_lines: Vec<&str> = new.lines().collect();
+    let Some(old) = old.filter(|s| !s.is_empty()) else {
+        return new_lines.into_iter().map(DiffLine::Added).collect();
+    };
+    let old_lines: Vec<&str> = old.lines().collect();
+
+    let prefix = old_lines
+        .iter()
+        .zip(new_lines.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let old_rem = &old_lines[prefix..];
+    let new_rem = &new_lines[prefix..];
+    let suffix = old_rem
+        .iter()
+        .rev()
+        .zip(new_rem.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let old_mid = &old_rem[..old_rem.len() - suffix];
+    let new_mid = &new_rem[..new_rem.len() - suffix];
+
+    if old_mid.is_empty() && new_mid.is_empty() {
+        return old_lines.into_iter().map(DiffLine::Context).collect();
+    }
+
+    let mut out = Vec::new();
+    let ctx_start = prefix.saturating_sub(CONTEXT);
+    for &l in &old_lines[ctx_start..prefix] {
+        out.push(DiffLine::Context(l));
+    }
+
+    let m = old_mid.len();
+    let n = new_mid.len();
+    if m.saturating_mul(n) <= MAX_LCS_CELLS {
+        // Bottom-up LCS table so a forward walk emits removals before additions.
+        let cols = n + 1;
+        let mut dp = vec![0usize; (m + 1) * cols];
+        for i in (0..m).rev() {
+            for j in (0..n).rev() {
+                dp[i * cols + j] = if old_mid[i] == new_mid[j] {
+                    dp[(i + 1) * cols + (j + 1)] + 1
+                } else {
+                    dp[(i + 1) * cols + j].max(dp[i * cols + (j + 1)])
+                };
+            }
+        }
+        let (mut i, mut j) = (0, 0);
+        while i < m || j < n {
+            if i < m && j < n && old_mid[i] == new_mid[j] {
+                out.push(DiffLine::Context(old_mid[i]));
+                i += 1;
+                j += 1;
+            } else if i < m && (j == n || dp[(i + 1) * cols + j] >= dp[i * cols + (j + 1)]) {
+                out.push(DiffLine::Removed(old_mid[i]));
+                i += 1;
+            } else {
+                out.push(DiffLine::Added(new_mid[j]));
+                j += 1;
+            }
+        }
+    } else {
+        out.extend(old_mid.iter().copied().map(DiffLine::Removed));
+        out.extend(new_mid.iter().copied().map(DiffLine::Added));
+    }
+
+    let suffix_start = old_lines.len() - suffix;
+    let ctx_end = (suffix_start + CONTEXT).min(old_lines.len());
+    for &l in &old_lines[suffix_start..ctx_end] {
+        out.push(DiffLine::Context(l));
+    }
+    out
+}
+
+fn render_tool_detail(detail: &[ToolContent], width: usize, out: &mut Vec<Line<'static>>) {
+    let body = width.saturating_sub(6).max(1);
+    for item in detail {
+        match item {
+            ToolContent::Diff {
+                path,
+                old_text,
+                new_text,
+            } => {
+                if !path.is_empty() {
+                    out.push(Line::styled(format!("    ┄ {}", fit(path, body)), DIM));
+                }
+                let mut rendered: Vec<Line<'static>> = Vec::new();
+                for dl in diff_lines(old_text.as_deref(), new_text) {
+                    let (first_gutter, style, text) = match dl {
+                        DiffLine::Removed(s) => ("    - ", Style::new().fg(ERR), s),
+                        DiffLine::Added(s) => ("    + ", Style::new().fg(OK), s),
+                        DiffLine::Context(s) => ("      ", DIM, s),
+                    };
+                    for (idx, chunk) in wrap_code(text, body).into_iter().enumerate() {
+                        let gutter = if idx == 0 { first_gutter } else { "      " };
+                        rendered.push(Line::styled(format!("{gutter}{chunk}"), style));
+                    }
+                }
+                let total = rendered.len();
+                out.extend(rendered.into_iter().take(MAX_TOOL_DIFF_LINES));
+                if total > MAX_TOOL_DIFF_LINES {
+                    let more = total - MAX_TOOL_DIFF_LINES;
+                    out.push(Line::styled(format!("    … (+{more} more lines)"), DIM));
+                }
+            }
+            ToolContent::Text(t) => {
+                let wrapped = wrap(t, body);
+                let total = wrapped.len();
+                for l in wrapped.into_iter().take(MAX_TOOL_TEXT_LINES) {
+                    out.push(Line::from(vec![
+                        Span::styled("    │ ", DIM),
+                        Span::styled(l, Style::new().fg(CODE_FG)),
+                    ]));
+                }
+                if total > MAX_TOOL_TEXT_LINES {
+                    let more = total - MAX_TOOL_TEXT_LINES;
+                    out.push(Line::styled(format!("    … (+{more} more lines)"), DIM));
+                }
+            }
+        }
+    }
+}
+
 /// Transcript body for one session, already wrapped to `width` columns, so
 /// scrolling is exact and every wrapped line keeps its gutter.
-fn transcript_lines(s: &Session, width: usize) -> Vec<Line<'static>> {
+fn transcript_lines(s: &Session, width: usize, show_tool_details: bool) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let body = width.saturating_sub(4).max(1);
     let prose = |t: &str, gutter: &'static str, gutter_style: Style, style: Style| {
@@ -289,10 +429,18 @@ fn transcript_lines(s: &Session, width: usize) -> Vec<Line<'static>> {
                 title,
                 kind,
                 status,
+                detail,
                 ..
             } => {
                 let (g, c) = tool_glyph(s, status);
-                let kind_txt = format!("  {kind}");
+                let toggle = if detail.is_empty() {
+                    ""
+                } else if show_tool_details {
+                    " ▾"
+                } else {
+                    " ▸"
+                };
+                let kind_txt = format!("  {kind}{toggle}");
                 let room = width.saturating_sub(4 + kind_txt.chars().count());
                 out.push(Line::from(vec![
                     Span::raw("  "),
@@ -300,6 +448,9 @@ fn transcript_lines(s: &Session, width: usize) -> Vec<Line<'static>> {
                     Span::raw(fit(title, room)),
                     Span::styled(kind_txt, DIM),
                 ]));
+                if show_tool_details && !detail.is_empty() {
+                    render_tool_detail(detail, width, &mut out);
+                }
             }
             Entry::Notice(t) => {
                 out.extend(prose(t, "  ▎ ", Style::new().fg(ERR), Style::new().fg(ERR)))
@@ -405,7 +556,7 @@ fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let mut lines = transcript_lines(s, inner.width as usize);
+    let mut lines = transcript_lines(s, inner.width as usize, app.show_tool_details);
     lines.extend(activity_line(s));
     let total = lines.len() as u16;
     let max_scroll = total.saturating_sub(inner.height);
@@ -551,6 +702,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             ("d", "close"),
             ("M", "model"),
             ("s", "sessions"),
+            ("t", "tools"),
             ("j/k", "select"),
             ("g/G", "top/bottom"),
             ("m", "mouse"),
@@ -821,8 +973,8 @@ fn render_help(f: &mut Frame) {
         pair("n", "new worktree", "N", "new here"),
         pair("s / Tab", "switcher", "j / k", "next / prev"),
         pair("d", "close session", "M", "model (/model)"),
-        pair("g / G", "top / bottom", "m", "toggle mouse"),
-        pair("?", "help", "q", "quit"),
+        pair("g / G", "top / bottom", "t", "tool details"),
+        pair("m", "toggle mouse", "? / q", "help / quit"),
         Line::from(""),
         heading("session & scroll"),
         row("PgUp / PgDn", "scroll transcript (or mouse wheel)"),
@@ -869,47 +1021,6 @@ fn permission_kind_label(kind: &str) -> Option<&str> {
         "" => None,
         other => Some(other),
     }
-}
-
-enum DiffLine<'a> {
-    Context(&'a str),
-    Removed(&'a str),
-    Added(&'a str),
-}
-
-fn diff_lines<'a>(old: Option<&'a str>, new: &'a str) -> Vec<DiffLine<'a>> {
-    let new_lines: Vec<&str> = new.lines().collect();
-    let Some(old_str) = old.filter(|s| !s.is_empty()) else {
-        return new_lines.into_iter().map(DiffLine::Added).collect();
-    };
-    let old_lines: Vec<&str> = old_str.lines().collect();
-    let prefix = old_lines
-        .iter()
-        .zip(new_lines.iter())
-        .take_while(|(a, b)| a == b)
-        .count();
-    let old_rem = &old_lines[prefix..];
-    let new_rem = &new_lines[prefix..];
-    let suffix = old_rem
-        .iter()
-        .rev()
-        .zip(new_rem.iter().rev())
-        .take_while(|(a, b)| a == b)
-        .count();
-    let mut out = Vec::new();
-    if prefix > 0 && (prefix < old_lines.len() || prefix < new_lines.len()) {
-        out.push(DiffLine::Context(old_lines[prefix - 1]));
-    }
-    for &l in &old_rem[..old_rem.len() - suffix] {
-        out.push(DiffLine::Removed(l));
-    }
-    for &l in &new_rem[..new_rem.len() - suffix] {
-        out.push(DiffLine::Added(l));
-    }
-    if suffix > 0 {
-        out.push(DiffLine::Context(old_rem[old_rem.len() - suffix]));
-    }
-    out
 }
 
 fn render_permission(f: &mut Frame, s: &Session) {
@@ -1328,5 +1439,145 @@ mod tests {
             .any(|c| c.symbol() == "+" && c.fg == OK);
         assert!(has_red_minus, "expected red '-' in diff:\n{screen}");
         assert!(has_green_plus, "expected green '+' in diff:\n{screen}");
+    }
+
+    #[test]
+    fn tool_call_detail_renders_expanded_and_collapsed() {
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.status = Status::Idle;
+        s.entries.push(Entry::Tool {
+            id: "t0".into(),
+            title: "Read Cargo.toml".into(),
+            kind: "read".into(),
+            status: "completed".into(),
+            detail: vec![],
+        });
+        s.entries.push(Entry::Tool {
+            id: "t1".into(),
+            title: "Edit src/main.rs".into(),
+            kind: "edit".into(),
+            status: "completed".into(),
+            detail: vec![ToolContent::Diff {
+                path: "src/main.rs".into(),
+                old_text: Some("fn main() {\n    old();\n}".into()),
+                new_text: "fn main() {\n    new();\n}".into(),
+            }],
+        });
+        s.entries.push(Entry::Tool {
+            id: "t2".into(),
+            title: "Run tests".into(),
+            kind: "execute".into(),
+            status: "completed".into(),
+            detail: vec![ToolContent::Text("test ok\npassed".into())],
+        });
+
+        let to_text = |lines: &[Line<'static>]| -> Vec<String> {
+            lines
+                .iter()
+                .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+                .collect()
+        };
+
+        let expanded = transcript_lines(&s, 80, true);
+        let exp_text = to_text(&expanded);
+        assert!(exp_text[0].contains("Read Cargo.toml") && !exp_text[0].contains('▾'));
+        assert!(exp_text.iter().any(|l| l.contains("edit ▾")));
+        assert!(exp_text.iter().any(|l| l == "    ┄ src/main.rs"));
+        assert!(exp_text.iter().any(|l| l == "      fn main() {"));
+        assert!(exp_text.iter().any(|l| l == "    -     old();"));
+        assert!(exp_text.iter().any(|l| l == "    +     new();"));
+        assert!(exp_text.iter().any(|l| l == "      }"));
+        assert!(exp_text.iter().any(|l| l.contains("execute ▾")));
+        assert!(exp_text.iter().any(|l| l == "    │ test ok"));
+        assert!(exp_text.iter().any(|l| l == "    │ passed"));
+
+        // Verify red/green styles on diff lines.
+        let removed = expanded
+            .iter()
+            .find(|l| l.spans.iter().any(|sp| sp.content.contains("-     old();")))
+            .unwrap();
+        assert_eq!(removed.style.fg, Some(ERR));
+        let added = expanded
+            .iter()
+            .find(|l| l.spans.iter().any(|sp| sp.content.contains("+     new();")))
+            .unwrap();
+        assert_eq!(added.style.fg, Some(OK));
+
+        let collapsed = transcript_lines(&s, 80, false);
+        let col_text = to_text(&collapsed);
+        assert!(col_text.iter().any(|l| l.contains("edit ▸")));
+        assert!(col_text.iter().any(|l| l.contains("execute ▸")));
+        assert!(!col_text.iter().any(|l| l.contains("┄ src/main.rs")));
+        assert!(!col_text.iter().any(|l| l.contains("    - ")));
+        assert!(!col_text.iter().any(|l| l.contains("    │ ")));
+    }
+
+    #[test]
+    fn tool_call_detail_caps_large_diffs_and_text() {
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.status = Status::Idle;
+        let many_added: String = (1..=25)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let many_text: String = (1..=15)
+            .map(|i| format!("out {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        s.entries.push(Entry::Tool {
+            id: "t1".into(),
+            title: "Create big.rs".into(),
+            kind: "edit".into(),
+            status: "completed".into(),
+            detail: vec![ToolContent::Diff {
+                path: "big.rs".into(),
+                old_text: None,
+                new_text: many_added,
+            }],
+        });
+        s.entries.push(Entry::Tool {
+            id: "t2".into(),
+            title: "Verbose output".into(),
+            kind: "execute".into(),
+            status: "completed".into(),
+            detail: vec![ToolContent::Text(many_text)],
+        });
+
+        let lines: Vec<String> = transcript_lines(&s, 80, true)
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+            .collect();
+        assert!(lines.iter().any(|l| l == "    … (+9 more lines)"));
+        assert!(lines.iter().any(|l| l == "    … (+5 more lines)"));
+        assert!(!lines.iter().any(|l| l.contains("line 25")));
+        assert!(!lines.iter().any(|l| l.contains("out 15")));
+    }
+
+    #[test]
+    fn large_file_diff_shows_changed_hunk_instead_of_file_top() {
+        let mut old: Vec<String> = (1..=40).map(|i| format!("keep {i}")).collect();
+        let mut new = old.clone();
+        old[25] = "before".into();
+        new[25] = "after".into();
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.status = Status::Idle;
+        s.entries.push(Entry::Tool {
+            id: "t1".into(),
+            title: "Edit large.rs".into(),
+            kind: "edit".into(),
+            status: "completed".into(),
+            detail: vec![ToolContent::Diff {
+                path: "large.rs".into(),
+                old_text: Some(old.join("\n")),
+                new_text: new.join("\n"),
+            }],
+        });
+        let lines: Vec<String> = transcript_lines(&s, 80, true)
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+            .collect();
+        assert!(lines.iter().any(|l| l == "    - before"));
+        assert!(lines.iter().any(|l| l == "    + after"));
+        assert!(!lines.iter().any(|l| l == "      keep 1"));
     }
 }

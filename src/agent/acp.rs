@@ -13,6 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -31,6 +32,17 @@ pub enum AcpError {
     Protocol(String),
 }
 
+/// Content block attached to a `tool_call` or `tool_call_update`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolContent {
+    Text(String),
+    Diff {
+        path: String,
+        old_text: Option<String>,
+        new_text: String,
+    },
+}
+
 /// Something the agent told us during a prompt turn.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -41,10 +53,13 @@ pub enum Event {
         title: String,
         kind: String,
         status: String,
+        content: Vec<ToolContent>,
     },
     ToolUpdate {
         id: String,
+        title: Option<String>,
         status: Option<String>,
+        content: Vec<ToolContent>,
     },
     Plan(Vec<String>),
     /// The agent switched models (e.g. `/model` inside Claude Code).
@@ -460,6 +475,58 @@ fn str_of(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
+fn parse_tool_content(v: Option<&Value>) -> Vec<ToolContent> {
+    let Some(items) = v.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        match item.get("type").and_then(Value::as_str).unwrap_or("") {
+            "content" => {
+                if let Some(inner) = item.get("content") {
+                    if inner.get("type").and_then(Value::as_str) == Some("text") {
+                        if let Some(text) = inner.get("text").and_then(Value::as_str) {
+                            if !text.is_empty() {
+                                out.push(ToolContent::Text(text.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+            "text" => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        out.push(ToolContent::Text(text.to_string()));
+                    }
+                }
+            }
+            "terminal" => {
+                if let Some(text) = item
+                    .get("output")
+                    .or_else(|| item.get("text"))
+                    .and_then(Value::as_str)
+                {
+                    if !text.is_empty() {
+                        out.push(ToolContent::Text(text.to_string()));
+                    }
+                }
+            }
+            "diff" => {
+                out.push(ToolContent::Diff {
+                    path: str_of(item, "path"),
+                    old_text: item
+                        .get("oldText")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    new_text: str_of(item, "newText"),
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn parse_update(u: &Value) -> Event {
     let kind = str_of(u, "sessionUpdate");
     let text = || {
@@ -484,10 +551,13 @@ fn parse_update(u: &Value) -> Event {
                 .and_then(Value::as_str)
                 .unwrap_or("pending")
                 .to_string(),
+            content: parse_tool_content(u.get("content")),
         },
         "tool_call_update" => Event::ToolUpdate {
             id: str_of(u, "toolCallId"),
+            title: u.get("title").and_then(Value::as_str).map(str::to_string),
             status: u.get("status").and_then(Value::as_str).map(str::to_string),
+            content: parse_tool_content(u.get("content")),
         },
         "plan" => Event::Plan(
             u.get("entries")
@@ -772,6 +842,83 @@ case "$l" in *'"modelId":"b"'*) echo '{"jsonrpc":"2.0","id":2,"result":{}}';; *)
     fn model_update_notification_is_parsed() {
         let u = json!({"sessionUpdate": "current_model_update", "currentModelId": "b"});
         assert_eq!(parse_update(&u), Event::ModelChanged("b".into()));
+    }
+
+    #[test]
+    fn tool_call_and_update_parse_text_and_diff_content() {
+        let call = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "c1",
+            "title": "Edit main.rs",
+            "kind": "edit",
+            "status": "in_progress",
+            "content": [
+                {"type": "content", "content": {"type": "text", "text": "updating file"}},
+                {"type": "diff", "path": "src/main.rs", "oldText": "let x = 1;", "newText": "let x = 2;"}
+            ]
+        });
+        assert_eq!(
+            parse_update(&call),
+            Event::ToolCall {
+                id: "c1".into(),
+                title: "Edit main.rs".into(),
+                kind: "edit".into(),
+                status: "in_progress".into(),
+                content: vec![
+                    ToolContent::Text("updating file".into()),
+                    ToolContent::Diff {
+                        path: "src/main.rs".into(),
+                        old_text: Some("let x = 1;".into()),
+                        new_text: "let x = 2;".into(),
+                    },
+                ],
+            }
+        );
+
+        let update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "c1",
+            "title": "Edited src/main.rs",
+            "status": "completed",
+            "content": [
+                {"type": "text", "text": "done"},
+                {"type": "terminal", "terminalId": "t1", "output": "ok\n"},
+                {"type": "diff", "path": "new.rs", "oldText": null, "newText": "fn f() {}"}
+            ]
+        });
+        assert_eq!(
+            parse_update(&update),
+            Event::ToolUpdate {
+                id: "c1".into(),
+                title: Some("Edited src/main.rs".into()),
+                status: Some("completed".into()),
+                content: vec![
+                    ToolContent::Text("done".into()),
+                    ToolContent::Text("ok\n".into()),
+                    ToolContent::Diff {
+                        path: "new.rs".into(),
+                        old_text: None,
+                        new_text: "fn f() {}".into(),
+                    },
+                ],
+            }
+        );
+
+        // Missing or empty content blocks produce an empty Vec.
+        let minimal = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "c1",
+            "status": "failed"
+        });
+        assert_eq!(
+            parse_update(&minimal),
+            Event::ToolUpdate {
+                id: "c1".into(),
+                title: None,
+                status: Some("failed".into()),
+                content: vec![],
+            }
+        );
     }
 
     #[test]
