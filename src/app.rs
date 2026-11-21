@@ -29,6 +29,8 @@ pub enum Mode {
     Help,
     /// Renaming a session's label.
     Rename,
+    /// Searching the current session's transcript.
+    Search,
 }
 
 /// A destructive action waiting for the user to confirm it.
@@ -79,6 +81,15 @@ pub struct App {
     /// Largest useful `scroll`, reported by the last render so scrolling
     /// stops at the top instead of piling up invisible overscroll.
     pub max_scroll: Cell<u16>,
+    /// Last rendered transcript viewport height, used for half-page scrolling
+    /// and centering search matches.
+    pub transcript_height: Cell<u16>,
+    /// Active transcript search query (case-insensitive substring).
+    pub search_query: String,
+    /// Line indices in `transcript_text` matching `search_query`.
+    pub search_matches: Vec<usize>,
+    /// Index into `search_matches` of the currently focused match.
+    pub search_current: Option<usize>,
     /// Mouse selection over the transcript, in content coordinates.
     pub selection: Option<Selection>,
     /// Plain text of the transcript lines from the last render, for copying.
@@ -124,6 +135,10 @@ impl App {
             rename_return: Mode::Normal,
             scroll: 0,
             max_scroll: Cell::new(u16::MAX),
+            transcript_height: Cell::new(20),
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_current: None,
             selection: None,
             transcript_text: RefCell::new(Vec::new()),
             pending_copy: None,
@@ -287,6 +302,7 @@ impl App {
         ));
         self.selected = self.sessions.len() - 1;
         self.scroll = 0;
+        self.clear_search();
         self.mode = Mode::Insert;
     }
 
@@ -308,7 +324,8 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         self.selection = None;
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('c') {
             match self.current_mut() {
                 Some(s) if matches!(s.status, Status::Running | Status::AwaitingPermission) => {
                     s.cancel()
@@ -317,9 +334,16 @@ impl App {
             }
             return;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
-            self.should_quit = true;
-            return;
+        let modal_open =
+            self.confirm.is_some() || self.current().is_some_and(|s| s.pending.is_some());
+        if ctrl && key.code == KeyCode::Char('d') {
+            let scroll_ctx = !modal_open
+                && !self.sessions.is_empty()
+                && (self.leader || self.mode == Mode::Normal);
+            if !scroll_ctx {
+                self.should_quit = true;
+                return;
+            }
         }
         // A pending permission request owns the keyboard.
         if self.current().is_some_and(|s| s.pending.is_some()) {
@@ -335,7 +359,6 @@ impl App {
             }
             return;
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if self.leader {
             self.leader = false;
             self.handle_command(key);
@@ -357,6 +380,7 @@ impl App {
             Mode::Switcher => self.handle_switcher(key),
             Mode::Help => self.handle_help(key),
             Mode::Rename => self.handle_rename(key),
+            Mode::Search => self.handle_search(key),
         }
     }
 
@@ -511,9 +535,43 @@ impl App {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if !ctrl && key.code == KeyCode::Char('?') && self.input.pending().is_empty() {
-            self.mode = Mode::Help;
-            return;
+        if ctrl {
+            match key.code {
+                KeyCode::Char('u') => {
+                    self.scroll_up(self.half_page());
+                    return;
+                }
+                KeyCode::Char('d') => {
+                    self.scroll = self.scroll.saturating_sub(self.half_page());
+                    return;
+                }
+                KeyCode::Char('r') => {
+                    self.input.redo();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if !ctrl && self.input.pending().is_empty() {
+            match key.code {
+                KeyCode::Char('?') => {
+                    self.mode = Mode::Help;
+                    return;
+                }
+                KeyCode::Char('/') => {
+                    self.open_search();
+                    return;
+                }
+                KeyCode::Char('n') if !self.search_query.is_empty() => {
+                    self.search_step(true);
+                    return;
+                }
+                KeyCode::Char('N') if !self.search_query.is_empty() => {
+                    self.search_step(false);
+                    return;
+                }
+                _ => {}
+            }
         }
         let motion = match key.code {
             KeyCode::Char(c) if !ctrl => Some(c),
@@ -532,8 +590,13 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Esc => self.input.cancel_pending(),
-            KeyCode::Char('r') if ctrl => self.input.redo(),
+            KeyCode::Esc => {
+                if !self.input.pending().is_empty() {
+                    self.input.cancel_pending();
+                } else if !self.search_query.is_empty() {
+                    self.clear_search();
+                }
+            }
             KeyCode::Enter => {
                 self.input.checkpoint();
                 self.mode = Mode::Insert;
@@ -548,7 +611,13 @@ impl App {
     /// App-level commands: the key after the leader, or any key in normal mode
     /// when there is no session.
     fn handle_command(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
+            KeyCode::Char('u') if ctrl => self.scroll_up(self.half_page()),
+            KeyCode::Char('d') if ctrl => {
+                self.scroll = self.scroll.saturating_sub(self.half_page());
+            }
+            KeyCode::Char('/') if !self.sessions.is_empty() => self.open_search(),
             KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('n') => self.open_picker(true),
             KeyCode::Char('N') => self.open_picker(false),
@@ -595,8 +664,140 @@ impl App {
         }
     }
 
+    fn half_page(&self) -> u16 {
+        (self.transcript_height.get() / 2).max(1)
+    }
+
     fn scroll_up(&mut self, n: u16) {
         self.scroll = self.scroll.saturating_add(n).min(self.max_scroll.get());
+    }
+
+    fn open_search(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        self.clear_search();
+        self.mode = Mode::Search;
+    }
+
+    fn clear_search(&mut self) {
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_current = None;
+    }
+
+    fn handle_search(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.clear_search();
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Enter => {
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Backspace => {
+                self.search_query.pop();
+                self.update_search();
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.search_query.clear();
+                self.update_search();
+            }
+            KeyCode::Char(c) if !ctrl => {
+                self.search_query.push(c);
+                self.update_search();
+            }
+            _ => {}
+        }
+    }
+
+    fn update_search(&mut self) {
+        if self.search_query.is_empty() {
+            self.search_matches.clear();
+            self.search_current = None;
+            return;
+        }
+        let needle = self.search_query.to_lowercase();
+        self.search_matches = self
+            .transcript_text
+            .borrow()
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect();
+        if self.search_matches.is_empty() {
+            self.search_current = None;
+        } else {
+            self.search_current = Some(0);
+            self.scroll_to_current_match();
+        }
+    }
+
+    fn search_step(&mut self, forward: bool) {
+        if self.search_query.is_empty() {
+            return;
+        }
+        let needle = self.search_query.to_lowercase();
+        let fresh: Vec<usize> = self
+            .transcript_text
+            .borrow()
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect();
+        if fresh.is_empty() {
+            self.search_matches.clear();
+            self.search_current = None;
+            return;
+        }
+        let next = if fresh == self.search_matches {
+            let n = fresh.len();
+            match self.search_current {
+                Some(i) if forward => (i + 1) % n,
+                Some(i) => (i + n - 1) % n,
+                None if forward => 0,
+                None => n - 1,
+            }
+        } else {
+            let prev_line = self
+                .search_current
+                .and_then(|i| self.search_matches.get(i).copied());
+            self.search_matches = fresh;
+            match prev_line {
+                Some(line) if forward => self
+                    .search_matches
+                    .iter()
+                    .position(|&l| l > line)
+                    .unwrap_or(0),
+                Some(line) => self
+                    .search_matches
+                    .iter()
+                    .rposition(|&l| l < line)
+                    .unwrap_or(self.search_matches.len() - 1),
+                None if forward => 0,
+                None => self.search_matches.len() - 1,
+            }
+        };
+        self.search_current = Some(next);
+        self.scroll_to_current_match();
+    }
+
+    fn scroll_to_current_match(&mut self) {
+        let Some(line) = self
+            .search_current
+            .and_then(|i| self.search_matches.get(i).copied())
+        else {
+            return;
+        };
+        let total = self.transcript_text.borrow().len();
+        let height = self.transcript_height.get().max(1) as usize;
+        let max_scroll = total.saturating_sub(height);
+        let target_top = line.saturating_sub(height / 2).min(max_scroll);
+        let target_scroll = max_scroll.saturating_sub(target_top);
+        self.scroll = u16::try_from(target_scroll).unwrap_or(u16::MAX);
     }
 
     /// Quit now, or ask first when an agent is mid-turn.
@@ -810,6 +1011,7 @@ impl App {
             if i != self.selected {
                 self.selected = i;
                 self.scroll = 0;
+                self.clear_search();
             }
             self.sessions[i].attention = false;
             if self.sessions[i].worktree.is_some() {
@@ -949,6 +1151,7 @@ impl App {
             cur.attention = false;
         }
         self.scroll = 0;
+        self.clear_search();
         if self.sessions.is_empty() {
             self.mode = Mode::Normal;
         }
@@ -961,10 +1164,15 @@ impl App {
         if n == 0 {
             return;
         }
-        self.selected = (self.selected as isize + delta).rem_euclid(n as isize) as usize;
+        let next = (self.selected as isize + delta).rem_euclid(n as isize) as usize;
+        let changed = next != self.selected;
+        self.selected = next;
         self.sessions[self.selected].attention = false;
         if self.sessions[self.selected].worktree.is_some() {
             self.sessions[self.selected].refresh_worktree_state();
+        }
+        if changed {
+            self.clear_search();
         }
         self.scroll = 0;
     }
@@ -1484,6 +1692,185 @@ mod tests {
         app.mode = Mode::Insert;
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_u_and_ctrl_d_scroll_half_page_in_normal_mode() {
+        let (mut app, _) = app_with_session();
+        app.max_scroll.set(30);
+        // Default transcript_height is 20 -> half-page step is 10.
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        app.handle_key(ctrl('u'));
+        assert_eq!(app.scroll, 10);
+        assert!(!app.should_quit);
+        app.handle_key(ctrl('u'));
+        assert_eq!(app.scroll, 20);
+        app.handle_key(ctrl('d'));
+        assert_eq!(app.scroll, 10);
+        assert!(!app.should_quit);
+        app.handle_key(ctrl('d'));
+        assert_eq!(app.scroll, 0);
+        assert!(!app.should_quit);
+
+        // Custom viewport height scales the step and floors at 1.
+        app.transcript_height.set(12);
+        app.handle_key(ctrl('u'));
+        assert_eq!(app.scroll, 6);
+        app.transcript_height.set(1);
+        app.handle_key(ctrl('u'));
+        assert_eq!(app.scroll, 7);
+
+        // Leader + Ctrl-u / Ctrl-d also scroll half-page from Insert mode.
+        app.transcript_height.set(10);
+        app.mode = Mode::Insert;
+        app.handle_key(ctrl('a'));
+        app.handle_key(ctrl('u'));
+        assert_eq!(app.scroll, 12);
+        assert_eq!(app.mode, Mode::Insert);
+        app.handle_key(ctrl('a'));
+        app.handle_key(ctrl('d'));
+        assert_eq!(app.scroll, 7);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_d_quits_when_not_scrolling_transcript() {
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        // No sessions open.
+        let (tx, _rx) = mpsc::channel();
+        let store = Store::new(tempfile::tempdir().unwrap().keep());
+        let mut empty = App::new(PathBuf::from("."), PathBuf::from("."), store, tx);
+        empty.handle_key(ctrl_d);
+        assert!(empty.should_quit);
+
+        // Confirm modal open.
+        let (mut app, _) = app_with_session();
+        app.confirm = Some(Confirm::Quit);
+        app.handle_key(ctrl_d);
+        assert!(app.should_quit);
+
+        // Permission modal open.
+        let (mut app, _) = app_with_session();
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::Permission(PermissionRequest {
+                tool_call_id: "c".into(),
+                title: Some("run".into()),
+                options: vec![],
+                ..Default::default()
+            }),
+        });
+        app.handle_key(ctrl_d);
+        assert!(app.should_quit);
+
+        // Search mode.
+        let (mut app, _) = app_with_session();
+        app.mode = Mode::Search;
+        app.handle_key(ctrl_d);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn search_finds_case_insensitive_matches_cycles_and_clears() {
+        let (mut app, _) = app_with_session();
+        let mut lines: Vec<String> = (0..30).map(|i| format!("line {i}")).collect();
+        lines[2] = "  ▎ Fix the BUG".into();
+        lines[14] = "    bug again".into();
+        lines[27] = "    another Bug".into();
+        *app.transcript_text.borrow_mut() = lines;
+        app.transcript_height.set(10);
+        app.max_scroll.set(20);
+
+        // `/` enters search mode and searches live.
+        app.handle_key(key(KeyCode::Char('/')));
+        assert_eq!(app.mode, Mode::Search);
+        type_keys(&mut app, "bug");
+        assert_eq!(app.search_query, "bug");
+        assert_eq!(app.search_matches, vec![2, 14, 27]);
+        assert_eq!(app.search_current, Some(0));
+        // Line 2 is visible: from_top = 20 - scroll <= 2 < from_top + 10.
+        let from_top = 20 - app.scroll as usize;
+        assert!((from_top..from_top + 10).contains(&2));
+
+        // Backspace & Ctrl-u edit the query live.
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.search_query, "bu");
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(app.search_query.is_empty());
+        assert!(app.search_matches.is_empty());
+        assert_eq!(app.search_current, None);
+
+        // Enter confirms and returns to Normal while keeping highlights active.
+        type_keys(&mut app, "BUG");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.search_query, "BUG");
+        assert_eq!(app.search_current, Some(0));
+
+        // n / N step forward and backward with wrap-around and scroll into view.
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.search_current, Some(1));
+        let from_top = 20 - app.scroll as usize;
+        assert!((from_top..from_top + 10).contains(&14));
+
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.search_current, Some(2));
+        let from_top = 20 - app.scroll as usize;
+        assert!((from_top..from_top + 10).contains(&27));
+
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.search_current, Some(0));
+
+        app.handle_key(key(KeyCode::Char('N')));
+        assert_eq!(app.search_current, Some(2));
+
+        // Pending operator + Esc cancels the operator without clearing search.
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.input.pending(), "d");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.input.pending().is_empty());
+        assert_eq!(app.search_query, "BUG");
+
+        // Esc with no pending operator clears the active search.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.search_query.is_empty());
+        assert!(app.search_matches.is_empty());
+        assert_eq!(app.search_current, None);
+    }
+
+    #[test]
+    fn search_esc_clears_leader_opens_and_session_switch_clears() {
+        let (mut app, _) = app_with_session();
+        let (s1, _) = Session::detached(1, agent::find("antigravity").unwrap());
+        app.sessions.push(s1);
+        *app.transcript_text.borrow_mut() = vec!["alpha".into(), "beta".into()];
+
+        // Leader + / opens search from Insert mode as well.
+        app.mode = Mode::Insert;
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('/')));
+        assert_eq!(app.mode, Mode::Search);
+        type_keys(&mut app, "alpha");
+        assert_eq!(app.search_matches, vec![0]);
+
+        // Esc inside Search mode clears and returns to Normal.
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.search_query.is_empty());
+        assert!(app.search_matches.is_empty());
+
+        // Switching sessions clears an active search.
+        app.handle_key(key(KeyCode::Char('/')));
+        type_keys(&mut app, "beta");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.search_query, "beta");
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.selected, 1);
+        assert!(app.search_query.is_empty());
+        assert!(app.search_matches.is_empty());
+        assert_eq!(app.search_current, None);
     }
 
     #[test]
