@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
+use crate::agent::install::AgentStatus;
 use crate::agent::{self, AgentSpec};
 use crate::editor::Editor;
 use crate::selection::Selection;
@@ -64,6 +65,8 @@ pub struct App {
     pub leader: bool,
     /// Agents offered by the new-session picker.
     pub picker: Vec<&'static AgentSpec>,
+    /// Cached local install/login status for each entry in `picker`.
+    pub picker_status: Vec<AgentStatus>,
     pub picker_cursor: usize,
     /// Whether the picked session gets its own worktree (`n`) or runs
     /// directly in the current directory/branch (`N`).
@@ -126,6 +129,7 @@ impl App {
             pastes: Vec::new(),
             leader: false,
             picker: Vec::new(),
+            picker_status: Vec::new(),
             picker_cursor: 0,
             picker_isolated: true,
             model_cursor: 0,
@@ -1091,9 +1095,15 @@ impl App {
         self.picker = agents;
         self.picker_cursor = 0;
         if self.picker.len() == 1 {
+            self.picker_status.clear();
             self.open_session(self.picker[0], isolated);
             return;
         }
+        self.picker_status = self
+            .picker
+            .iter()
+            .map(|a| agent::install::status(a))
+            .collect();
         self.mode = Mode::Picker;
     }
 
@@ -1998,6 +2008,7 @@ mod tests {
         assert_eq!(app2.mode, Mode::Picker);
         assert!(app2.picker_isolated);
         assert!(app2.sessions.is_empty());
+        assert_eq!(app2.picker_status.len(), 2);
     }
 
     #[test]
@@ -2201,5 +2212,16 @@ mod tests {
         type_keys(&mut app, " j");
         assert_eq!(app.selected, 0);
         assert!(!app.sessions[0].attention);
+    }
+
+    #[test]
+    fn opening_picker_caches_status_for_every_agent() {
+        let (tx, _rx) = mpsc::channel();
+        let store = Store::new(tempfile::tempdir().unwrap().keep());
+        let mut app = App::new(PathBuf::from("."), PathBuf::from("."), store, tx);
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.mode, Mode::Picker);
+        assert!(!app.picker.is_empty());
+        assert_eq!(app.picker_status.len(), app.picker.len());
     }
 }

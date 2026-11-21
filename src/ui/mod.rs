@@ -11,6 +11,7 @@ use ratatui::Frame;
 mod markdown;
 
 use crate::agent::acp::ToolContent;
+use crate::agent::install::AgentStatus;
 use crate::app::{App, Confirm, Mode};
 use crate::session::{Entry, Session, Status};
 
@@ -1033,8 +1034,18 @@ fn hint_line(pairs: &[(&'static str, &'static str)]) -> Line<'static> {
     Line::from(spans)
 }
 
+fn picker_status_badge(status: AgentStatus) -> (&'static str, Color) {
+    match status {
+        AgentStatus::Ready => ("● installed", OK),
+        AgentStatus::NeedsLogin => ("○ needs login", WARN),
+        AgentStatus::NeedsInstall => ("↓ will install", ACCENT),
+        AgentStatus::Missing => ("✗ not installed", ERR),
+    }
+}
+
 fn render_picker(f: &mut Frame, app: &App) {
-    let area = centered(f.area(), 52, app.picker.len() as u16 + 4);
+    let area = centered(f.area(), 58, app.picker.len() as u16 + 4);
+    let inner_w = area.width.saturating_sub(8) as usize;
     let title = if app.picker_isolated {
         "new session · worktree"
     } else {
@@ -1045,10 +1056,28 @@ fn render_picker(f: &mut Frame, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, a)| {
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{} ", i + 1), DIM),
-                Span::raw(a.name),
-            ]))
+            let idx = format!("{} ", i + 1);
+            let mut spans = vec![Span::styled(idx.clone(), DIM)];
+            if let Some(status) = app.picker_status.get(i).copied() {
+                let (badge, color) = picker_status_badge(status);
+                let idx_len = idx.chars().count();
+                let badge_len = badge.chars().count();
+                let name_room = inner_w.saturating_sub(idx_len + badge_len + 2);
+                let name = if name_room > 0 {
+                    fit(a.name, name_room)
+                } else {
+                    a.name.to_string()
+                };
+                let gap = inner_w
+                    .saturating_sub(idx_len + name.chars().count() + badge_len)
+                    .max(2);
+                spans.push(Span::raw(name));
+                spans.push(Span::raw(" ".repeat(gap)));
+                spans.push(Span::styled(badge, Style::new().fg(color)));
+            } else {
+                spans.push(Span::raw(a.name));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let mut state = ListState::default();
@@ -1602,6 +1631,43 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert_eq!(reversed, vec!["d"], "{}", dump(&term));
+    }
+
+    #[test]
+    fn picker_renders_install_and_login_status_badges() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        app.mode = Mode::Picker;
+        app.picker = vec![
+            find("claude").unwrap(),
+            find("codex").unwrap(),
+            find("antigravity").unwrap(),
+        ];
+        app.picker_status = vec![
+            AgentStatus::Ready,
+            AgentStatus::NeedsLogin,
+            AgentStatus::NeedsInstall,
+        ];
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("● installed"), "{screen}");
+        assert!(screen.contains("○ needs login"), "{screen}");
+        assert!(screen.contains("↓ will install"), "{screen}");
+
+        app.picker_status = vec![
+            AgentStatus::Missing,
+            AgentStatus::Ready,
+            AgentStatus::NeedsLogin,
+        ];
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("✗ not installed"), "{screen}");
     }
 
     #[test]

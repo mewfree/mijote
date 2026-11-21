@@ -43,6 +43,66 @@ fn managed_bin(spec: &AgentSpec) -> PathBuf {
     managed_dir(spec).join("node_modules/.bin").join(spec.bin)
 }
 
+/// Local install and login readiness for an agent backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentStatus {
+    /// Binary is installed and local auth/login state looks present (or cannot be ruled out).
+    Ready,
+    /// Binary is installed, but known local credential markers and API key env vars are absent.
+    NeedsLogin,
+    /// Binary is not found, and its npm adapter will be installed on first use.
+    NeedsInstall,
+    /// Binary is not found, and it must be installed manually.
+    Missing,
+}
+
+/// Fast local check (no network, no subprocesses) for whether `spec` is
+/// installed and appears logged in. Never reads secret file contents.
+pub fn status(spec: &AgentSpec) -> AgentStatus {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    status_with(locate(spec).is_some(), spec, home.as_deref(), |name| {
+        std::env::var_os(name).is_some_and(|v| !v.is_empty())
+    })
+}
+
+fn status_with(
+    installed: bool,
+    spec: &AgentSpec,
+    home: Option<&Path>,
+    has_env: impl Fn(&str) -> bool,
+) -> AgentStatus {
+    if !installed {
+        return match spec.install {
+            Install::Npm { .. } => AgentStatus::NeedsInstall,
+            Install::None | Install::Manual(_) => AgentStatus::Missing,
+        };
+    }
+    let exists = |rel: &str| home.is_some_and(|h| h.join(rel).exists());
+    let logged_in = match spec.id {
+        "claude" => {
+            has_env("ANTHROPIC_API_KEY")
+                || has_env("CLAUDE_CODE_OAUTH_TOKEN")
+                || exists(".claude.json")
+                || exists(".claude")
+        }
+        "codex" => {
+            has_env("OPENAI_API_KEY") || has_env("CODEX_API_KEY") || exists(".codex/auth.json")
+        }
+        "antigravity" => {
+            has_env("GEMINI_API_KEY")
+                || has_env("GOOGLE_API_KEY")
+                || exists(".gemini/antigravity-cli")
+                || exists(".gemini")
+        }
+        _ => true,
+    };
+    if logged_in {
+        AgentStatus::Ready
+    } else {
+        AgentStatus::NeedsLogin
+    }
+}
+
 /// Where the binary currently is, without installing anything.
 pub fn locate(spec: &AgentSpec) -> Option<PathBuf> {
     let managed = managed_bin(spec);
@@ -99,6 +159,7 @@ fn npm_install(dir: &Path, package: &'static str, version: &str) -> Result<(), I
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::find;
 
     #[test]
     fn manual_agent_reports_hint_instead_of_installing() {
@@ -112,5 +173,154 @@ mod tests {
         };
         let err = ensure(&spec).unwrap_err();
         assert!(matches!(err, InstallError::Manual(_, "install manually")));
+    }
+
+    #[test]
+    fn status_reports_needs_install_or_missing_when_binary_absent() {
+        let claude = find("claude").unwrap();
+        let codex = find("codex").unwrap();
+        let agy = find("antigravity").unwrap();
+        let manual = AgentSpec {
+            id: "manual-test",
+            name: "Manual",
+            bin: "manual",
+            args: &[],
+            install: Install::Manual("hint"),
+            note: "",
+        };
+
+        assert_eq!(
+            status_with(false, claude, None, |_| true),
+            AgentStatus::NeedsInstall
+        );
+        assert_eq!(
+            status_with(false, codex, None, |_| true),
+            AgentStatus::NeedsInstall
+        );
+        assert_eq!(
+            status_with(false, agy, None, |_| true),
+            AgentStatus::Missing
+        );
+        assert_eq!(
+            status_with(false, &manual, None, |_| true),
+            AgentStatus::Missing
+        );
+    }
+
+    #[test]
+    fn status_checks_claude_login_markers() {
+        let claude = find("claude").unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            status_with(true, claude, Some(home.path()), |_| false),
+            AgentStatus::NeedsLogin
+        );
+        assert_eq!(
+            status_with(true, claude, None, |_| false),
+            AgentStatus::NeedsLogin
+        );
+        assert_eq!(
+            status_with(true, claude, Some(home.path()), |k| k
+                == "ANTHROPIC_API_KEY"),
+            AgentStatus::Ready
+        );
+        assert_eq!(
+            status_with(true, claude, Some(home.path()), |k| {
+                k == "CLAUDE_CODE_OAUTH_TOKEN"
+            }),
+            AgentStatus::Ready
+        );
+
+        std::fs::write(home.path().join(".claude.json"), "{}").unwrap();
+        assert_eq!(
+            status_with(true, claude, Some(home.path()), |_| false),
+            AgentStatus::Ready
+        );
+
+        let home_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home_dir.path().join(".claude")).unwrap();
+        assert_eq!(
+            status_with(true, claude, Some(home_dir.path()), |_| false),
+            AgentStatus::Ready
+        );
+    }
+
+    #[test]
+    fn status_checks_codex_login_markers() {
+        let codex = find("codex").unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            status_with(true, codex, Some(home.path()), |_| false),
+            AgentStatus::NeedsLogin
+        );
+        assert_eq!(
+            status_with(true, codex, Some(home.path()), |k| k == "OPENAI_API_KEY"),
+            AgentStatus::Ready
+        );
+        assert_eq!(
+            status_with(true, codex, Some(home.path()), |k| k == "CODEX_API_KEY"),
+            AgentStatus::Ready
+        );
+
+        std::fs::create_dir(home.path().join(".codex")).unwrap();
+        assert_eq!(
+            status_with(true, codex, Some(home.path()), |_| false),
+            AgentStatus::NeedsLogin
+        );
+        std::fs::write(home.path().join(".codex/auth.json"), "{}").unwrap();
+        assert_eq!(
+            status_with(true, codex, Some(home.path()), |_| false),
+            AgentStatus::Ready
+        );
+    }
+
+    #[test]
+    fn status_checks_antigravity_login_markers() {
+        let agy = find("antigravity").unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            status_with(true, agy, Some(home.path()), |_| false),
+            AgentStatus::NeedsLogin
+        );
+        assert_eq!(
+            status_with(true, agy, Some(home.path()), |k| k == "GEMINI_API_KEY"),
+            AgentStatus::Ready
+        );
+        assert_eq!(
+            status_with(true, agy, Some(home.path()), |k| k == "GOOGLE_API_KEY"),
+            AgentStatus::Ready
+        );
+
+        std::fs::create_dir_all(home.path().join(".gemini/antigravity-cli")).unwrap();
+        assert_eq!(
+            status_with(true, agy, Some(home.path()), |_| false),
+            AgentStatus::Ready
+        );
+
+        let home_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home_dir.path().join(".gemini")).unwrap();
+        assert_eq!(
+            status_with(true, agy, Some(home_dir.path()), |_| false),
+            AgentStatus::Ready
+        );
+    }
+
+    #[test]
+    fn status_treats_unknown_installed_agent_as_ready() {
+        let custom = AgentSpec {
+            id: "custom-agent",
+            name: "Custom",
+            bin: "custom",
+            args: &[],
+            install: Install::None,
+            note: "",
+        };
+        assert_eq!(
+            status_with(true, &custom, None, |_| false),
+            AgentStatus::Ready
+        );
     }
 }
