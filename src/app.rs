@@ -497,9 +497,13 @@ impl App {
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::Char('g') | KeyCode::Home => self.scroll = self.max_scroll.get(),
             KeyCode::Char('G') | KeyCode::End => self.scroll = 0,
-            KeyCode::Char('i') | KeyCode::Enter if !self.sessions.is_empty() => {
-                self.input.checkpoint();
-                self.mode = Mode::Insert;
+            KeyCode::Char('i') | KeyCode::Enter => {
+                if self.sessions.is_empty() {
+                    self.open_picker(false);
+                } else {
+                    self.input.checkpoint();
+                    self.mode = Mode::Insert;
+                }
             }
             _ => {}
         }
@@ -718,15 +722,24 @@ impl App {
     }
 
     fn open_picker(&mut self, isolated: bool) {
-        self.picker_isolated = isolated;
-        self.picker = agent::KNOWN
+        let agents = agent::KNOWN
             .iter()
             .filter(|a| {
                 !matches!(a.install, agent::Install::Manual(_))
                     || agent::install::locate(a).is_some()
             })
             .collect();
+        self.open_picker_with(agents, isolated);
+    }
+
+    fn open_picker_with(&mut self, agents: Vec<&'static AgentSpec>, isolated: bool) {
+        self.picker_isolated = isolated;
+        self.picker = agents;
         self.picker_cursor = 0;
+        if self.picker.len() == 1 {
+            self.open_session(self.picker[0], isolated);
+            return;
+        }
         self.mode = Mode::Picker;
     }
 
@@ -781,6 +794,9 @@ impl App {
             .saturating_sub(1)
             .min(self.sessions.len().saturating_sub(1));
         self.scroll = 0;
+        if self.sessions.is_empty() {
+            self.mode = Mode::Normal;
+        }
         self.message = Some(format!("closing {}…", s.spec.name));
         s.close(self.ui_tx.clone());
     }
@@ -1279,5 +1295,66 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let app = App::new(PathBuf::from("/now"), PathBuf::from("."), store, tx);
         assert_eq!(app.default_agent().map(|s| s.id), Some("codex"));
+    }
+
+    #[test]
+    fn i_and_enter_open_picker_when_no_sessions() {
+        for k in [KeyCode::Char('i'), KeyCode::Enter] {
+            let (tx, _rx) = mpsc::channel();
+            let store = Store::new(tempfile::tempdir().unwrap().keep());
+            let mut app = App::new(PathBuf::from("."), PathBuf::from("."), store, tx);
+            app.handle_key(key(k));
+            assert_eq!(app.mode, Mode::Picker, "key {k:?} should open picker");
+            assert!(!app.picker_isolated);
+            assert!(!app.picker.is_empty());
+        }
+    }
+
+    #[test]
+    fn single_agent_picker_spawns_directly_without_modal() {
+        static ONLY: agent::AgentSpec = agent::AgentSpec {
+            id: "fake",
+            name: "Fake",
+            bin: "nonexistent-mijote-test-agent",
+            args: &[],
+            install: agent::Install::None,
+            note: "test only",
+        };
+        static OTHER: agent::AgentSpec = agent::AgentSpec {
+            id: "fake2",
+            name: "Fake 2",
+            bin: "nonexistent-mijote-test-agent-2",
+            args: &[],
+            install: agent::Install::None,
+            note: "test only",
+        };
+        let (tx, _rx) = mpsc::channel();
+        let store = Store::new(tempfile::tempdir().unwrap().keep());
+        let mut app = App::new(PathBuf::from("."), PathBuf::from("."), store, tx);
+        app.open_picker_with(vec![&ONLY], false);
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].spec.id, "fake");
+        assert!(app.sessions[0].worktree.is_none());
+
+        let (tx2, _rx2) = mpsc::channel();
+        let store2 = Store::new(tempfile::tempdir().unwrap().keep());
+        let mut app2 = App::new(PathBuf::from("."), PathBuf::from("."), store2, tx2);
+        app2.open_picker_with(vec![&ONLY, &OTHER], true);
+        assert_eq!(app2.mode, Mode::Picker);
+        assert!(app2.picker_isolated);
+        assert!(app2.sessions.is_empty());
+    }
+
+    #[test]
+    fn closing_last_session_from_insert_allows_reopening_picker() {
+        let (mut app, _) = app_with_session();
+        app.mode = Mode::Insert;
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(app.sessions.is_empty());
+        assert_eq!(app.mode, Mode::Normal);
+        app.handle_key(key(KeyCode::Char('i')));
+        assert_eq!(app.mode, Mode::Picker);
     }
 }

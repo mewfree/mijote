@@ -362,7 +362,7 @@ fn render_logo(f: &mut Frame, area: Rect) {
 fn render_welcome(f: &mut Frame, area: Rect) {
     let rows = [
         ("n", "new isolated session (git worktree)"),
-        ("N", "new session in the current directory"),
+        ("N", "new session in the current directory (i / Enter)"),
         ("q", "quit"),
     ];
     render_logo(f, area);
@@ -378,7 +378,7 @@ fn render_welcome(f: &mut Frame, area: Rect) {
         spans.push(Span::raw(what));
         lines.push(Line::from(spans));
     }
-    let r = centered(area, 52, lines.len() as u16);
+    let r = centered(area, 56, lines.len() as u16);
     f.render_widget(Paragraph::new(lines), r);
 }
 
@@ -444,10 +444,12 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
 
     let prompt = |style: Style| Span::styled("› ", style);
     let lines: Vec<Line> = if app.input.is_empty() && !active {
-        vec![Line::from(vec![
-            prompt(DIM),
-            Span::styled("press i to write a prompt", DIM),
-        ])]
+        let hint = if app.sessions.is_empty() {
+            "press i or Enter to start a session"
+        } else {
+            "press i to write a prompt"
+        };
+        vec![Line::from(vec![prompt(DIM), Span::styled(hint, DIM)])]
     } else {
         // Scroll sideways and vertically just enough to keep the cursor in view.
         let room = (inner.width as usize).saturating_sub(3).max(1);
@@ -544,7 +546,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         ],
         Mode::Normal if app.sessions.is_empty() => &[
             ("n", "new"),
-            ("N", "new here"),
+            ("N/Enter", "new here"),
             ("m", "mouse"),
             ("q", "quit"),
         ],
