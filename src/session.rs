@@ -156,6 +156,13 @@ impl Session {
         (Self::new(id, spec, cmd_tx, perm_tx), perm_rx)
     }
 
+    /// Directory this session operates in (its worktree if isolated, else `fallback`).
+    pub fn dir<'a>(&'a self, fallback: &'a std::path::Path) -> &'a std::path::Path {
+        self.worktree
+            .as_ref()
+            .map_or(fallback, |w| w.path.as_path())
+    }
+
     /// Human-friendly title: `<label> · <agent>` when renamed, else `<agent>`.
     pub fn display_title(&self) -> String {
         match &self.label {
@@ -426,10 +433,12 @@ fn worker(
                 }
                 WorkerCmd::Quit => break,
             };
+            let blocks =
+                crate::files::expand_mentions(&text, &cwd, client.supports_embedded_context());
             let stop = client
-                .prompt(
+                .prompt_blocks(
                     &sid,
-                    &text,
+                    &blocks,
                     |e| send(UiMsg::Event(e)),
                     |req| {
                         send(UiMsg::Permission(req.clone()));
