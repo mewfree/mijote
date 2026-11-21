@@ -1,5 +1,14 @@
 //! ratatui rendering. Reads `App`, never mutates it.
 
+use std::io::{self, Write};
+use std::path::Path;
+
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::queue;
+use crossterm::style::{
+    Attribute, Color as CColor, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+};
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -14,6 +23,15 @@ use crate::agent::acp::ToolContent;
 use crate::agent::install::AgentStatus;
 use crate::app::{App, Confirm, Mode};
 use crate::session::{Entry, Session, Status};
+
+/// A clickable markdown hyperlink on the current screen, in terminal cells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenLink {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub url: String,
+}
 
 // Palette: ANSI names plus one 256-colour grey, so it follows the user's
 // terminal theme and still works on 256-colour terminals.
@@ -73,35 +91,149 @@ pub fn locate(area: Rect, input_lines: usize, col: u16, row: u16) -> Region {
 }
 
 pub fn render(f: &mut Frame, app: &App) {
+    app.cursor_pos.set(None);
     let [header, transcript, input, status] = layout(f.area(), app.input.line_count());
     render_header(f, app, header);
     render_transcript(f, app, transcript);
     render_input(f, app, input);
     render_status(f, app, status);
 
+    let mut modal_open = false;
     if app.mode == Mode::Picker {
         render_picker(f, app);
+        modal_open = true;
     }
     if app.mode == Mode::Model {
         render_models(f, app);
+        modal_open = true;
     }
     if app.mode == Mode::Switcher {
         render_switcher(f, app);
+        modal_open = true;
     }
     if app.mode == Mode::Help {
         render_help(f);
+        modal_open = true;
     }
     if app.mode == Mode::Rename {
         render_rename(f, app);
+        modal_open = true;
     }
     if let Some(s) = app.current() {
         if s.pending.is_some() {
             render_permission(f, s);
+            modal_open = true;
         }
     }
     if let Some(c) = app.confirm {
         render_confirm(f, c);
+        modal_open = true;
     }
+    if modal_open {
+        app.visible_links.borrow_mut().clear();
+    }
+}
+
+/// Overlay OSC 8 terminal hyperlinks onto the already-drawn cells for `links`,
+/// replaying exact cell styles from `buf` and restoring cursor position.
+pub fn write_osc8_links<W: Write>(
+    out: &mut W,
+    links: &[ScreenLink],
+    buf: &Buffer,
+    cursor: Option<(u16, u16)>,
+) -> io::Result<()> {
+    if links.is_empty() {
+        return Ok(());
+    }
+    queue!(out, Hide)?;
+    for link in links {
+        let url = sanitize_osc8_url(&link.url);
+        if url.is_empty() || link.width == 0 || link.y >= buf.area.bottom() {
+            continue;
+        }
+        let end_x = link.x.saturating_add(link.width).min(buf.area.right());
+        if link.x >= end_x {
+            continue;
+        }
+        queue!(out, MoveTo(link.x, link.y))?;
+        write!(out, "\x1b]8;;{url}\x1b\\")?;
+        let mut x = link.x;
+        while x < end_x {
+            let cell = &buf[(x, link.y)];
+            let sym = cell.symbol();
+            let step = unicode_width::UnicodeWidthStr::width(sym).max(1) as u16;
+            apply_cell_style(out, cell.fg, cell.bg, cell.modifier)?;
+            out.write_all(sym.as_bytes())?;
+            x = x.saturating_add(step);
+        }
+        write!(out, "\x1b]8;;\x1b\\")?;
+        queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
+    }
+    if let Some((cx, cy)) = cursor {
+        queue!(out, MoveTo(cx, cy), Show)?;
+    }
+    out.flush()
+}
+
+fn sanitize_osc8_url(url: &str) -> String {
+    url.chars().filter(|&c| !c.is_control()).collect()
+}
+
+fn to_crossterm_color(c: Color) -> CColor {
+    match c {
+        Color::Reset => CColor::Reset,
+        Color::Black => CColor::Black,
+        Color::Red => CColor::DarkRed,
+        Color::Green => CColor::DarkGreen,
+        Color::Yellow => CColor::DarkYellow,
+        Color::Blue => CColor::DarkBlue,
+        Color::Magenta => CColor::DarkMagenta,
+        Color::Cyan => CColor::DarkCyan,
+        Color::Gray => CColor::Grey,
+        Color::DarkGray => CColor::DarkGrey,
+        Color::LightRed => CColor::Red,
+        Color::LightGreen => CColor::Green,
+        Color::LightYellow => CColor::Yellow,
+        Color::LightBlue => CColor::Blue,
+        Color::LightMagenta => CColor::Magenta,
+        Color::LightCyan => CColor::Cyan,
+        Color::White => CColor::White,
+        Color::Indexed(i) => CColor::AnsiValue(i),
+        Color::Rgb(r, g, b) => CColor::Rgb { r, g, b },
+    }
+}
+
+fn apply_cell_style<W: Write>(
+    out: &mut W,
+    fg: Color,
+    bg: Color,
+    modifier: Modifier,
+) -> io::Result<()> {
+    queue!(
+        out,
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(to_crossterm_color(fg)),
+        SetBackgroundColor(to_crossterm_color(bg))
+    )?;
+    if modifier.contains(Modifier::BOLD) {
+        queue!(out, SetAttribute(Attribute::Bold))?;
+    }
+    if modifier.contains(Modifier::DIM) {
+        queue!(out, SetAttribute(Attribute::Dim))?;
+    }
+    if modifier.contains(Modifier::ITALIC) {
+        queue!(out, SetAttribute(Attribute::Italic))?;
+    }
+    if modifier.contains(Modifier::UNDERLINED) {
+        queue!(out, SetAttribute(Attribute::Underlined))?;
+    }
+    if modifier.contains(Modifier::REVERSED) {
+        queue!(out, SetAttribute(Attribute::Reverse))?;
+    }
+    if modifier.contains(Modifier::CROSSED_OUT) {
+        queue!(out, SetAttribute(Attribute::CrossedOut))?;
+    }
+    Ok(())
 }
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -451,10 +583,22 @@ fn render_tool_detail(detail: &[ToolContent], width: usize, out: &mut Vec<Line<'
     }
 }
 
-/// Transcript body for one session, already wrapped to `width` columns, so
-/// scrolling is exact and every wrapped line keeps its gutter.
+#[cfg(test)]
 fn transcript_lines(s: &Session, width: usize, show_tool_details: bool) -> Vec<Line<'static>> {
+    transcript_lines_with_links(s, width, show_tool_details, None).0
+}
+
+/// Transcript body for one session, already wrapped to `width` columns, so
+/// scrolling is exact and every wrapped line keeps its gutter. Also returns
+/// link column ranges in transcript coordinates for OSC 8 hyperlink rendering.
+fn transcript_lines_with_links(
+    s: &Session,
+    width: usize,
+    show_tool_details: bool,
+    cwd: Option<&Path>,
+) -> (Vec<Line<'static>>, Vec<markdown::LinkSpan>) {
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut links: Vec<markdown::LinkSpan> = Vec::new();
     let body = width.saturating_sub(4).max(1);
     let prose = |t: &str, gutter: &'static str, gutter_style: Style, style: Style| {
         wrap(t, body)
@@ -472,10 +616,18 @@ fn transcript_lines(s: &Session, width: usize, show_tool_details: bool) -> Vec<L
         match e {
             Entry::User(t) => out.extend(prose(t, "  ▎ ", Style::new().fg(ACCENT), BOLD)),
             Entry::Agent(t) => {
-                for l in markdown::render(t, body) {
+                let base_line = out.len();
+                let rendered = markdown::render_with_links(t, body, cwd);
+                for l in rendered.lines {
                     let mut spans = vec![Span::raw("    ")];
                     spans.extend(l.spans);
                     out.push(Line::from(spans));
+                }
+                for mut ls in rendered.links {
+                    ls.line += base_line;
+                    ls.start_col = ls.start_col.saturating_add(4);
+                    ls.end_col = ls.end_col.saturating_add(4);
+                    links.push(ls);
                 }
             }
             Entry::Thought(t) => {
@@ -518,7 +670,7 @@ fn transcript_lines(s: &Session, width: usize, show_tool_details: bool) -> Vec<L
             out.push(Line::from(""));
         }
     }
-    out
+    (out, links)
 }
 
 /// Trailing "the agent is busy" line, so a long silent turn never looks hung.
@@ -636,12 +788,14 @@ fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
     let Some(s) = app.current() else {
         app.max_scroll.set(0);
         app.transcript_text.borrow_mut().clear();
+        app.visible_links.borrow_mut().clear();
         render_welcome(f, inner);
         return;
     };
     if s.entries.is_empty() {
         app.max_scroll.set(0);
         app.transcript_text.borrow_mut().clear();
+        app.visible_links.borrow_mut().clear();
         let msg = match s.status {
             Status::Starting => "starting agent (first run may install the adapter)…",
             Status::Failed => "agent failed to start",
@@ -654,7 +808,13 @@ fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let mut lines = transcript_lines(s, inner.width as usize, app.show_tool_details);
+    let cwd = s
+        .worktree
+        .as_ref()
+        .map(|w| w.path.as_path())
+        .unwrap_or_else(|| app.cwd());
+    let (mut lines, link_spans) =
+        transcript_lines_with_links(s, inner.width as usize, app.show_tool_details, Some(cwd));
     lines.extend(activity_line(s));
     let total = lines.len().min(u16::MAX as usize) as u16;
     let max_scroll = total.saturating_sub(inner.height);
@@ -665,6 +825,27 @@ fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
         .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
         .collect();
     f.render_widget(Paragraph::new(lines).scroll((from_top, 0)), inner);
+
+    let first_line = from_top as usize;
+    let last_line = first_line.saturating_add(inner.height as usize);
+    let visible_links: Vec<ScreenLink> = link_spans
+        .into_iter()
+        .filter(|ls| ls.line >= first_line && ls.line < last_line)
+        .filter_map(|ls| {
+            let start = ls.start_col.min(inner.width);
+            let end = ls.end_col.min(inner.width);
+            if start >= end {
+                return None;
+            }
+            Some(ScreenLink {
+                x: inner.x.saturating_add(start),
+                y: inner.y.saturating_add((ls.line - first_line) as u16),
+                width: end - start,
+                url: ls.url,
+            })
+        })
+        .collect();
+    *app.visible_links.borrow_mut() = visible_links;
 
     if !app.search_query.is_empty() {
         let current_line = app
@@ -744,7 +925,9 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
         if active {
             let x = inner.x + 2 + (ccol - off) as u16;
             if x < inner.right() {
-                f.set_cursor_position((x, inner.y + (crow - first) as u16));
+                let pos = (x, inner.y + (crow - first) as u16);
+                f.set_cursor_position(pos);
+                app.cursor_pos.set(Some(pos));
             }
         }
         app.input
@@ -826,7 +1009,9 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             .saturating_add(1)
             .saturating_add(query_w);
         if cursor_x < area.right() {
-            f.set_cursor_position((cursor_x, area.y));
+            let pos = (cursor_x, area.y);
+            f.set_cursor_position(pos);
+            app.cursor_pos.set(Some(pos));
         }
         spans.push(Span::raw("  "));
         if !app.search_query.is_empty() {
@@ -1234,7 +1419,9 @@ fn render_rename(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(line), inner);
     let x = inner.x + 2 + (len - off) as u16;
     if x < inner.right() && inner.height > 0 {
-        f.set_cursor_position((x, inner.y));
+        let pos = (x, inner.y);
+        f.set_cursor_position(pos);
+        app.cursor_pos.set(Some(pos));
     }
 }
 
@@ -2126,5 +2313,55 @@ mod tests {
         }
         term.draw(|f| render(f, &app)).unwrap();
         assert!(dump(&term).contains("no matches"));
+    }
+
+    #[test]
+    fn render_collects_visible_links_clears_on_modal_and_emits_osc8() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.entries.push(Entry::Agent(
+            "Read [ACP docs](https://agentclientprotocol.com) now.".into(),
+        ));
+        app.sessions.push(s);
+
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let buf = term.draw(|f| render(f, &app)).unwrap().buffer.clone();
+        let screen = dump(&term);
+        assert!(screen.contains("ACP docs[1]"), "{screen}");
+        assert!(
+            screen.contains("[1] https://agentclientprotocol.com"),
+            "{screen}"
+        );
+
+        let links = app.visible_links.borrow().clone();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].url, "https://agentclientprotocol.com");
+
+        let mut bytes = Vec::new();
+        write_osc8_links(&mut bytes, &links, &buf, Some((5, 18))).unwrap();
+        let out = String::from_utf8(bytes).unwrap();
+        assert!(out.contains("\x1b]8;;https://agentclientprotocol.com\x1b\\"));
+        assert!(out.contains("\x1b]8;;\x1b\\"));
+
+        // Control characters in a URL must be stripped before writing OSC 8.
+        let dirty = vec![ScreenLink {
+            url: "https://x.y/\x1b[31m\x07evil".into(),
+            ..links[0].clone()
+        }];
+        let mut bytes = Vec::new();
+        write_osc8_links(&mut bytes, &dirty, &buf, None).unwrap();
+        let out = String::from_utf8(bytes).unwrap();
+        assert!(out.contains("\x1b]8;;https://x.y/[31mevil\x1b\\"));
+
+        // Opening a modal suppresses visible links so OSC 8 never paints over it.
+        app.mode = Mode::Help;
+        term.draw(|f| render(f, &app)).unwrap();
+        assert!(app.visible_links.borrow().is_empty());
     }
 }

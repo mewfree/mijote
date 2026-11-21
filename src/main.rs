@@ -175,6 +175,8 @@ fn tui(resume: bool) -> Result<()> {
     }
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let mut mouse_on = false;
+    let mut prev_buf: Option<ratatui::buffer::Buffer> = None;
+    let mut prev_links: Vec<ui::ScreenLink> = Vec::new();
     let result = (|| -> Result<()> {
         while !app.should_quit {
             if app.mouse != mouse_on {
@@ -195,7 +197,20 @@ fn tui(resume: bool) -> Result<()> {
                 let _ = out.write_all(b"\x07");
                 let _ = out.flush();
             }
-            terminal.draw(|f| ui::render(f, &app))?;
+            let completed = terminal.draw(|f| ui::render(f, &app))?;
+            let links = app.visible_links.borrow().clone();
+            if prev_buf.as_ref() != Some(completed.buffer) || prev_links != links {
+                if !links.is_empty() {
+                    let _ = ui::write_osc8_links(
+                        &mut std::io::stdout(),
+                        &links,
+                        completed.buffer,
+                        app.cursor_pos.get(),
+                    );
+                }
+                prev_buf = Some(completed.buffer.clone());
+                prev_links = links;
+            }
             if let Some(text) = app.pending_copy.take() {
                 if clipboard::copy(&text).is_err() {
                     app.set_message("copy failed");
