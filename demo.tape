@@ -14,17 +14,12 @@ Enter
 Sleep 1500ms
 Show
 
+# mijote starts straight into a new session (Insert mode) with the default agent
 Type "mijote"
 Enter
 Sleep 1500ms
 
-# New isolated session (own git worktree) -> pick Claude Code
-Type "n"
-Sleep 1000ms
-Enter
-Sleep 1500ms
-
-# Prompt, vim style
+# Prompt directly in Insert mode
 Type "add retry with backoff to fetch"
 Sleep 600ms
 Enter
@@ -34,10 +29,10 @@ Sleep 4500ms
 Type "1"
 Sleep 6000ms
 
-# Second agent in parallel, then jump back with the switcher
+# Second agent in its own git worktree, then jump back with the switcher
 Escape
 Type " n"
-Sleep 800ms
+Sleep 1200ms
 Type "j"
 Sleep 600ms
 Enter

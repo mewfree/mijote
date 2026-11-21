@@ -9,7 +9,8 @@ mkdir -p "$DEMO/bin" "$DEMO/home" "$DEMO/repo/src"
 
 printf '#!/bin/sh\nexec python3 %s "Claude Code"\n' "$SRC/demo-agent.py" > "$DEMO/bin/claude-agent-acp"
 printf '#!/bin/sh\nexec python3 %s "Codex CLI"\n' "$SRC/demo-agent.py" > "$DEMO/bin/codex-acp"
-chmod +x "$DEMO/bin/claude-agent-acp" "$DEMO/bin/codex-acp"
+printf '#!/bin/sh\nexec python3 %s "Antigravity"\n' "$SRC/demo-agent.py" > "$DEMO/bin/agy"
+chmod +x "$DEMO/bin/claude-agent-acp" "$DEMO/bin/codex-acp" "$DEMO/bin/agy"
 
 export MIJOTE_HOME="$DEMO/home"
 export PATH="$SRC/target/release:$DEMO/bin:$PATH"
