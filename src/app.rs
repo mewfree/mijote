@@ -11,6 +11,7 @@ use ratatui::layout::Rect;
 use crate::agent::install::AgentStatus;
 use crate::agent::{self, AgentSpec};
 use crate::editor::Editor;
+use crate::files::{self, FileMatch};
 use crate::selection::Selection;
 use crate::session::{Entry, Msg, Session, Status, UiMsg};
 use crate::store::Store;
@@ -41,6 +42,17 @@ pub enum Confirm {
     Quit,
 }
 
+/// Active `@` file-mention autocomplete state while typing in Insert mode.
+#[derive(Debug, Clone)]
+pub struct MentionPopup {
+    /// Char index of the triggering `@` in `App::input`.
+    pub at_start: usize,
+    pub query: String,
+    pub matches: Vec<FileMatch>,
+    pub cursor: usize,
+    pub total_files: usize,
+}
+
 /// A paste with more lines or characters than this is collapsed to a placeholder.
 const PASTE_COLLAPSE_LINES: usize = 3;
 const PASTE_COLLAPSE_CHARS: usize = 500;
@@ -58,6 +70,10 @@ pub struct App {
     pub selected: usize,
     pub mode: Mode,
     pub input: Editor,
+    /// Active `@` file-mention completion popup in Insert mode.
+    pub mention: Option<MentionPopup>,
+    /// Cached file list for the currently open `@` completion session.
+    mention_files: Option<(PathBuf, Vec<String>)>,
     /// Large pastes shown in `input` as a placeholder: (placeholder, text).
     /// Expanded on submit.
     pastes: Vec<(String, String)>,
@@ -130,6 +146,8 @@ impl App {
             selected: 0,
             mode: Mode::Normal,
             input: Editor::default(),
+            mention: None,
+            mention_files: None,
             pastes: Vec::new(),
             leader: false,
             picker: Vec::new(),
@@ -313,6 +331,7 @@ impl App {
         self.selected = self.sessions.len() - 1;
         self.scroll = 0;
         self.clear_search();
+        self.clear_mention();
         self.mode = Mode::Insert;
     }
 
@@ -418,12 +437,14 @@ impl App {
         let lines = text.matches('\n').count() + 1;
         if lines <= PASTE_COLLAPSE_LINES && text.chars().count() <= PASTE_COLLAPSE_CHARS {
             self.input.insert_str(&text);
+            self.update_mention();
             return;
         }
         let n = self.pastes.len() + 1;
         let placeholder = format!("[Pasted text #{n} +{lines} lines]");
         self.input.insert_str(&placeholder);
         self.pastes.push((placeholder, text));
+        self.update_mention();
     }
 
     /// `text` with paste placeholders replaced by what was pasted. A
@@ -834,10 +855,111 @@ impl App {
         }
     }
 
+    fn clear_mention(&mut self) {
+        self.mention = None;
+        self.mention_files = None;
+    }
+
+    fn update_mention(&mut self) {
+        if self.mode != Mode::Insert {
+            self.clear_mention();
+            return;
+        }
+        let Some(dir) = self.current().map(|s| s.dir(&self.cwd).to_path_buf()) else {
+            self.clear_mention();
+            return;
+        };
+        let Some((at_start, query)) =
+            files::active_mention(self.input.chars(), self.input.cursor_index())
+        else {
+            self.clear_mention();
+            return;
+        };
+        let needs_load = self
+            .mention_files
+            .as_ref()
+            .is_none_or(|(cached_dir, _)| cached_dir != &dir);
+        if needs_load {
+            let listed = files::list_files(&dir);
+            self.mention_files = Some((dir, listed));
+        }
+        let Some((_, listed)) = &self.mention_files else {
+            return;
+        };
+        let prev_selected = self
+            .mention
+            .as_ref()
+            .and_then(|m| m.matches.get(m.cursor))
+            .map(|m| m.path.clone());
+        let matches = files::fuzzy_filter(listed, &query, 50);
+        let cursor = prev_selected
+            .and_then(|p| matches.iter().position(|m| m.path == p))
+            .unwrap_or(0);
+        self.mention = Some(MentionPopup {
+            at_start,
+            query,
+            matches,
+            cursor,
+            total_files: listed.len(),
+        });
+    }
+
+    fn accept_mention(&mut self) -> bool {
+        let Some(popup) = self.mention.as_ref() else {
+            return false;
+        };
+        let Some(chosen) = popup.matches.get(popup.cursor) else {
+            return false;
+        };
+        let at_start = popup.at_start;
+        let replacement = files::format_mention(&chosen.path);
+        let end = self.input.cursor_index();
+        self.input.replace_range(at_start, end, &replacement);
+        self.clear_mention();
+        true
+    }
+
     fn handle_insert(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(popup) = self.mention.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.clear_mention();
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('n') if key.code == KeyCode::Down || ctrl => {
+                    if !popup.matches.is_empty() {
+                        popup.cursor = (popup.cursor + 1) % popup.matches.len();
+                    }
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('p') if key.code == KeyCode::Up || ctrl => {
+                    if !popup.matches.is_empty() {
+                        popup.cursor =
+                            (popup.cursor + popup.matches.len() - 1) % popup.matches.len();
+                    }
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.accept_mention();
+                    return;
+                }
+                KeyCode::Enter
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    if self.accept_mention() {
+                        return;
+                    }
+                    self.clear_mention();
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc => {
+                self.clear_mention();
                 self.input.leave_insert();
                 self.mode = Mode::Normal;
             }
@@ -847,10 +969,20 @@ impl App {
                     .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
             {
                 self.input.insert('\n');
+                self.update_mention();
             }
-            KeyCode::Char('j') if ctrl => self.input.insert('\n'),
-            KeyCode::Char('w') if ctrl => self.input.delete_word_back(),
-            KeyCode::Char('u') if ctrl => self.input.kill_line_back(),
+            KeyCode::Char('j') if ctrl => {
+                self.input.insert('\n');
+                self.update_mention();
+            }
+            KeyCode::Char('w') if ctrl => {
+                self.input.delete_word_back();
+                self.update_mention();
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.input.kill_line_back();
+                self.update_mention();
+            }
             KeyCode::Enter => {
                 let text = self.input.text().trim().to_string();
                 if text.is_empty() {
@@ -859,6 +991,7 @@ impl App {
                 if self.slash_model(&text) {
                     self.input.clear();
                     self.pastes.clear();
+                    self.clear_mention();
                     return;
                 }
                 let text = self.expand_pastes(&text);
@@ -872,6 +1005,7 @@ impl App {
                 if let Some((id, agent)) = sent {
                     self.input.clear();
                     self.pastes.clear();
+                    self.clear_mention();
                     self.scroll = 0;
                     self.persist(id);
                     let _ = self.store.save_last_agent(agent);
@@ -879,15 +1013,42 @@ impl App {
             }
             KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::Backspace => self.input.backspace(),
-            KeyCode::Delete => self.input.delete_forward(),
-            KeyCode::Left => self.input.left(),
-            KeyCode::Right => self.input.right(),
-            KeyCode::Up => self.input.up(),
-            KeyCode::Down => self.input.down(),
-            KeyCode::Home => self.input.home(),
-            KeyCode::End => self.input.end(),
-            KeyCode::Char(c) if !ctrl => self.input.insert(c),
+            KeyCode::Backspace => {
+                self.input.backspace();
+                self.update_mention();
+            }
+            KeyCode::Delete => {
+                self.input.delete_forward();
+                self.update_mention();
+            }
+            KeyCode::Left => {
+                self.input.left();
+                self.update_mention();
+            }
+            KeyCode::Right => {
+                self.input.right();
+                self.update_mention();
+            }
+            KeyCode::Up => {
+                self.input.up();
+                self.update_mention();
+            }
+            KeyCode::Down => {
+                self.input.down();
+                self.update_mention();
+            }
+            KeyCode::Home => {
+                self.input.home();
+                self.update_mention();
+            }
+            KeyCode::End => {
+                self.input.end();
+                self.update_mention();
+            }
+            KeyCode::Char(c) if !ctrl => {
+                self.input.insert(c);
+                self.update_mention();
+            }
             _ => {}
         }
     }
@@ -1022,6 +1183,7 @@ impl App {
                 self.selected = i;
                 self.scroll = 0;
                 self.clear_search();
+                self.clear_mention();
             }
             self.sessions[i].attention = false;
             if self.sessions[i].worktree.is_some() {
@@ -2229,5 +2391,52 @@ mod tests {
         assert_eq!(app.mode, Mode::Picker);
         assert!(!app.picker.is_empty());
         assert_eq!(app.picker_status.len(), app.picker.len());
+    }
+
+    #[test]
+    fn at_mention_popup_filters_selects_accepts_and_dismisses() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join("src")).unwrap();
+        std::fs::write(work.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(work.path().join("src/app.rs"), "").unwrap();
+        std::fs::write(work.path().join("Cargo.toml"), "").unwrap();
+
+        let (tx, _rx) = mpsc::channel();
+        let store = Store::new(tempfile::tempdir().unwrap().keep());
+        let mut app = App::new(
+            work.path().to_path_buf(),
+            work.path().to_path_buf(),
+            store,
+            tx,
+        );
+        let (mut s, _) = Session::detached(0, agent::find("claude").unwrap());
+        s.status = Status::Idle;
+        app.sessions.push(s);
+        app.mode = Mode::Insert;
+
+        type_keys(&mut app, "check @ma");
+        let popup = app.mention.as_ref().expect("mention popup should be open");
+        assert_eq!(popup.query, "ma");
+        assert_eq!(popup.matches[0].path, "src/main.rs");
+
+        // Tab accepts the selected match and inserts a trailing space.
+        app.handle_key(key(KeyCode::Tab));
+        assert!(app.mention.is_none());
+        assert_eq!(app.input.text(), "check @src/main.rs ");
+
+        // Typing `@` again opens the popup; Down moves selection; Esc closes popup
+        // while staying in Insert mode, and a second Esc returns to Normal mode.
+        type_keys(&mut app, "@");
+        let popup = app.mention.as_ref().unwrap();
+        assert!(popup.matches.len() >= 2);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.mention.as_ref().unwrap().cursor, 1);
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.mention.is_none());
+        assert_eq!(app.mode, Mode::Insert);
+
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
     }
 }
