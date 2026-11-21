@@ -32,6 +32,59 @@ pub enum AcpError {
     Protocol(String),
 }
 
+/// A content block in an ACP `session/prompt` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptBlock {
+    Text(String),
+    ResourceLink {
+        uri: String,
+        name: String,
+        mime_type: Option<String>,
+    },
+    Resource {
+        uri: String,
+        text: String,
+        mime_type: Option<String>,
+    },
+}
+
+impl PromptBlock {
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Text(text) => json!({ "type": "text", "text": text }),
+            Self::ResourceLink {
+                uri,
+                name,
+                mime_type,
+            } => {
+                let mut obj = json!({
+                    "type": "resource_link",
+                    "uri": uri,
+                    "name": name,
+                });
+                if let Some(m) = mime_type {
+                    obj["mimeType"] = json!(m);
+                }
+                obj
+            }
+            Self::Resource {
+                uri,
+                text,
+                mime_type,
+            } => {
+                let mut res = json!({
+                    "uri": uri,
+                    "text": text,
+                });
+                if let Some(m) = mime_type {
+                    res["mimeType"] = json!(m);
+                }
+                json!({ "type": "resource", "resource": res })
+            }
+        }
+    }
+}
+
 /// Content block attached to a `tool_call` or `tool_call_update`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolContent {
@@ -263,6 +316,7 @@ pub struct AcpClient {
     rx: Receiver<Value>,
     next_id: u64,
     models: ModelState,
+    embedded_context: bool,
 }
 
 impl AcpClient {
@@ -294,6 +348,7 @@ impl AcpClient {
             rx,
             next_id: 0,
             models: ModelState::default(),
+            embedded_context: false,
         })
     }
 
@@ -387,12 +442,21 @@ impl AcpClient {
                 },
             }),
         )?;
+        self.embedded_context = result
+            .pointer("/agentCapabilities/promptCapabilities/embeddedContext")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         Ok(result
             .pointer("/agentInfo/title")
             .or_else(|| result.pointer("/agentInfo/name"))
             .and_then(Value::as_str)
             .unwrap_or("agent")
             .to_string())
+    }
+
+    /// Whether the agent advertised `promptCapabilities.embeddedContext`.
+    pub fn supports_embedded_context(&self) -> bool {
+        self.embedded_context
     }
 
     pub fn new_session(&mut self, cwd: &Path) -> Result<String, AcpError> {
@@ -437,21 +501,39 @@ impl AcpClient {
         Ok(())
     }
 
-    /// Run one prompt turn to completion.
+    /// Run one prompt turn to completion with a single text block.
     ///
     /// `on_permission` returns the chosen option id, or `None` to cancel.
+    #[cfg(test)]
     pub fn prompt(
         &mut self,
         session_id: &str,
         text: &str,
+        on_event: impl FnMut(Event),
+        on_permission: impl FnMut(&PermissionRequest) -> Option<String>,
+    ) -> Result<StopReason, AcpError> {
+        self.prompt_blocks(
+            session_id,
+            &[PromptBlock::Text(text.to_string())],
+            on_event,
+            on_permission,
+        )
+    }
+
+    /// Run one prompt turn to completion with structured ACP content blocks.
+    pub fn prompt_blocks(
+        &mut self,
+        session_id: &str,
+        blocks: &[PromptBlock],
         mut on_event: impl FnMut(Event),
         mut on_permission: impl FnMut(&PermissionRequest) -> Option<String>,
     ) -> Result<StopReason, AcpError> {
+        let prompt: Vec<Value> = blocks.iter().map(PromptBlock::to_json).collect();
         let result = self.call(
             "session/prompt",
             json!({
                 "sessionId": session_id,
-                "prompt": [{"type": "text", "text": text}],
+                "prompt": prompt,
             }),
             &mut on_event,
             &mut on_permission,
@@ -1019,5 +1101,64 @@ case "$l" in *'"modelId":"b"'*) echo '{"jsonrpc":"2.0","id":2,"result":{}}';; *)
             raw_summary.preview_text.as_deref(),
             Some("limit: 5\nquery: retry")
         );
+    }
+
+    #[test]
+    fn prompt_blocks_reads_embedded_context_capability_and_sends_resources() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    m, mid = msg.get("method"), msg.get("id")
+    if m == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{
+            "protocolVersion":1,
+            "agentCapabilities":{"promptCapabilities":{"embeddedContext":True}},
+            "agentInfo":{"name":"fake"}
+        }}), flush=True)
+    elif m == "session/new":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"sessionId":"s1"}}), flush=True)
+    elif m == "session/prompt":
+        prompt = msg["params"]["prompt"]
+        kinds = [b["type"] for b in prompt]
+        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"s1",
+            "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":",".join(kinds)}}
+        }}), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"stopReason":"end_turn"}}), flush=True)
+"#;
+        let mut client = AcpClient::spawn("python3", &["-c", script], dir.path()).unwrap();
+        client.initialize().unwrap();
+        assert!(client.supports_embedded_context());
+        let sid = client.new_session(dir.path()).unwrap();
+        let blocks = vec![
+            PromptBlock::Text("see ".into()),
+            PromptBlock::Resource {
+                uri: "file:///a.rs".into(),
+                text: "fn a() {}".into(),
+                mime_type: Some("text/x-rust".into()),
+            },
+            PromptBlock::ResourceLink {
+                uri: "file:///b.bin".into(),
+                name: "b.bin".into(),
+                mime_type: None,
+            },
+        ];
+        let mut out = String::new();
+        let stop = client
+            .prompt_blocks(
+                &sid,
+                &blocks,
+                |ev| {
+                    if let Event::AgentText(t) = ev {
+                        out.push_str(&t);
+                    }
+                },
+                |_| None,
+            )
+            .unwrap();
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(out, "text,resource,resource_link");
     }
 }

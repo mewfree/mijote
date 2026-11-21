@@ -2,6 +2,7 @@ mod agent;
 mod app;
 mod clipboard;
 mod editor;
+mod files;
 mod selection;
 mod session;
 mod store;
@@ -103,9 +104,10 @@ fn ask(id: &str, prompt: &str) -> Result<()> {
     eprintln!("connected to {name}");
     let session = client.new_session(&cwd)?;
 
-    let stop = client.prompt(
+    let blocks = files::expand_mentions(prompt, &cwd, client.supports_embedded_context());
+    let stop = client.prompt_blocks(
         &session,
-        prompt,
+        &blocks,
         |event| match event {
             Event::AgentText(t) => {
                 print!("{t}");

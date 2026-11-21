@@ -21,7 +21,7 @@ mod markdown;
 
 use crate::agent::acp::ToolContent;
 use crate::agent::install::AgentStatus;
-use crate::app::{App, Confirm, Mode};
+use crate::app::{App, Confirm, MentionPopup, Mode};
 use crate::session::{Entry, Session, Status};
 
 /// A clickable markdown hyperlink on the current screen, in terminal cells.
@@ -128,6 +128,12 @@ pub fn render(f: &mut Frame, app: &App) {
     if let Some(c) = app.confirm {
         render_confirm(f, c);
         modal_open = true;
+    }
+    if !modal_open {
+        if let Some(popup) = &app.mention {
+            render_mention_popup(f, popup, input);
+            modal_open = true;
+        }
     }
     if modal_open {
         app.visible_links.borrow_mut().clear();
@@ -1124,6 +1130,11 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("?", "help"),
                 ("^C", "quit"),
             ],
+            Mode::Insert if app.mention.is_some() => &[
+                ("Tab/Enter", "insert file"),
+                ("↑/↓", "select"),
+                ("Esc", "close"),
+            ],
             Mode::Insert if busy => &[
                 ("Enter", "send when idle"),
                 ("^C", "cancel turn"),
@@ -1133,6 +1144,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             Mode::Insert => &[
                 ("Enter", "send"),
                 ("S-Enter", "newline"),
+                ("@", "files"),
                 ("^A", "commands"),
                 ("Esc", "normal"),
             ],
@@ -1483,6 +1495,7 @@ fn render_help(f: &mut Frame) {
         heading("prompt (vim)"),
         row("i / Enter", "insert mode, Esc for normal"),
         row("S-Enter / C-j", "insert newline (also Alt-Enter)"),
+        row("@", "fuzzy-complete and attach workspace files"),
         row("d c y u C-r", "operators, undo/redo & vim motions"),
         Line::from(""),
         heading("commands (Space in normal · C-a anywhere)"),
@@ -1506,6 +1519,118 @@ fn render_help(f: &mut Frame) {
         Paragraph::new(lines).block(modal("help", ACCENT, hint_line(&[("Esc/q/?", "close")]))),
         area,
     );
+}
+
+fn render_mention_popup(f: &mut Frame, popup: &MentionPopup, input: Rect) {
+    const MAX_ROWS: usize = 8;
+    let max_avail_h = input.y.saturating_sub(2);
+    if max_avail_h < 3 || input.width < 20 {
+        return;
+    }
+    let rows = popup.matches.len().clamp(1, MAX_ROWS) as u16;
+    let h = (rows + 2).min(max_avail_h);
+    let visible_rows = h.saturating_sub(2) as usize;
+    let w = input.width.clamp(36, 76).min(input.width);
+    let area = Rect {
+        x: input.x,
+        y: input.y.saturating_sub(h),
+        width: w,
+        height: h,
+    };
+
+    let title = if popup.matches.is_empty() {
+        format!(" @{} · no matches ", fit(&popup.query, 24))
+    } else if popup.query.is_empty() {
+        format!(" @ files ({}) ", popup.total_files)
+    } else {
+        format!(
+            " @{} ({}/{}) ",
+            fit(&popup.query, 24),
+            popup.matches.len(),
+            popup.total_files
+        )
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT))
+        .title(Line::from(Span::styled(
+            title,
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )))
+        .title_bottom(
+            hint_line(&[("Tab/Enter", "insert"), ("↑/↓", "move"), ("Esc", "close")])
+                .right_aligned(),
+        )
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+
+    let items: Vec<Line<'static>> = if popup.matches.is_empty() {
+        vec![Line::styled("  no matching files in workspace", DIM)]
+    } else {
+        let start = if popup.cursor >= visible_rows {
+            popup.cursor + 1 - visible_rows
+        } else {
+            0
+        };
+        let room = inner.width.saturating_sub(2) as usize;
+        popup
+            .matches
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible_rows)
+            .map(|(idx, m)| {
+                let selected = idx == popup.cursor;
+                let base_style = if selected {
+                    Style::new().bg(SELECTED_BG)
+                } else {
+                    Style::new()
+                };
+                let match_style = if selected {
+                    BOLD.fg(ACCENT).bg(SELECTED_BG)
+                } else {
+                    BOLD.fg(ACCENT)
+                };
+                let mut spans = vec![Span::styled(
+                    if selected { "▌ " } else { "  " },
+                    if selected {
+                        Style::new().fg(ACCENT).bg(SELECTED_BG)
+                    } else {
+                        base_style
+                    },
+                )];
+                let chars: Vec<char> = m.path.chars().collect();
+                let show_len = chars.len().min(room);
+                let mut run = String::new();
+                let mut run_hl = false;
+                for (ci, &ch) in chars.iter().take(show_len).enumerate() {
+                    let hl = m.positions.binary_search(&ci).is_ok();
+                    if !run.is_empty() && hl != run_hl {
+                        spans.push(Span::styled(
+                            std::mem::take(&mut run),
+                            if run_hl { match_style } else { base_style },
+                        ));
+                    }
+                    run_hl = hl;
+                    run.push(ch);
+                }
+                if !run.is_empty() {
+                    spans.push(Span::styled(
+                        run,
+                        if run_hl { match_style } else { base_style },
+                    ));
+                }
+                if selected && show_len < room {
+                    spans.push(Span::styled(" ".repeat(room - show_len), base_style));
+                }
+                Line::from(spans)
+            })
+            .collect()
+    };
+
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(items).block(block), area);
 }
 
 fn render_confirm(f: &mut Frame, c: Confirm) {
@@ -2363,5 +2488,39 @@ mod tests {
         app.mode = Mode::Help;
         term.draw(|f| render(f, &app)).unwrap();
         assert!(app.visible_links.borrow().is_empty());
+    }
+
+    #[test]
+    fn render_shows_at_mention_popup_above_prompt() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join("src")).unwrap();
+        std::fs::write(work.path().join("src/main.rs"), "").unwrap();
+        std::fs::write(work.path().join("Cargo.toml"), "").unwrap();
+
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            work.path().to_path_buf(),
+            work.path().to_path_buf(),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.status = Status::Idle;
+        app.sessions.push(s);
+        app.mode = Mode::Insert;
+
+        for c in "edit @ma".chars() {
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("@ma"), "{screen}");
+        assert!(screen.contains("src/main.rs"), "{screen}");
+        assert!(screen.contains("Tab/Enter insert"), "{screen}");
     }
 }
