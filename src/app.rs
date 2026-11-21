@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
+use crate::agent::acp::{ElicitationRequest, ElicitationResponse, FieldKind};
 use crate::agent::install::AgentStatus;
 use crate::agent::{self, AgentSpec};
 use crate::editor::Editor;
@@ -40,6 +41,64 @@ pub enum Mode {
 pub enum Confirm {
     CloseSession,
     Quit,
+}
+
+/// In-progress value for one field of an active interactive question modal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldDraft {
+    Single(Option<usize>),
+    Multi(Vec<bool>),
+    Text(String),
+    Bool(bool),
+}
+
+/// Interactive state for the active session's pending `elicitation/create` modal.
+#[derive(Debug, Clone)]
+pub struct QuestionDraft {
+    pub session_id: usize,
+    pub field_idx: usize,
+    pub option_idx: usize,
+    pub values: Vec<FieldDraft>,
+    pub error: Option<String>,
+}
+
+impl QuestionDraft {
+    pub fn from_request(session_id: usize, req: &ElicitationRequest) -> Self {
+        let values: Vec<FieldDraft> = req
+            .fields
+            .iter()
+            .map(|f| match &f.kind {
+                FieldKind::SingleSelect { options, default } => {
+                    let sel = default
+                        .as_deref()
+                        .and_then(|d| options.iter().position(|o| o.value == d));
+                    FieldDraft::Single(sel)
+                }
+                FieldKind::MultiSelect { options, default } => {
+                    let checks = options
+                        .iter()
+                        .map(|o| default.iter().any(|d| d == &o.value))
+                        .collect();
+                    FieldDraft::Multi(checks)
+                }
+                FieldKind::Text { default } | FieldKind::Number { default, .. } => {
+                    FieldDraft::Text(default.clone().unwrap_or_default())
+                }
+                FieldKind::Bool { default } => FieldDraft::Bool(default.unwrap_or(false)),
+            })
+            .collect();
+        let option_idx = match values.first() {
+            Some(FieldDraft::Single(Some(i))) => *i,
+            _ => 0,
+        };
+        Self {
+            session_id,
+            field_idx: 0,
+            option_idx,
+            values,
+            error: None,
+        }
+    }
 }
 
 /// Active `@` file-mention autocomplete state while typing in Insert mode.
@@ -129,6 +188,8 @@ pub struct App {
     pub show_tool_details: bool,
     /// Action awaiting y/n; owns the keyboard while set.
     pub confirm: Option<Confirm>,
+    /// In-progress form state for the active session's pending question modal.
+    pub question_draft: Option<QuestionDraft>,
     /// One-line notice shown in the status bar until its TTL expires or a newer
     /// notice replaces it.
     notice: Option<Notice>,
@@ -175,6 +236,7 @@ impl App {
             mouse: true,
             show_tool_details: true,
             confirm: None,
+            question_draft: None,
             notice: None,
             cwd,
             worktrees_root,
@@ -230,6 +292,7 @@ impl App {
         }
         let is_turn_done = matches!(msg.body, UiMsg::TurnDone(_));
         let is_permission = matches!(msg.body, UiMsg::Permission(_));
+        let is_question = matches!(msg.body, UiMsg::Question(_));
         let settled = is_turn_done || matches!(msg.body, UiMsg::Error(_));
         let Some(idx) = self.sessions.iter().position(|s| s.id == msg.session) else {
             return;
@@ -240,11 +303,16 @@ impl App {
         if is_turn_done && s.worktree.is_some() {
             s.refresh_worktree_state();
         }
-        if background && (is_turn_done || is_permission) {
+        if background && (is_turn_done || is_permission || is_question) {
             if is_turn_done {
                 s.attention = true;
             }
             self.pending_bell = true;
+        }
+        if !background && is_question {
+            self.sync_question_draft();
+        } else if !background && settled {
+            self.question_draft = None;
         }
         if settled {
             self.persist(msg.session);
@@ -356,15 +424,23 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             match self.current_mut() {
-                Some(s) if matches!(s.status, Status::Running | Status::AwaitingPermission) => {
-                    s.cancel()
+                Some(s)
+                    if matches!(
+                        s.status,
+                        Status::Running | Status::AwaitingPermission | Status::AwaitingQuestion
+                    ) =>
+                {
+                    s.cancel();
+                    self.question_draft = None;
                 }
                 _ => self.request_quit(),
             }
             return;
         }
-        let modal_open =
-            self.confirm.is_some() || self.current().is_some_and(|s| s.pending.is_some());
+        let modal_open = self.confirm.is_some()
+            || self
+                .current()
+                .is_some_and(|s| s.pending.is_some() || s.pending_question.is_some());
         if ctrl && key.code == KeyCode::Char('d') {
             let scroll_ctx = !modal_open
                 && !self.sessions.is_empty()
@@ -374,9 +450,13 @@ impl App {
                 return;
             }
         }
-        // A pending permission request owns the keyboard.
+        // A pending permission or question request owns the keyboard.
         if self.current().is_some_and(|s| s.pending.is_some()) {
             self.handle_permission_key(key);
+            return;
+        }
+        if self.current().is_some_and(|s| s.pending_question.is_some()) {
+            self.handle_question_key(key);
             return;
         }
         if let Some(action) = self.confirm.take() {
@@ -417,6 +497,22 @@ impl App {
     /// `PASTE_COLLAPSE_LINES` lines or `PASTE_COLLAPSE_CHARS` chars show as
     /// `[Pasted text #1 +12 lines]` and are expanded when the prompt is sent.
     pub fn handle_paste(&mut self, text: &str) {
+        if self.current().is_some_and(|s| s.pending_question.is_some()) {
+            self.sync_question_draft();
+            if let Some(draft) = self.question_draft.as_mut() {
+                if let Some(FieldDraft::Text(buf)) = draft.values.get_mut(draft.field_idx) {
+                    let clean: String = text
+                        .replace("\r\n", " ")
+                        .replace(['\r', '\n', '\t'], " ")
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .collect();
+                    buf.push_str(&clean);
+                    draft.error = None;
+                }
+            }
+            return;
+        }
         if self.mode != Mode::Insert
             || self.sessions.is_empty()
             || self.confirm.is_some()
@@ -462,7 +558,9 @@ impl App {
             self.mode,
             Mode::Picker | Mode::Model | Mode::Switcher | Mode::Help | Mode::Rename
         ) || self.confirm.is_some()
-            || self.current().is_some_and(|s| s.pending.is_some())
+            || self
+                .current()
+                .is_some_and(|s| s.pending.is_some() || s.pending_question.is_some())
         {
             return;
         }
@@ -558,6 +656,373 @@ impl App {
         }
     }
 
+    /// Ensure `question_draft` matches the currently selected session's pending question.
+    pub fn sync_question_draft(&mut self) {
+        let Some(s) = self.current() else {
+            self.question_draft = None;
+            return;
+        };
+        let Some(req) = &s.pending_question else {
+            self.question_draft = None;
+            return;
+        };
+        let matches = self
+            .question_draft
+            .as_ref()
+            .is_some_and(|d| d.session_id == s.id && d.values.len() == req.fields.len());
+        if !matches {
+            self.question_draft = Some(QuestionDraft::from_request(s.id, req));
+        }
+    }
+
+    fn handle_question_key(&mut self, key: KeyEvent) {
+        self.sync_question_draft();
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(req) = self.current().and_then(|s| s.pending_question.clone()) else {
+            return;
+        };
+        if key.code == KeyCode::Esc {
+            if let Some(s) = self.current_mut() {
+                s.answer_question(ElicitationResponse::Cancel);
+            }
+            self.question_draft = None;
+            return;
+        }
+        if ctrl && key.code == KeyCode::Char('s') {
+            self.submit_question(&req);
+            return;
+        }
+        if req.fields.is_empty() {
+            match key.code {
+                KeyCode::Enter => self.submit_question(&req),
+                KeyCode::Char('d') if !ctrl => {
+                    if let Some(s) = self.current_mut() {
+                        s.answer_question(ElicitationResponse::Decline);
+                    }
+                    self.question_draft = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        let n_fields = req.fields.len();
+        let Some(draft) = self.question_draft.as_mut() else {
+            return;
+        };
+        let fi = draft.field_idx.min(n_fields - 1);
+        draft.field_idx = fi;
+        let kind = &req.fields[fi].kind;
+
+        match key.code {
+            KeyCode::Tab => {
+                let next = (fi + 1) % n_fields;
+                draft.field_idx = next;
+                draft.option_idx = match draft.values.get(next) {
+                    Some(FieldDraft::Single(Some(i))) => *i,
+                    _ => 0,
+                };
+                draft.error = None;
+                return;
+            }
+            KeyCode::BackTab => {
+                let prev = (fi + n_fields - 1) % n_fields;
+                draft.field_idx = prev;
+                draft.option_idx = match draft.values.get(prev) {
+                    Some(FieldDraft::Single(Some(i))) => *i,
+                    _ => 0,
+                };
+                draft.error = None;
+                return;
+            }
+            _ => {}
+        }
+
+        match kind {
+            FieldKind::SingleSelect { options, .. } => match key.code {
+                KeyCode::Down | KeyCode::Char('j') if !ctrl && !options.is_empty() => {
+                    draft.option_idx = (draft.option_idx + 1) % options.len();
+                }
+                KeyCode::Up | KeyCode::Char('k') if !ctrl && !options.is_empty() => {
+                    draft.option_idx = (draft.option_idx + options.len() - 1) % options.len();
+                }
+                KeyCode::Char(' ') if !ctrl && !options.is_empty() => {
+                    if let Some(FieldDraft::Single(sel)) = draft.values.get_mut(fi) {
+                        *sel = if *sel == Some(draft.option_idx) {
+                            None
+                        } else {
+                            Some(draft.option_idx)
+                        };
+                        draft.error = None;
+                    }
+                }
+                KeyCode::Char('d') if !ctrl => {
+                    if let Some(s) = self.current_mut() {
+                        s.answer_question(ElicitationResponse::Decline);
+                    }
+                    self.question_draft = None;
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    if let Some(idx) = c
+                        .to_digit(10)
+                        .and_then(|n| (n as usize).checked_sub(1))
+                        .filter(|&i| i < options.len())
+                    {
+                        draft.option_idx = idx;
+                        if let Some(FieldDraft::Single(sel)) = draft.values.get_mut(fi) {
+                            *sel = Some(idx);
+                            draft.error = None;
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    if !options.is_empty() {
+                        if let Some(FieldDraft::Single(sel)) = draft.values.get_mut(fi) {
+                            if sel.is_none() {
+                                *sel = Some(draft.option_idx.min(options.len() - 1));
+                            }
+                        }
+                    }
+                    if let Some(next) = next_primary_field(&req, fi) {
+                        draft.field_idx = next;
+                        draft.option_idx = match draft.values.get(next) {
+                            Some(FieldDraft::Single(Some(i))) => *i,
+                            _ => 0,
+                        };
+                        draft.error = None;
+                    } else {
+                        self.submit_question(&req);
+                    }
+                }
+                _ => {}
+            },
+            FieldKind::MultiSelect { options, .. } => match key.code {
+                KeyCode::Down | KeyCode::Char('j') if !ctrl && !options.is_empty() => {
+                    draft.option_idx = (draft.option_idx + 1) % options.len();
+                }
+                KeyCode::Up | KeyCode::Char('k') if !ctrl && !options.is_empty() => {
+                    draft.option_idx = (draft.option_idx + options.len() - 1) % options.len();
+                }
+                KeyCode::Char(' ') if !ctrl && !options.is_empty() => {
+                    if let Some(FieldDraft::Multi(checks)) = draft.values.get_mut(fi) {
+                        if let Some(slot) = checks.get_mut(draft.option_idx) {
+                            *slot = !*slot;
+                            draft.error = None;
+                        }
+                    }
+                }
+                KeyCode::Char('d') if !ctrl => {
+                    if let Some(s) = self.current_mut() {
+                        s.answer_question(ElicitationResponse::Decline);
+                    }
+                    self.question_draft = None;
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    if let Some(idx) = c
+                        .to_digit(10)
+                        .and_then(|n| (n as usize).checked_sub(1))
+                        .filter(|&i| i < options.len())
+                    {
+                        draft.option_idx = idx;
+                        if let Some(FieldDraft::Multi(checks)) = draft.values.get_mut(fi) {
+                            if let Some(slot) = checks.get_mut(idx) {
+                                *slot = !*slot;
+                                draft.error = None;
+                            }
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(next) = next_primary_field(&req, fi) {
+                        draft.field_idx = next;
+                        draft.option_idx = match draft.values.get(next) {
+                            Some(FieldDraft::Single(Some(i))) => *i,
+                            _ => 0,
+                        };
+                        draft.error = None;
+                    } else {
+                        self.submit_question(&req);
+                    }
+                }
+                _ => {}
+            },
+            FieldKind::Bool { .. } => match key.code {
+                KeyCode::Char(' ') if !ctrl => {
+                    if let Some(FieldDraft::Bool(b)) = draft.values.get_mut(fi) {
+                        *b = !*b;
+                        draft.error = None;
+                    }
+                }
+                KeyCode::Char('y') if !ctrl => {
+                    if let Some(FieldDraft::Bool(b)) = draft.values.get_mut(fi) {
+                        *b = true;
+                        draft.error = None;
+                    }
+                }
+                KeyCode::Char('n') if !ctrl => {
+                    if let Some(FieldDraft::Bool(b)) = draft.values.get_mut(fi) {
+                        *b = false;
+                        draft.error = None;
+                    }
+                }
+                KeyCode::Char('d') if !ctrl => {
+                    if let Some(s) = self.current_mut() {
+                        s.answer_question(ElicitationResponse::Decline);
+                    }
+                    self.question_draft = None;
+                }
+                KeyCode::Enter => {
+                    if let Some(next) = next_primary_field(&req, fi) {
+                        draft.field_idx = next;
+                        draft.option_idx = 0;
+                        draft.error = None;
+                    } else {
+                        self.submit_question(&req);
+                    }
+                }
+                _ => {}
+            },
+            FieldKind::Text { .. } | FieldKind::Number { .. } => match key.code {
+                KeyCode::Backspace => {
+                    if let Some(FieldDraft::Text(buf)) = draft.values.get_mut(fi) {
+                        buf.pop();
+                        draft.error = None;
+                    }
+                }
+                KeyCode::Char('u') if ctrl => {
+                    if let Some(FieldDraft::Text(buf)) = draft.values.get_mut(fi) {
+                        buf.clear();
+                        draft.error = None;
+                    }
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    if let Some(FieldDraft::Text(buf)) = draft.values.get_mut(fi) {
+                        buf.push(c);
+                        draft.error = None;
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(next) = next_primary_field(&req, fi) {
+                        draft.field_idx = next;
+                        draft.option_idx = match draft.values.get(next) {
+                            Some(FieldDraft::Single(Some(i))) => *i,
+                            _ => 0,
+                        };
+                        draft.error = None;
+                    } else {
+                        self.submit_question(&req);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+
+    fn submit_question(&mut self, req: &ElicitationRequest) {
+        let Some(draft) = self.question_draft.as_mut() else {
+            return;
+        };
+        let mut content = serde_json::Map::new();
+        for (i, field) in req.fields.iter().enumerate() {
+            let label = field.title.as_deref().unwrap_or(&field.key);
+            match (&field.kind, draft.values.get(i)) {
+                (FieldKind::SingleSelect { options, .. }, Some(FieldDraft::Single(sel))) => {
+                    if let Some(opt) = sel.and_then(|idx| options.get(idx)) {
+                        content.insert(
+                            field.key.clone(),
+                            serde_json::Value::String(opt.value.clone()),
+                        );
+                    } else if field.required {
+                        draft.field_idx = i;
+                        draft.error = Some(format!("{label} is required"));
+                        return;
+                    }
+                }
+                (FieldKind::MultiSelect { options, .. }, Some(FieldDraft::Multi(checks))) => {
+                    let chosen: Vec<serde_json::Value> = options
+                        .iter()
+                        .zip(checks.iter())
+                        .filter(|(_, &on)| on)
+                        .map(|(o, _)| serde_json::Value::String(o.value.clone()))
+                        .collect();
+                    if !chosen.is_empty() {
+                        content.insert(field.key.clone(), serde_json::Value::Array(chosen));
+                    } else if field.required {
+                        draft.field_idx = i;
+                        draft.error = Some(format!("{label} requires at least one choice"));
+                        return;
+                    }
+                }
+                (FieldKind::Bool { .. }, Some(FieldDraft::Bool(val))) => {
+                    content.insert(field.key.clone(), serde_json::Value::Bool(*val));
+                }
+                (FieldKind::Text { .. }, Some(FieldDraft::Text(buf))) => {
+                    let trimmed = buf.trim();
+                    if !trimmed.is_empty() {
+                        content.insert(
+                            field.key.clone(),
+                            serde_json::Value::String(trimmed.to_string()),
+                        );
+                    } else if field.required {
+                        draft.field_idx = i;
+                        draft.error = Some(format!("{label} is required"));
+                        return;
+                    }
+                }
+                (FieldKind::Number { integer, .. }, Some(FieldDraft::Text(buf))) => {
+                    let trimmed = buf.trim();
+                    if trimmed.is_empty() {
+                        if field.required {
+                            draft.field_idx = i;
+                            draft.error = Some(format!("{label} is required"));
+                            return;
+                        }
+                    } else if *integer {
+                        match trimmed.parse::<i64>() {
+                            Ok(n) => {
+                                content.insert(field.key.clone(), serde_json::json!(n));
+                            }
+                            Err(_) => {
+                                draft.field_idx = i;
+                                draft.error = Some(format!("{label} must be an integer"));
+                                return;
+                            }
+                        }
+                    } else {
+                        match trimmed.parse::<f64>() {
+                            Ok(n) if n.is_finite() => {
+                                content.insert(field.key.clone(), serde_json::json!(n));
+                            }
+                            _ => {
+                                draft.field_idx = i;
+                                draft.error = Some(format!("{label} must be a number"));
+                                return;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = self.current_mut() {
+            s.answer_question(ElicitationResponse::Accept(content));
+        }
+        self.question_draft = None;
+    }
+}
+
+/// Next field after `current` that should be visited on `Enter`. Skips optional
+/// `*_custom` companion boxes (like `claude-agent-acp`'s per-question "Other"
+/// field) so single-question forms submit on one `Enter`; users can still reach
+/// any companion field with `Tab`.
+fn next_primary_field(req: &ElicitationRequest, current: usize) -> Option<usize> {
+    ((current + 1)..req.fields.len()).find(|&i| {
+        let f = &req.fields[i];
+        !f.key.ends_with("_custom") || f.required
+    })
+}
+
+impl App {
     /// Normal mode edits the prompt vim-style; app-level commands sit behind
     /// the leader key. With no session there is no prompt, so they are direct.
     fn handle_normal(&mut self, key: KeyEvent) {
@@ -833,10 +1298,12 @@ impl App {
 
     /// Quit now, or ask first when an agent is mid-turn.
     fn request_quit(&mut self) {
-        let busy = self
-            .sessions
-            .iter()
-            .any(|s| matches!(s.status, Status::Running | Status::AwaitingPermission));
+        let busy = self.sessions.iter().any(|s| {
+            matches!(
+                s.status,
+                Status::Running | Status::AwaitingPermission | Status::AwaitingQuestion
+            )
+        });
         if busy {
             self.confirm = Some(Confirm::Quit);
         } else {
@@ -847,7 +1314,10 @@ impl App {
     /// Close the selected session, asking first if it is running or has history.
     fn request_close(&mut self) {
         let Some(s) = self.current() else { return };
-        let busy = matches!(s.status, Status::Running | Status::AwaitingPermission);
+        let busy = matches!(
+            s.status,
+            Status::Running | Status::AwaitingPermission | Status::AwaitingQuestion
+        );
         if busy || !s.entries.is_empty() {
             self.confirm = Some(Confirm::CloseSession);
         } else {
@@ -1184,6 +1654,7 @@ impl App {
                 self.scroll = 0;
                 self.clear_search();
                 self.clear_mention();
+                self.sync_question_draft();
             }
             self.sessions[i].attention = false;
             if self.sessions[i].worktree.is_some() {
@@ -1330,6 +1801,8 @@ impl App {
         }
         self.scroll = 0;
         self.clear_search();
+        self.clear_mention();
+        self.sync_question_draft();
         if self.sessions.is_empty() {
             self.mode = Mode::Normal;
         }
@@ -1351,6 +1824,8 @@ impl App {
         }
         if changed {
             self.clear_search();
+            self.clear_mention();
+            self.sync_question_draft();
         }
         self.scroll = 0;
     }
@@ -2438,5 +2913,152 @@ mod tests {
 
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn question_modal_handles_select_multi_custom_validation_decline_and_cancel() {
+        use crate::agent::acp::{QuestionField, QuestionOption};
+
+        let (tx, _rx) = mpsc::channel();
+        let store = Store::new(tempfile::tempdir().unwrap().keep());
+        let mut app = App::new(PathBuf::from("."), PathBuf::from("."), store, tx);
+        let (s, _, q_rx) = Session::detached_with_questions(0, agent::find("claude").unwrap());
+        app.sessions.push(s);
+
+        let req = ElicitationRequest {
+            message: "Configure backend".into(),
+            fields: vec![
+                QuestionField {
+                    key: "question_0".into(),
+                    title: Some("Database".into()),
+                    description: None,
+                    required: false,
+                    kind: FieldKind::SingleSelect {
+                        options: vec![
+                            QuestionOption {
+                                value: "SQLite".into(),
+                                label: "SQLite".into(),
+                                description: Some("Local".into()),
+                            },
+                            QuestionOption {
+                                value: "Postgres".into(),
+                                label: "Postgres".into(),
+                                description: Some("Server".into()),
+                            },
+                        ],
+                        default: None,
+                    },
+                },
+                QuestionField {
+                    key: "question_0_custom".into(),
+                    title: Some("Other".into()),
+                    description: None,
+                    required: false,
+                    kind: FieldKind::Text { default: None },
+                },
+                QuestionField {
+                    key: "question_1".into(),
+                    title: Some("Features".into()),
+                    description: None,
+                    required: false,
+                    kind: FieldKind::MultiSelect {
+                        options: vec![
+                            QuestionOption {
+                                value: "TLS".into(),
+                                label: "TLS".into(),
+                                description: None,
+                            },
+                            QuestionOption {
+                                value: "Metrics".into(),
+                                label: "Metrics".into(),
+                                description: None,
+                            },
+                        ],
+                        default: vec![],
+                    },
+                },
+            ],
+        };
+
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::Question(req.clone()),
+        });
+        assert_eq!(app.sessions[0].status, Status::AwaitingQuestion);
+
+        // Move to Postgres, Tab to Other and add a note, Tab to Features, toggle both, Enter submits.
+        app.handle_key(key(KeyCode::Char('2')));
+        app.handle_key(key(KeyCode::Tab));
+        type_keys(&mut app, "v16");
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Enter));
+
+        match q_rx.try_recv().unwrap() {
+            ElicitationResponse::Accept(map) => {
+                assert_eq!(map.get("question_0"), Some(&serde_json::json!("Postgres")));
+                assert_eq!(
+                    map.get("question_0_custom"),
+                    Some(&serde_json::json!("v16"))
+                );
+                assert_eq!(
+                    map.get("question_1"),
+                    Some(&serde_json::json!(["TLS", "Metrics"]))
+                );
+            }
+            other => panic!("expected Accept, got {other:?}"),
+        }
+        assert_eq!(app.sessions[0].status, Status::Running);
+
+        // Required integer field rejects invalid input and stays open until valid.
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::Question(ElicitationRequest {
+                message: "Port".into(),
+                fields: vec![QuestionField {
+                    key: "port".into(),
+                    title: Some("Port".into()),
+                    description: None,
+                    required: true,
+                    kind: FieldKind::Number {
+                        integer: true,
+                        default: None,
+                    },
+                }],
+            }),
+        });
+        type_keys(&mut app, "abc");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.sessions[0].pending_question.is_some());
+        assert!(app.question_draft.as_ref().unwrap().error.is_some());
+        assert!(q_rx.try_recv().is_err());
+
+        // Clear with Ctrl-u, enter valid integer, submit.
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_keys(&mut app, "8080");
+        app.handle_key(key(KeyCode::Enter));
+        match q_rx.try_recv().unwrap() {
+            ElicitationResponse::Accept(map) => {
+                assert_eq!(map.get("port"), Some(&serde_json::json!(8080)));
+            }
+            other => panic!("expected Accept, got {other:?}"),
+        }
+
+        // Esc cancels and `d` declines.
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::Question(req.clone()),
+        });
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(q_rx.try_recv().unwrap(), ElicitationResponse::Decline);
+
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::Question(req),
+        });
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(q_rx.try_recv().unwrap(), ElicitationResponse::Cancel);
     }
 }
