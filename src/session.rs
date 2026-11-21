@@ -9,7 +9,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::acp::{
-    AcpClient, CancelHandle, Event, ModelState, PermissionRequest, StopReason,
+    AcpClient, CancelHandle, Event, ModelState, PermissionRequest, StopReason, ToolContent,
 };
 use crate::agent::{install, AgentSpec};
 use crate::store::{self, Record};
@@ -25,6 +25,8 @@ pub enum Entry {
         title: String,
         kind: String,
         status: String,
+        #[serde(default)]
+        detail: Vec<ToolContent>,
     },
     Notice(String),
 }
@@ -295,21 +297,42 @@ impl Session {
                 title,
                 kind,
                 status,
+                content,
             } => self.entries.push(Entry::Tool {
                 id,
                 title,
                 kind,
                 status,
+                detail: content,
             }),
-            Event::ToolUpdate { id, status } => {
-                if let Some(new) = status {
+            Event::ToolUpdate {
+                id,
+                title,
+                status,
+                content,
+            } => {
+                if status.is_some() || title.is_some() || !content.is_empty() {
                     for entry in self.entries.iter_mut().rev() {
                         if let Entry::Tool {
-                            id: tid, status, ..
+                            id: tid,
+                            title: cur_title,
+                            status: cur_status,
+                            detail,
+                            ..
                         } = entry
                         {
                             if *tid == id {
-                                *status = new;
+                                if let Some(new_status) = status {
+                                    *cur_status = new_status;
+                                }
+                                if let Some(new_title) = title {
+                                    if !new_title.is_empty() {
+                                        *cur_title = new_title;
+                                    }
+                                }
+                                if !content.is_empty() {
+                                    *detail = content;
+                                }
                                 break;
                             }
                         }
@@ -418,15 +441,50 @@ mod tests {
             title: "ls".into(),
             kind: "execute".into(),
             status: "pending".into(),
+            content: vec![ToolContent::Text("running...".into())],
         }));
         s.apply(UiMsg::Event(Event::ToolUpdate {
             id: "t1".into(),
+            title: Some("ls -la".into()),
+            status: None,
+            content: vec![ToolContent::Text("Cargo.toml\nsrc".into())],
+        }));
+        // A status-only update must keep the existing detail intact.
+        s.apply(UiMsg::Event(Event::ToolUpdate {
+            id: "t1".into(),
+            title: None,
             status: Some("completed".into()),
+            content: vec![],
         }));
         assert_eq!(s.entries[0], Entry::Agent("hello".into()));
-        assert!(matches!(&s.entries[1], Entry::Tool { status, .. } if status == "completed"));
+        assert_eq!(
+            s.entries[1],
+            Entry::Tool {
+                id: "t1".into(),
+                title: "ls -la".into(),
+                kind: "execute".into(),
+                status: "completed".into(),
+                detail: vec![ToolContent::Text("Cargo.toml\nsrc".into())],
+            }
+        );
         s.apply(UiMsg::TurnDone(StopReason::EndTurn));
         assert_eq!(s.status, Status::Idle);
+    }
+
+    #[test]
+    fn old_tool_entry_without_detail_deserializes() {
+        let legacy = r#"{"Tool":{"id":"t1","title":"ls","kind":"execute","status":"completed"}}"#;
+        let entry: Entry = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            entry,
+            Entry::Tool {
+                id: "t1".into(),
+                title: "ls".into(),
+                kind: "execute".into(),
+                status: "completed".into(),
+                detail: vec![],
+            }
+        );
     }
 
     #[test]
