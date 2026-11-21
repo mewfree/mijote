@@ -68,6 +68,24 @@ impl Editor {
         self.buf.is_empty()
     }
 
+    pub fn chars(&self) -> &[char] {
+        &self.buf
+    }
+
+    pub fn cursor_index(&self) -> usize {
+        self.cur
+    }
+
+    /// Replace char range `start..end` with `s` and place the cursor after it.
+    pub fn replace_range(&mut self, start: usize, end: usize, s: &str) {
+        self.want_col = None;
+        let start = start.min(self.buf.len());
+        let end = end.clamp(start, self.buf.len());
+        let n = s.chars().count();
+        self.buf.splice(start..end, s.chars());
+        self.cur = start + n;
+    }
+
     pub fn line_count(&self) -> usize {
         self.buf.iter().filter(|&&c| c == '\n').count() + 1
     }
