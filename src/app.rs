@@ -26,6 +26,8 @@ pub enum Mode {
     Picker,
     /// Choosing a model for the current session.
     Model,
+    /// Choosing a reasoning/effort level for the current session's model.
+    Effort,
     /// Floating session list.
     Switcher,
     /// Key-binding help overlay.
@@ -147,6 +149,7 @@ pub struct App {
     /// directly in the current directory/branch (`N`).
     pub picker_isolated: bool,
     pub model_cursor: usize,
+    pub effort_cursor: usize,
     pub switcher_cursor: usize,
     /// Buffer edited while in `Mode::Rename`.
     pub rename_buf: String,
@@ -216,6 +219,7 @@ impl App {
             picker_cursor: 0,
             picker_isolated: true,
             model_cursor: 0,
+            effort_cursor: 0,
             switcher_cursor: 0,
             rename_buf: String::new(),
             rename_target: 0,
@@ -360,6 +364,7 @@ impl App {
                 self.cwd.clone(),
                 worktree,
                 rec.model,
+                rec.effort,
                 self.ui_tx.clone(),
             );
             s.key = key;
@@ -393,6 +398,7 @@ impl App {
             spec,
             self.cwd.clone(),
             worktree,
+            None,
             None,
             self.ui_tx.clone(),
         ));
@@ -486,6 +492,7 @@ impl App {
             Mode::Insert => self.handle_insert(key),
             Mode::Picker => self.handle_picker(key),
             Mode::Model => self.handle_model(key),
+            Mode::Effort => self.handle_effort(key),
             Mode::Switcher => self.handle_switcher(key),
             Mode::Help => self.handle_help(key),
             Mode::Rename => self.handle_rename(key),
@@ -556,7 +563,7 @@ impl App {
     pub fn handle_mouse(&mut self, ev: MouseEvent, area: Rect) {
         if matches!(
             self.mode,
-            Mode::Picker | Mode::Model | Mode::Switcher | Mode::Help | Mode::Rename
+            Mode::Picker | Mode::Model | Mode::Effort | Mode::Switcher | Mode::Help | Mode::Rename
         ) || self.confirm.is_some()
             || self
                 .current()
@@ -1120,6 +1127,7 @@ impl App {
             KeyCode::Char('d') => self.request_close(),
             KeyCode::Char('r') => self.open_rename(self.selected, Mode::Normal),
             KeyCode::Char('M') => self.open_models(),
+            KeyCode::Char('e') => self.open_effort(),
             KeyCode::Char('s') | KeyCode::Tab => self.open_switcher(),
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('t') => {
@@ -1458,7 +1466,7 @@ impl App {
                 if text.is_empty() {
                     return;
                 }
-                if self.slash_model(&text) {
+                if self.slash_model(&text) || self.slash_effort(&text) {
                     self.input.clear();
                     self.pastes.clear();
                     self.clear_mention();
@@ -1606,6 +1614,97 @@ impl App {
         if let Some(s) = self.current_mut() {
             if let Some(id) = s.models.available.get(i).map(|m| m.id.clone()) {
                 s.set_model(id);
+                self.mode = Mode::Normal;
+            }
+        }
+    }
+
+    /// Handle `/effort` and `/effort <level>` locally; returns whether `text`
+    /// was that command.
+    fn slash_effort(&mut self, text: &str) -> bool {
+        let Some(rest) = text.strip_prefix("/effort") else {
+            return false;
+        };
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            return false; // e.g. `/efforts`
+        }
+        let want = rest.trim();
+        if want.is_empty() {
+            self.open_effort();
+            return true;
+        }
+        let Some(s) = self.current_mut() else {
+            return true;
+        };
+        let found = s
+            .effort
+            .available
+            .iter()
+            .find(|e| e.id.eq_ignore_ascii_case(want) || e.name.eq_ignore_ascii_case(want))
+            .map(|e| e.id.clone());
+        let msg = if s.effort.available.is_empty() {
+            if s.status == Status::Starting {
+                "agent is still starting".into()
+            } else {
+                format!("{} does not offer effort selection", s.spec.name)
+            }
+        } else if !s.can_prompt() {
+            "change the effort level between turns".into()
+        } else if let Some(id) = found {
+            s.set_effort(id);
+            return true;
+        } else {
+            let names: Vec<_> = s.effort.available.iter().map(|e| e.name.as_str()).collect();
+            format!("unknown effort `{want}`; try: {}", names.join(", "))
+        };
+        self.set_message(msg);
+        true
+    }
+
+    fn open_effort(&mut self) {
+        let Some(s) = self.current() else { return };
+        if s.effort.available.is_empty() {
+            let msg = if s.status == Status::Starting {
+                "agent is still starting".into()
+            } else {
+                format!("{} does not offer effort selection", s.spec.name)
+            };
+            self.set_message(msg);
+        } else if !s.can_prompt() {
+            self.set_message("change the effort level between turns");
+        } else {
+            self.effort_cursor = s
+                .effort()
+                .and_then(|cur| s.effort.available.iter().position(|e| e.id == cur))
+                .unwrap_or(0);
+            self.mode = Mode::Effort;
+        }
+    }
+
+    fn handle_effort(&mut self, key: KeyEvent) {
+        let n = self.current().map_or(0, |s| s.effort.available.len());
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down if n > 0 => {
+                self.effort_cursor = (self.effort_cursor + 1) % n
+            }
+            KeyCode::Char('k') | KeyCode::Up if n > 0 => {
+                self.effort_cursor = (self.effort_cursor + n - 1) % n
+            }
+            KeyCode::Enter => self.choose_effort(self.effort_cursor),
+            KeyCode::Char(c) => {
+                if let Some(i) = c.to_digit(10).and_then(|d| (d as usize).checked_sub(1)) {
+                    self.choose_effort(i);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn choose_effort(&mut self, i: usize) {
+        if let Some(s) = self.current_mut() {
+            if let Some(id) = s.effort.available.get(i).map(|e| e.id.clone()) {
+                s.set_effort(id);
                 self.mode = Mode::Normal;
             }
         }
@@ -2240,6 +2339,103 @@ mod tests {
     }
 
     #[test]
+    fn effort_picker_selects_between_turns() {
+        use crate::agent::acp::{EffortInfo, EffortState};
+        let (mut app, _) = app_with_session();
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app
+            .message()
+            .unwrap()
+            .contains("does not offer effort selection"));
+
+        app.sessions[0].effort = EffortState {
+            current: Some("high".into()),
+            available: vec![
+                EffortInfo {
+                    id: "default".into(),
+                    name: "Default".into(),
+                    description: None,
+                },
+                EffortInfo {
+                    id: "medium".into(),
+                    name: "Medium".into(),
+                    description: None,
+                },
+                EffortInfo {
+                    id: "high".into(),
+                    name: "High".into(),
+                    description: Some("Deeper reasoning".into()),
+                },
+            ],
+            config_id: Some("effort".into()),
+        };
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(app.mode, Mode::Effort);
+        assert_eq!(app.effort_cursor, 2, "starts on the current effort level");
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.effort_cursor, 1);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Normal);
+
+        // Mid-turn effort change is refused with a notice.
+        app.sessions[0].status = Status::Running;
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.message(), Some("change the effort level between turns"));
+    }
+
+    #[test]
+    fn slash_effort_is_handled_locally() {
+        use crate::agent::acp::{EffortInfo, EffortState};
+        let (mut app, _) = app_with_session();
+        app.sessions[0].effort = EffortState {
+            current: Some("default".into()),
+            available: vec![
+                EffortInfo {
+                    id: "default".into(),
+                    name: "Default".into(),
+                    description: None,
+                },
+                EffortInfo {
+                    id: "low".into(),
+                    name: "Low".into(),
+                    description: None,
+                },
+                EffortInfo {
+                    id: "high".into(),
+                    name: "High".into(),
+                    description: None,
+                },
+            ],
+            config_id: Some("effort".into()),
+        };
+        let say = |app: &mut App, t: &str| {
+            app.mode = Mode::Insert;
+            app.input.set_text(t);
+            app.handle_key(key(KeyCode::Enter));
+        };
+        say(&mut app, "/effort");
+        assert_eq!(app.mode, Mode::Effort);
+        assert!(app.input.is_empty());
+        assert!(app.sessions[0].entries.is_empty(), "not sent as a prompt");
+
+        say(&mut app, "/effort nope");
+        assert!(app.message().unwrap().contains("Default, Low, High"));
+        assert_eq!(app.sessions[0].status, Status::Idle);
+
+        say(&mut app, "/effort HIGH");
+        assert!(app.sessions[0].entries.is_empty());
+
+        // Not the command: goes to the agent as a normal prompt.
+        say(&mut app, "/efforts please");
+        assert_eq!(app.sessions[0].status, Status::Running);
+    }
+
+    #[test]
     fn m_toggles_mouse_capture() {
         let (mut app, _) = app_with_session();
         assert!(app.mouse);
@@ -2595,6 +2791,7 @@ mod tests {
                     worktree: None,
                     entries: vec![Entry::User("hi".into())],
                     model: None,
+                    effort: None,
                     label: None,
                 },
             )

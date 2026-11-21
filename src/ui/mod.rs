@@ -107,6 +107,10 @@ pub fn render(f: &mut Frame, app: &App) {
         render_models(f, app);
         modal_open = true;
     }
+    if app.mode == Mode::Effort {
+        render_effort(f, app);
+        modal_open = true;
+    }
     if app.mode == Mode::Switcher {
         render_switcher(f, app);
         modal_open = true;
@@ -389,6 +393,9 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(m) = s.model_name() {
         left.push(Span::styled(format!("  · {m}"), DIM));
+    }
+    if let Some(e) = s.effort_name() {
+        left.push(Span::styled(format!("  · effort: {e}"), DIM));
     }
     f.render_widget(Paragraph::new(Line::from(left)), inner);
 
@@ -1004,6 +1011,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         Mode::Insert => (" INSERT ", OK),
         Mode::Picker => (" PICK ", ASK),
         Mode::Model => (" MODEL ", ASK),
+        Mode::Effort => (" EFFORT ", ASK),
         Mode::Switcher => (" SESSIONS ", ASK),
         Mode::Help => (" HELP ", ASK),
         Mode::Rename => (" RENAME ", ASK),
@@ -1121,6 +1129,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("d", "close"),
                 ("r", "rename"),
                 ("M", "model"),
+                ("e", "effort"),
                 ("s", "sessions"),
                 ("t", "tools"),
                 ("j/k", "select"),
@@ -1180,7 +1189,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("^A", "commands"),
                 ("Esc", "normal"),
             ],
-            Mode::Picker | Mode::Model => {
+            Mode::Picker | Mode::Model | Mode::Effort => {
                 &[("j/k", "move"), ("Enter/1-9", "choose"), ("Esc", "close")]
             }
             Mode::Switcher => &[
@@ -1512,6 +1521,51 @@ fn render_models(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+fn render_effort(f: &mut Frame, app: &App) {
+    let Some(s) = app.current() else { return };
+    let current = s.effort();
+    let has_desc = s.effort.available.iter().any(|e| e.description.is_some());
+    let width = if has_desc { 62 } else { 44 };
+    let area = centered(f.area(), width, s.effort.available.len() as u16 + 4);
+    let inner_w = area.width.saturating_sub(8) as usize;
+    let items: Vec<ListItem> = s
+        .effort
+        .available
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let mark = if current == Some(e.id.as_str()) {
+                " ✓"
+            } else {
+                ""
+            };
+            let idx = format!("{} ", i + 1);
+            let label = format!("{}{mark}", e.name);
+            let mut spans = vec![Span::styled(idx.clone(), DIM), Span::raw(label.clone())];
+            if let Some(desc) = &e.description {
+                let used = idx.chars().count() + label.chars().count() + 2;
+                let room = inner_w.saturating_sub(used);
+                if room >= 4 {
+                    spans.push(Span::styled(format!("  {}", fit(desc, room)), DIM));
+                }
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(app.effort_cursor));
+    let list = List::new(items)
+        .block(modal(
+            "effort",
+            ACCENT,
+            hint_line(&[("Enter", "choose"), ("Esc", "close")]),
+        ))
+        .highlight_symbol("▌ ")
+        .highlight_style(BOLD.fg(ACCENT).bg(SELECTED_BG));
+    f.render_widget(Clear, area);
+    f.render_stateful_widget(list, area, &mut state);
+}
+
 fn render_help(f: &mut Frame) {
     let heading = |title: &'static str| {
         Line::styled(title, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
@@ -1542,8 +1596,9 @@ fn render_help(f: &mut Frame) {
         pair("n", "new worktree", "N", "new here"),
         pair("s / Tab", "switcher", "j / k", "next / prev"),
         pair("d", "close session", "r", "rename session"),
-        pair("M", "model (/model)", "t", "tool details"),
-        pair("g / G", "top / bottom", "m", "toggle mouse"),
+        pair("M", "model (/model)", "e", "effort (/effort)"),
+        pair("t", "tool details", "m", "toggle mouse"),
+        pair("g / G", "top / bottom", "/", "search"),
         pair("?", "help", "q", "quit"),
         Line::from(""),
         heading("session & scroll"),
@@ -2882,5 +2937,60 @@ mod tests {
         assert!(screen.contains("1. ACP"), "{screen}");
         assert!(screen.contains("Standard stdio"), "{screen}");
         assert!(screen.contains("Other"), "{screen}");
+    }
+
+    #[test]
+    fn render_shows_effort_in_header_and_picker_modal() {
+        use crate::agent::acp::{EffortInfo, EffortState, ModelInfo, ModelState};
+
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.status = Status::Idle;
+        s.models = ModelState {
+            current: Some("opus".into()),
+            available: vec![ModelInfo {
+                id: "opus".into(),
+                name: "Opus".into(),
+            }],
+            config_id: Some("model".into()),
+        };
+        s.effort = EffortState {
+            current: Some("high".into()),
+            available: vec![
+                EffortInfo {
+                    id: "default".into(),
+                    name: "Default".into(),
+                    description: None,
+                },
+                EffortInfo {
+                    id: "high".into(),
+                    name: "High".into(),
+                    description: Some("Deeper reasoning".into()),
+                },
+            ],
+            config_id: Some("effort".into()),
+        };
+        app.sessions.push(s);
+
+        let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("· Opus"), "{screen}");
+        assert!(screen.contains("· effort: High"), "{screen}");
+
+        app.mode = Mode::Effort;
+        app.effort_cursor = 1;
+        term.draw(|f| render(f, &app)).unwrap();
+        let modal_screen = dump(&term);
+        assert!(modal_screen.contains("EFFORT"), "{modal_screen}");
+        assert!(modal_screen.contains("effort"), "{modal_screen}");
+        assert!(modal_screen.contains("High ✓"), "{modal_screen}");
+        assert!(modal_screen.contains("Deeper reasoning"), "{modal_screen}");
     }
 }

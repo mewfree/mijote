@@ -9,8 +9,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::acp::{
-    AcpClient, CancelHandle, ElicitationRequest, ElicitationResponse, Event, ModelState,
-    PermissionRequest, StopReason, ToolContent,
+    AcpClient, CancelHandle, EffortState, ElicitationRequest, ElicitationResponse, Event,
+    ModelState, PermissionRequest, StopReason, ToolContent,
 };
 use crate::agent::{install, AgentSpec};
 use crate::store::{self, Record};
@@ -45,9 +45,11 @@ pub enum Status {
 /// Worker -> UI messages.
 #[derive(Debug)]
 pub enum UiMsg {
-    Ready(CancelHandle, ModelState),
+    Ready(CancelHandle, ModelState, EffortState),
     /// `session/set_model` failed; the model is unchanged.
     ModelFailed(String),
+    /// Setting the effort level failed; the effort is unchanged.
+    EffortFailed(String),
     Event(Event),
     Permission(PermissionRequest),
     Question(ElicitationRequest),
@@ -67,6 +69,7 @@ pub struct Msg {
 enum WorkerCmd {
     Prompt(String),
     SetModel(String),
+    SetEffort(String),
     Quit,
 }
 
@@ -93,6 +96,10 @@ pub struct Session {
     pub models: ModelState,
     /// Model to apply once the agent is up (restored from the record).
     preferred_model: Option<String>,
+    /// Effort levels the agent advertised for the current model; empty if unsupported.
+    pub effort: EffortState,
+    /// Effort level to apply once the agent is up (restored from the record).
+    preferred_effort: Option<String>,
     cancel: Option<CancelHandle>,
     cmd_tx: Sender<WorkerCmd>,
     perm_tx: Sender<Option<String>>,
@@ -110,19 +117,22 @@ impl Session {
         cwd: PathBuf,
         worktree: Option<Worktree>,
         model: Option<String>,
+        effort: Option<String>,
         ui_tx: Sender<Msg>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (perm_tx, perm_rx) = mpsc::channel();
         let (question_tx, question_rx) = mpsc::channel();
         let dir = worktree.as_ref().map_or(cwd, |w| w.path.clone());
-        let preferred = model.clone();
+        let preferred_model = model.clone();
+        let preferred_effort = effort.clone();
         let handle = thread::spawn(move || {
             worker(
                 id,
                 spec,
                 dir,
-                preferred,
+                preferred_model,
+                preferred_effort,
                 ui_tx,
                 cmd_rx,
                 perm_rx,
@@ -133,6 +143,7 @@ impl Session {
         s.worktree = worktree;
         s.refresh_worktree_state();
         s.preferred_model = model;
+        s.preferred_effort = effort;
         s.thread = Some(handle);
         s
     }
@@ -159,6 +170,8 @@ impl Session {
             turn_started: None,
             models: ModelState::default(),
             preferred_model: None,
+            effort: EffortState::default(),
+            preferred_effort: None,
             cancel: None,
             cmd_tx,
             perm_tx,
@@ -226,6 +239,11 @@ impl Session {
                 .current
                 .clone()
                 .or_else(|| self.preferred_model.clone()),
+            effort: self
+                .effort
+                .current
+                .clone()
+                .or_else(|| self.preferred_effort.clone()),
             label: self.label.clone(),
         }
     }
@@ -256,6 +274,31 @@ impl Session {
             let name = self.models.display(&id);
             self.entries.push(Entry::Notice(format!("model: {name}")));
             self.models.current = Some(id);
+        }
+    }
+
+    /// Id of the effort level in use, if the agent reported one.
+    pub fn effort(&self) -> Option<&str> {
+        self.effort.current.as_deref()
+    }
+
+    /// Human name of the effort level in use.
+    pub fn effort_name(&self) -> Option<String> {
+        self.effort().map(|id| self.effort.display(id))
+    }
+
+    /// Ask the agent to switch effort levels (only between turns).
+    pub fn set_effort(&mut self, id: String) {
+        if self.can_prompt() && self.effort.available.iter().any(|e| e.id == id) {
+            let _ = self.cmd_tx.send(WorkerCmd::SetEffort(id));
+        }
+    }
+
+    fn note_effort(&mut self, id: String) {
+        if self.effort.current.as_deref() != Some(&id) {
+            let name = self.effort.display(&id);
+            self.entries.push(Entry::Notice(format!("effort: {name}")));
+            self.effort.current = Some(id);
         }
     }
 
@@ -333,15 +376,20 @@ impl Session {
     pub fn apply(&mut self, body: UiMsg) {
         match body {
             UiMsg::Closed(_) => {}
-            UiMsg::Ready(handle, models) => {
+            UiMsg::Ready(handle, models, effort) => {
                 self.cancel = Some(handle);
                 self.status = Status::Idle;
                 self.models = models;
                 self.preferred_model = None;
+                self.effort = effort;
+                self.preferred_effort = None;
             }
             UiMsg::ModelFailed(e) => self
                 .entries
                 .push(Entry::Notice(format!("could not change model: {e}"))),
+            UiMsg::EffortFailed(e) => self
+                .entries
+                .push(Entry::Notice(format!("could not change effort: {e}"))),
             UiMsg::Event(e) => self.apply_event(e),
             UiMsg::Permission(req) => {
                 self.pending = Some(req);
@@ -437,6 +485,33 @@ impl Session {
                 self.entries.push(Entry::Notice(format!("plan:\n{list}")));
             }
             Event::ModelChanged(id) => self.note_model(id),
+            Event::EffortChanged(id) => self.note_effort(id),
+            Event::ConfigOptionsUpdated { models, effort } => {
+                let model_updated = models.is_some();
+                if let Some(m) = models {
+                    let prev = self.models.current.clone();
+                    let next = m.current.clone();
+                    self.models = m;
+                    if let Some(id) = next {
+                        if prev.as_deref() != Some(id.as_str()) {
+                            let name = self.models.display(&id);
+                            self.entries.push(Entry::Notice(format!("model: {name}")));
+                        }
+                    }
+                }
+                let prev_effort = self.effort.current.clone();
+                let next_effort = effort.unwrap_or_default();
+                let next_effort_id = next_effort.current.clone();
+                self.effort = next_effort;
+                if let Some(id) = next_effort_id {
+                    if prev_effort.as_deref() != Some(id.as_str())
+                        && (!model_updated || prev_effort.is_some() || id != "default")
+                    {
+                        let name = self.effort.display(&id);
+                        self.entries.push(Entry::Notice(format!("effort: {name}")));
+                    }
+                }
+            }
             Event::Other(_) => {}
         }
     }
@@ -453,7 +528,8 @@ fn worker(
     id: usize,
     spec: &'static AgentSpec,
     cwd: PathBuf,
-    preferred: Option<String>,
+    preferred_model: Option<String>,
+    preferred_effort: Option<String>,
     ui_tx: Sender<Msg>,
     cmd_rx: Receiver<WorkerCmd>,
     perm_rx: Receiver<Option<String>>,
@@ -468,24 +544,55 @@ fn worker(
             .map_err(|e| e.to_string())?;
         client.initialize().map_err(|e| e.to_string())?;
         let sid = client.new_session(&cwd).map_err(|e| e.to_string())?;
-        // Re-apply a restored choice; failure just leaves the default model.
-        if let Some(want) = preferred {
+        // Re-apply a restored model first (changing models may update available
+        // effort levels), then re-apply any restored effort level.
+        if let Some(want) = preferred_model {
             let m = client.models();
             if m.current.as_deref() != Some(&want) && m.available.iter().any(|a| a.id == want) {
                 let _ = client.set_model(&sid, &want);
             }
         }
+        if let Some(want) = preferred_effort {
+            let e = client.effort();
+            if e.current.as_deref() != Some(&want) && e.available.iter().any(|a| a.id == want) {
+                let _ = client.set_effort(&sid, &want);
+            }
+        }
         send(UiMsg::Ready(
             client.cancel_handle(&sid),
             client.models().clone(),
+            client.effort().clone(),
         ));
         while let Ok(cmd) = cmd_rx.recv() {
             let text = match cmd {
                 WorkerCmd::Prompt(text) => text,
                 WorkerCmd::SetModel(id) => {
                     match client.set_model(&sid, &id) {
-                        Ok(()) => send(UiMsg::Event(Event::ModelChanged(id))),
+                        Ok(()) => {
+                            let effort = (!client.effort().available.is_empty())
+                                .then(|| client.effort().clone());
+                            send(UiMsg::Event(Event::ConfigOptionsUpdated {
+                                models: Some(client.models().clone()),
+                                effort,
+                            }));
+                        }
                         Err(e) => send(UiMsg::ModelFailed(e.to_string())),
+                    }
+                    continue;
+                }
+                WorkerCmd::SetEffort(id) => {
+                    match client.set_effort(&sid, &id) {
+                        Ok(()) => {
+                            if client.effort().available.is_empty() {
+                                send(UiMsg::Event(Event::EffortChanged(id)));
+                            } else {
+                                send(UiMsg::Event(Event::ConfigOptionsUpdated {
+                                    models: None,
+                                    effort: Some(client.effort().clone()),
+                                }));
+                            }
+                        }
+                        Err(e) => send(UiMsg::EffortFailed(e.to_string())),
                     }
                     continue;
                 }
@@ -660,6 +767,79 @@ mod tests {
         assert_eq!(
             s.record(std::path::Path::new(".")).model.as_deref(),
             Some("b")
+        );
+    }
+
+    #[test]
+    fn effort_changes_and_config_sync_update_state_and_record() {
+        use crate::agent::acp::{EffortInfo, ModelInfo};
+        let (mut s, _) = session();
+        s.models = ModelState {
+            current: Some("opus".into()),
+            available: vec![
+                ModelInfo {
+                    id: "opus".into(),
+                    name: "Opus".into(),
+                },
+                ModelInfo {
+                    id: "haiku".into(),
+                    name: "Haiku".into(),
+                },
+            ],
+            config_id: Some("model".into()),
+        };
+        s.effort = EffortState {
+            current: Some("default".into()),
+            available: vec![
+                EffortInfo {
+                    id: "default".into(),
+                    name: "Default".into(),
+                    description: None,
+                },
+                EffortInfo {
+                    id: "high".into(),
+                    name: "High".into(),
+                    description: None,
+                },
+            ],
+            config_id: Some("effort".into()),
+        };
+
+        // Re-applying current effort is a no-op.
+        s.apply(UiMsg::Event(Event::EffortChanged("default".into())));
+        assert!(s.entries.is_empty());
+
+        // Switching to high logs once and updates record.
+        s.apply(UiMsg::Event(Event::EffortChanged("high".into())));
+        assert_eq!(s.entries, vec![Entry::Notice("effort: High".into())]);
+        assert_eq!(s.effort_name().as_deref(), Some("High"));
+        assert_eq!(
+            s.record(std::path::Path::new(".")).effort.as_deref(),
+            Some("high")
+        );
+
+        // Switching to a model with no effort clears effort state and logs model.
+        s.apply(UiMsg::Event(Event::ConfigOptionsUpdated {
+            models: Some(ModelState {
+                current: Some("haiku".into()),
+                available: s.models.available.clone(),
+                config_id: Some("model".into()),
+            }),
+            effort: None,
+        }));
+        assert_eq!(s.model_name().as_deref(), Some("Haiku"));
+        assert!(s.effort.available.is_empty());
+        assert_eq!(s.effort(), None);
+        assert_eq!(
+            s.entries.last(),
+            Some(&Entry::Notice("model: Haiku".into()))
+        );
+
+        // Failure notice is logged cleanly.
+        s.apply(UiMsg::EffortFailed("rpc error".into()));
+        assert_eq!(
+            s.entries.last(),
+            Some(&Entry::Notice("could not change effort: rpc error".into()))
         );
     }
 

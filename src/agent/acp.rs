@@ -115,8 +115,16 @@ pub enum Event {
         content: Vec<ToolContent>,
     },
     Plan(Vec<String>),
-    /// The agent switched models (e.g. `/model` inside Claude Code).
+    /// The agent switched models (e.g. legacy `current_model_update`).
     ModelChanged(String),
+    /// The agent switched reasoning/effort level.
+    EffortChanged(String),
+    /// The agent pushed a refreshed `configOptions` snapshot (may update model,
+    /// effort, or available effort levels after a model switch).
+    ConfigOptionsUpdated {
+        models: Option<ModelState>,
+        effort: Option<EffortState>,
+    },
     /// An update type we don't model yet (kept so nothing is silently lost).
     Other(String),
 }
@@ -350,6 +358,88 @@ impl ModelState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortInfo {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// Reasoning / effort levels an agent advertises for the current model via the
+/// ACP `thought_level` config option. Empty `available` means the agent (or
+/// current model) offers no effort selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffortState {
+    pub current: Option<String>,
+    pub available: Vec<EffortInfo>,
+    pub config_id: Option<String>,
+}
+
+impl EffortState {
+    /// Pull the reasoning/effort select out of a `configOptions` array, if
+    /// there is one. Matches standard ACP `category: "thought_level"`, falling
+    /// back to options named `thought_level`, `effort`, or `reasoning_effort`.
+    fn from_config_options(options: &Value) -> Option<Self> {
+        let arr = options.as_array()?;
+        let opt = arr
+            .iter()
+            .find(|o| o.get("category").and_then(Value::as_str) == Some("thought_level"))
+            .or_else(|| {
+                arr.iter().find(|o| {
+                    let cat = o.get("category").and_then(Value::as_str);
+                    !matches!(cat, Some("model" | "mode"))
+                        && matches!(
+                            o.get("id").and_then(Value::as_str),
+                            Some("thought_level" | "effort" | "reasoning_effort")
+                        )
+                })
+            })?;
+        let config_id = opt.get("id").and_then(non_empty_str)?.to_string();
+        let mut available = Vec::new();
+        for v in opt.get("options").and_then(Value::as_array)? {
+            let group = v.get("options").and_then(Value::as_array);
+            for item in group.map_or(std::slice::from_ref(v), Vec::as_slice) {
+                let id = str_of(item, "value");
+                if id.is_empty() {
+                    continue;
+                }
+                let name = item
+                    .get("name")
+                    .and_then(non_empty_str)
+                    .map_or_else(|| id.clone(), str::to_string);
+                let description = item
+                    .get("description")
+                    .and_then(non_empty_str)
+                    .map(str::to_string);
+                available.push(EffortInfo {
+                    id,
+                    name,
+                    description,
+                });
+            }
+        }
+        if available.is_empty() {
+            return None;
+        }
+        Some(Self {
+            current: opt
+                .get("currentValue")
+                .and_then(non_empty_str)
+                .map(str::to_string),
+            available,
+            config_id: Some(config_id),
+        })
+    }
+
+    /// Display name for `id`, falling back to the id itself.
+    pub fn display(&self, id: &str) -> String {
+        self.available
+            .iter()
+            .find(|e| e.id == id)
+            .map_or_else(|| id.to_string(), |e| e.name.clone())
+    }
+}
+
 /// Sends `session/cancel` from any thread, even while a prompt is running.
 #[derive(Clone, Debug)]
 pub struct CancelHandle {
@@ -385,6 +475,7 @@ pub struct AcpClient {
     rx: Receiver<Value>,
     next_id: u64,
     models: ModelState,
+    effort: EffortState,
     embedded_context: bool,
 }
 
@@ -417,6 +508,7 @@ impl AcpClient {
             rx,
             next_id: 0,
             models: ModelState::default(),
+            effort: EffortState::default(),
             embedded_context: false,
         })
     }
@@ -468,7 +560,19 @@ impl AcpClient {
                 // Notification.
                 (Some("session/update"), None) => {
                     if let Some(update) = msg.pointer("/params/update") {
-                        on_event(parse_update(update));
+                        let ev = parse_update(update);
+                        match &ev {
+                            Event::ModelChanged(id) => self.models.current = Some(id.clone()),
+                            Event::EffortChanged(id) => self.effort.current = Some(id.clone()),
+                            Event::ConfigOptionsUpdated { models, effort } => {
+                                if let Some(m) = models {
+                                    self.models = m.clone();
+                                }
+                                self.effort = effort.clone().unwrap_or_default();
+                            }
+                            _ => {}
+                        }
+                        on_event(ev);
                     }
                 }
                 // Agent->client request.
@@ -546,11 +650,17 @@ impl AcpClient {
             "session/new",
             json!({"cwd": cwd.to_string_lossy(), "mcpServers": []}),
         )?;
-        if let Some(m) = result
-            .get("configOptions")
-            .and_then(ModelState::from_config_options)
-        {
-            self.models = m;
+        self.models = ModelState::default();
+        self.effort = EffortState::default();
+        if let Some(opts) = result.get("configOptions") {
+            if let Some(m) = ModelState::from_config_options(opts) {
+                self.models = m;
+            } else if let Some(models) = result.get("models") {
+                self.models = ModelState::parse(models);
+            }
+            if let Some(e) = EffortState::from_config_options(opts) {
+                self.effort = e;
+            }
         } else if let Some(models) = result.get("models") {
             self.models = ModelState::parse(models);
         }
@@ -566,20 +676,73 @@ impl AcpClient {
         &self.models
     }
 
+    /// Effort levels the agent advertised for the current model (empty if none).
+    pub fn effort(&self) -> &EffortState {
+        &self.effort
+    }
+
+    fn sync_config_options(
+        &mut self,
+        opts: &Value,
+        fallback_model: Option<&str>,
+        fallback_effort: Option<&str>,
+    ) {
+        if let Some(m) = ModelState::from_config_options(opts) {
+            self.models = m;
+        } else if let Some(id) = fallback_model {
+            self.models.current = Some(id.to_string());
+        }
+        if let Some(e) = EffortState::from_config_options(opts) {
+            self.effort = e;
+        } else if let Some(id) = fallback_effort {
+            self.effort.current = Some(id.to_string());
+        } else {
+            self.effort = EffortState::default();
+        }
+    }
+
     /// Switch the session's model. Agents that do not support it answer with
     /// an RPC error, which the caller reports.
     pub fn set_model(&mut self, session_id: &str, model_id: &str) -> Result<(), AcpError> {
         match self.models.config_id.clone() {
-            Some(config_id) => self.call_quiet(
-                "session/set_config_option",
-                json!({"sessionId": session_id, "configId": config_id, "value": model_id}),
-            )?,
-            None => self.call_quiet(
-                "session/set_model",
-                json!({"sessionId": session_id, "modelId": model_id}),
-            )?,
+            Some(config_id) => {
+                let result = self.call_quiet(
+                    "session/set_config_option",
+                    json!({"sessionId": session_id, "configId": config_id, "value": model_id}),
+                )?;
+                if let Some(opts) = result.get("configOptions") {
+                    self.sync_config_options(opts, Some(model_id), None);
+                } else {
+                    self.models.current = Some(model_id.to_string());
+                }
+            }
+            None => {
+                self.call_quiet(
+                    "session/set_model",
+                    json!({"sessionId": session_id, "modelId": model_id}),
+                )?;
+                self.models.current = Some(model_id.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Switch the session's reasoning/effort level via `session/set_config_option`.
+    pub fn set_effort(&mut self, session_id: &str, effort_id: &str) -> Result<(), AcpError> {
+        let Some(config_id) = self.effort.config_id.clone() else {
+            return Err(AcpError::Protocol(
+                "agent does not offer effort selection".into(),
+            ));
         };
-        self.models.current = Some(model_id.to_string());
+        let result = self.call_quiet(
+            "session/set_config_option",
+            json!({"sessionId": session_id, "configId": config_id, "value": effort_id}),
+        )?;
+        if let Some(opts) = result.get("configOptions") {
+            self.sync_config_options(opts, None, Some(effort_id));
+        } else {
+            self.effort.current = Some(effort_id.to_string());
+        }
         Ok(())
     }
 
@@ -732,12 +895,11 @@ fn parse_update(u: &Value) -> Event {
                 .map(|es| es.iter().map(|e| str_of(e, "content")).collect())
                 .unwrap_or_default(),
         ),
-        "config_option_update" => match u
-            .get("configOptions")
-            .and_then(ModelState::from_config_options)
-            .and_then(|m| m.current)
-        {
-            Some(id) => Event::ModelChanged(id),
+        "config_option_update" => match u.get("configOptions").filter(|v| v.is_array()) {
+            Some(opts) => Event::ConfigOptionsUpdated {
+                models: ModelState::from_config_options(opts),
+                effort: EffortState::from_config_options(opts),
+            },
             None => Event::Other(kind),
         },
         "current_model_update" => Event::ModelChanged(str_of(u, "currentModelId")),
@@ -1151,8 +1313,157 @@ case "$l" in *'"modelId":"b"'*) echo '{"jsonrpc":"2.0","id":2,"result":{}}';; *)
         assert_eq!(m.display("opus"), "Opus");
         assert_eq!(m.available.len(), 2);
         let u = json!({"sessionUpdate": "config_option_update", "configOptions": opts});
-        assert_eq!(parse_update(&u), Event::ModelChanged("opus".into()));
+        assert_eq!(
+            parse_update(&u),
+            Event::ConfigOptionsUpdated {
+                models: Some(m),
+                effort: None,
+            }
+        );
         assert!(ModelState::from_config_options(&json!([])).is_none());
+    }
+
+    #[test]
+    fn effort_as_config_option_supports_category_and_id_fallbacks() {
+        let claude_opts = json!([
+            {"id": "model", "category": "model", "type": "select", "currentValue": "opus",
+             "options": [{"value": "opus", "name": "Opus"}]},
+            {"id": "effort", "category": "thought_level", "type": "select", "currentValue": "high",
+             "options": [
+                {"value": "default", "name": "Default"},
+                {"value": "low", "name": "Low", "description": "Fast replies"},
+                {"value": "high", "name": "High"}
+             ]}
+        ]);
+        let e = EffortState::from_config_options(&claude_opts).unwrap();
+        assert_eq!(e.current.as_deref(), Some("high"));
+        assert_eq!(e.config_id.as_deref(), Some("effort"));
+        assert_eq!(e.display("high"), "High");
+        assert_eq!(e.available.len(), 3);
+        assert_eq!(e.available[1].description.as_deref(), Some("Fast replies"));
+
+        // Fallback by id when category is omitted (e.g. codex-acp reasoning_effort)
+        let codex_opts = json!([
+            {"id": "reasoning_effort", "type": "select", "currentValue": "medium",
+             "options": [
+                {"group": "levels", "options": [
+                    {"value": "low", "name": "Low"},
+                    {"value": "medium", "name": "Medium"},
+                    {"value": "xhigh", "name": "Extra High"}
+                ]}
+             ]}
+        ]);
+        let ce = EffortState::from_config_options(&codex_opts).unwrap();
+        assert_eq!(ce.config_id.as_deref(), Some("reasoning_effort"));
+        assert_eq!(ce.current.as_deref(), Some("medium"));
+        assert_eq!(ce.display("xhigh"), "Extra High");
+
+        let u = json!({"sessionUpdate": "config_option_update", "configOptions": claude_opts});
+        assert_eq!(
+            parse_update(&u),
+            Event::ConfigOptionsUpdated {
+                models: ModelState::from_config_options(&claude_opts),
+                effort: Some(e),
+            }
+        );
+        assert!(EffortState::from_config_options(&json!([])).is_none());
+    }
+
+    #[test]
+    fn effort_set_and_model_switch_sync_config_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"
+import json, sys
+
+model = "opus"
+effort = "default"
+
+def config_options():
+    opts = [
+        {"id": "model", "category": "model", "type": "select", "currentValue": model,
+         "options": [
+             {"value": "opus", "name": "Opus"},
+             {"value": "haiku", "name": "Haiku"},
+             {"value": "sonnet", "name": "Sonnet"},
+         ]}
+    ]
+    if model == "opus":
+        opts.append({
+            "id": "effort", "category": "thought_level", "type": "select", "currentValue": effort,
+            "options": [
+                {"value": "default", "name": "Default"},
+                {"value": "high", "name": "High"},
+                {"value": "max", "name": "Max"},
+            ]
+        })
+    elif model == "sonnet":
+        opts.append({
+            "id": "effort", "category": "thought_level", "type": "select",
+            "currentValue": "medium" if effort == "max" else effort,
+            "options": [
+                {"value": "default", "name": "Default"},
+                {"value": "medium", "name": "Medium"},
+                {"value": "high", "name": "High"},
+            ]
+        })
+    return opts
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    m, mid = msg.get("method"), msg.get("id")
+    if m == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":1,"agentInfo":{"name":"fake"}}}), flush=True)
+    elif m == "session/new":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"sessionId":"s1","configOptions":config_options()}}), flush=True)
+    elif m == "session/set_config_option":
+        cid = msg["params"]["configId"]
+        val = msg["params"]["value"]
+        if cid == "effort":
+            effort = val
+        elif cid == "model":
+            model = val
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"configOptions":config_options()}}), flush=True)
+    elif m == "session/prompt":
+        effort = "high"
+        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"s1",
+            "update":{"sessionUpdate":"config_option_update","configOptions":config_options()}
+        }}), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"stopReason":"end_turn"}}), flush=True)
+"#;
+        let mut c = AcpClient::spawn("python3", &["-c", script], dir.path()).unwrap();
+        c.initialize().unwrap();
+        let sid = c.new_session(dir.path()).unwrap();
+        assert_eq!(c.models().current.as_deref(), Some("opus"));
+        assert_eq!(c.effort().current.as_deref(), Some("default"));
+        assert_eq!(c.effort().available.len(), 3);
+
+        c.set_effort(&sid, "max").unwrap();
+        assert_eq!(c.effort().current.as_deref(), Some("max"));
+
+        // Switching to Haiku (no effort support) clears available effort options.
+        c.set_model(&sid, "haiku").unwrap();
+        assert_eq!(c.models().current.as_deref(), Some("haiku"));
+        assert!(c.effort().available.is_empty());
+        assert!(c.set_effort(&sid, "high").is_err());
+
+        // Switching to Sonnet repopulates effort with Sonnet's levels (clamped from max -> medium).
+        c.set_model(&sid, "sonnet").unwrap();
+        assert_eq!(c.models().current.as_deref(), Some("sonnet"));
+        assert_eq!(c.effort().current.as_deref(), Some("medium"));
+        assert_eq!(c.effort().available.len(), 3);
+
+        // Mid-turn config_option_update syncs AcpClient and delivers Event::ConfigOptionsUpdated.
+        let mut events = Vec::new();
+        c.prompt(&sid, "hi", |e| events.push(e), |_| None).unwrap();
+        assert_eq!(c.effort().current.as_deref(), Some("high"));
+        assert!(matches!(
+            events.first(),
+            Some(Event::ConfigOptionsUpdated {
+                effort: Some(e),
+                ..
+            }) if e.current.as_deref() == Some("high")
+        ));
     }
 
     #[test]

@@ -47,6 +47,9 @@ enum Command {
         agent: String,
         /// The prompt
         prompt: String,
+        /// Model reasoning/effort level (e.g. low, medium, high, max)
+        #[arg(short, long)]
+        effort: Option<String>,
     },
 }
 
@@ -56,7 +59,11 @@ fn main() -> Result<()> {
         Command::Tui { resume } => tui(cli.resume || resume),
         Command::Agents => list_agents(),
         Command::Install { agent } => install(&agent),
-        Command::Ask { agent, prompt } => ask(&agent, &prompt),
+        Command::Ask {
+            agent,
+            prompt,
+            effort,
+        } => ask(&agent, &prompt, effort.as_deref()),
     }
 }
 
@@ -95,7 +102,7 @@ fn install(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn ask(id: &str, prompt: &str) -> Result<()> {
+fn ask(id: &str, prompt: &str, effort: Option<&str>) -> Result<()> {
     let (spec, program) = resolve(id)?;
     let cwd = std::env::current_dir()?;
     let mut client = AcpClient::spawn(&program.to_string_lossy(), spec.args, &cwd)
@@ -103,6 +110,22 @@ fn ask(id: &str, prompt: &str) -> Result<()> {
     let name = client.initialize()?;
     eprintln!("connected to {name}");
     let session = client.new_session(&cwd)?;
+    if let Some(want) = effort {
+        let state = client.effort();
+        if state.available.is_empty() {
+            bail!("{} does not offer effort selection", spec.name);
+        }
+        let Some(chosen) = state
+            .available
+            .iter()
+            .find(|e| e.id.eq_ignore_ascii_case(want) || e.name.eq_ignore_ascii_case(want))
+            .map(|e| e.id.clone())
+        else {
+            let names: Vec<_> = state.available.iter().map(|e| e.name.as_str()).collect();
+            bail!("unknown effort `{want}`; try: {}", names.join(", "));
+        };
+        client.set_effort(&session, &chosen)?;
+    }
 
     let blocks = files::expand_mentions(prompt, &cwd, client.supports_embedded_context());
     let stop = client.prompt_blocks(
@@ -370,5 +393,25 @@ mod tests {
 
         let cli = Cli::try_parse_from(["mijote", "tui", "--resume"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Tui { resume: true })));
+
+        let cli =
+            Cli::try_parse_from(["mijote", "ask", "claude", "--effort", "high", "hi"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ask {
+                agent,
+                prompt,
+                effort: Some(e),
+            }) if agent == "claude" && prompt == "hi" && e == "high"
+        ));
+
+        let cli = Cli::try_parse_from(["mijote", "ask", "-e", "low", "claude", "hi"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Ask {
+                effort: Some(e),
+                ..
+            }) if e == "low"
+        ));
     }
 }

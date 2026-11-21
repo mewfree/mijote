@@ -51,6 +51,7 @@ App commands sit behind a leader, =Space= in normal mode or =Ctrl-a= anywhere
 | =j= / =k=   | next / previous session                           |
 | =g= / =G=   | top / bottom of transcript (also =Home= / =End=)  |
 | =M=         | model picker (also =/model= in the prompt)        |
+| =e=         | effort picker (also =/effort= in the prompt)      |
 | =m=         | toggle mouse capture                              |
 | =q=         | quit                                              |
 
