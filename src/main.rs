@@ -14,7 +14,7 @@ use std::io::Write;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use agent::acp::{AcpClient, Event, StopReason};
+use agent::acp::{AcpClient, ElicitationResponse, Event, FieldKind, StopReason};
 
 #[derive(Parser)]
 #[command(name = "mijote", version, about)]
@@ -134,6 +134,102 @@ fn ask(id: &str, prompt: &str) -> Result<()> {
             std::io::stdin().read_line(&mut line).ok()?;
             let n: usize = line.trim().parse().ok()?;
             req.options.get(n.checked_sub(1)?).map(|o| o.id.clone())
+        },
+        |req| {
+            eprintln!("\nquestion: {}", req.message);
+            let mut content = serde_json::Map::new();
+            for field in &req.fields {
+                if let Some(t) = &field.title {
+                    eprintln!("  {t}");
+                }
+                if let Some(d) = &field.description {
+                    eprintln!("  {d}");
+                }
+                match &field.kind {
+                    FieldKind::SingleSelect { options, .. } => {
+                        for (i, o) in options.iter().enumerate() {
+                            eprintln!("    {}) {}", i + 1, o.label);
+                        }
+                        eprint!("  choice (empty = skip): ");
+                        let mut line = String::new();
+                        if std::io::stdin().read_line(&mut line).is_err() {
+                            return ElicitationResponse::Cancel;
+                        }
+                        if let Ok(n) = line.trim().parse::<usize>() {
+                            if let Some(opt) = n.checked_sub(1).and_then(|i| options.get(i)) {
+                                content.insert(
+                                    field.key.clone(),
+                                    serde_json::Value::String(opt.value.clone()),
+                                );
+                            }
+                        }
+                    }
+                    FieldKind::MultiSelect { options, .. } => {
+                        for (i, o) in options.iter().enumerate() {
+                            eprintln!("    {}) {}", i + 1, o.label);
+                        }
+                        eprint!("  choices (comma-separated numbers, empty = skip): ");
+                        let mut line = String::new();
+                        if std::io::stdin().read_line(&mut line).is_err() {
+                            return ElicitationResponse::Cancel;
+                        }
+                        let picked: Vec<serde_json::Value> = line
+                            .split(',')
+                            .filter_map(|p| p.trim().parse::<usize>().ok())
+                            .filter_map(|n| n.checked_sub(1).and_then(|i| options.get(i)))
+                            .map(|o| serde_json::Value::String(o.value.clone()))
+                            .collect();
+                        if !picked.is_empty() {
+                            content.insert(field.key.clone(), serde_json::Value::Array(picked));
+                        }
+                    }
+                    FieldKind::Bool { .. } => {
+                        eprint!("  yes/no (empty = skip): ");
+                        let mut line = String::new();
+                        if std::io::stdin().read_line(&mut line).is_err() {
+                            return ElicitationResponse::Cancel;
+                        }
+                        match line.trim().to_ascii_lowercase().as_str() {
+                            "y" | "yes" | "true" | "1" => {
+                                content.insert(field.key.clone(), serde_json::Value::Bool(true));
+                            }
+                            "n" | "no" | "false" | "0" => {
+                                content.insert(field.key.clone(), serde_json::Value::Bool(false));
+                            }
+                            _ => {}
+                        }
+                    }
+                    FieldKind::Text { .. } | FieldKind::Number { .. } => {
+                        eprint!("  answer (empty = skip): ");
+                        let mut line = String::new();
+                        if std::io::stdin().read_line(&mut line).is_err() {
+                            return ElicitationResponse::Cancel;
+                        }
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            match &field.kind {
+                                FieldKind::Number { integer: true, .. } => {
+                                    if let Ok(v) = trimmed.parse::<i64>() {
+                                        content.insert(field.key.clone(), serde_json::json!(v));
+                                    }
+                                }
+                                FieldKind::Number { integer: false, .. } => {
+                                    if let Ok(v) = trimmed.parse::<f64>() {
+                                        content.insert(field.key.clone(), serde_json::json!(v));
+                                    }
+                                }
+                                _ => {
+                                    content.insert(
+                                        field.key.clone(),
+                                        serde_json::Value::String(trimmed.to_string()),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ElicitationResponse::Accept(content)
         },
     )?;
     println!();

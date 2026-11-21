@@ -19,9 +19,9 @@ use ratatui::Frame;
 
 mod markdown;
 
-use crate::agent::acp::ToolContent;
+use crate::agent::acp::{ElicitationRequest, FieldKind, ToolContent};
 use crate::agent::install::AgentStatus;
-use crate::app::{App, Confirm, MentionPopup, Mode};
+use crate::app::{App, Confirm, FieldDraft, MentionPopup, Mode, QuestionDraft};
 use crate::session::{Entry, Session, Status};
 
 /// A clickable markdown hyperlink on the current screen, in terminal cells.
@@ -122,6 +122,9 @@ pub fn render(f: &mut Frame, app: &App) {
     if let Some(s) = app.current() {
         if s.pending.is_some() {
             render_permission(f, s);
+            modal_open = true;
+        } else if let Some(req) = &s.pending_question {
+            render_question(f, app, s, req);
             modal_open = true;
         }
     }
@@ -264,7 +267,7 @@ fn status_glyph(s: Status) -> (&'static str, Color) {
         Status::Starting => ("◌", WARN),
         Status::Idle => ("●", OK),
         Status::Running => ("●", ACCENT),
-        Status::AwaitingPermission => ("◆", ASK),
+        Status::AwaitingPermission | Status::AwaitingQuestion => ("◆", ASK),
         Status::Failed => ("✗", ERR),
     }
 }
@@ -275,6 +278,7 @@ fn status_label(s: &Session) -> (String, Color) {
         Status::Idle => ("idle".into(), OK),
         Status::Running => (format!("working {}", elapsed(s)), ACCENT),
         Status::AwaitingPermission => ("needs permission".into(), ASK),
+        Status::AwaitingQuestion => ("needs answer".into(), ASK),
         Status::Failed => ("failed".into(), ERR),
     }
 }
@@ -393,14 +397,25 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         .sessions
         .iter()
         .enumerate()
-        .filter(|(i, s)| *i != app.selected && s.status == Status::AwaitingPermission)
+        .filter(|(i, s)| {
+            *i != app.selected
+                && matches!(
+                    s.status,
+                    Status::AwaitingPermission | Status::AwaitingQuestion
+                )
+        })
         .count();
     let done = app
         .sessions
         .iter()
         .enumerate()
         .filter(|(i, s)| {
-            *i != app.selected && s.attention && s.status != Status::AwaitingPermission
+            *i != app.selected
+                && s.attention
+                && !matches!(
+                    s.status,
+                    Status::AwaitingPermission | Status::AwaitingQuestion
+                )
         })
         .count();
     let mut right = Vec::new();
@@ -688,6 +703,10 @@ fn activity_line(s: &Session) -> Option<Line<'static>> {
         ])),
         Status::AwaitingPermission => Some(Line::styled(
             "  ◆ waiting for your permission",
+            Style::new().fg(ASK),
+        )),
+        Status::AwaitingQuestion => Some(Line::styled(
+            "  ◆ waiting for your answer",
             Style::new().fg(ASK),
         )),
         _ => None,
@@ -1001,7 +1020,8 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         Span::raw("  "),
     ];
     let has_pending_perm = app.current().is_some_and(|s| s.pending.is_some());
-    if app.mode == Mode::Search && !has_pending_perm {
+    let has_pending_question = app.current().is_some_and(|s| s.pending_question.is_some());
+    if app.mode == Mode::Search && !has_pending_perm && !has_pending_question {
         let prefix_w: u16 = spans
             .iter()
             .map(|s| crate::selection::text_width(s.content.as_ref()))
@@ -1035,7 +1055,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
     if !pending.is_empty() {
         spans.push(Span::styled(format!("{pending}  "), Style::new().fg(WARN)));
     }
-    if !app.leader && app.confirm.is_none() && app.current().is_none_or(|s| s.pending.is_none()) {
+    if !app.leader && app.confirm.is_none() && !has_pending_perm && !has_pending_question {
         if let Some(m) = app.message() {
             spans.push(Span::styled(m, Style::new().fg(WARN)));
             f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1047,6 +1067,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         && !app.leader
         && app.confirm.is_none()
         && !has_pending_perm
+        && !has_pending_question
         && app.mode == Mode::Normal
     {
         spans.push(Span::styled(
@@ -1063,6 +1084,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             && !app.leader
             && app.confirm.is_none()
             && !has_pending_perm
+            && !has_pending_question
             && app.mode == Mode::Insert
         {
             spans.push(Span::styled(
@@ -1072,14 +1094,24 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             spans.push(search_count_span(app));
             spans.push(Span::raw("  "));
         }
-        let busy = app
-            .current()
-            .is_some_and(|s| matches!(s.status, Status::Running | Status::AwaitingPermission));
+        let busy = app.current().is_some_and(|s| {
+            matches!(
+                s.status,
+                Status::Running | Status::AwaitingPermission | Status::AwaitingQuestion
+            )
+        });
         let hints: &[(&'static str, &'static str)] = match app.mode {
             _ if has_pending_perm => &[
                 ("a", "allow"),
                 ("r", "reject"),
                 ("1-9", "choose"),
+                ("Esc", "cancel"),
+            ],
+            _ if has_pending_question => &[
+                ("↑/↓", "option"),
+                ("Space", "toggle"),
+                ("Tab", "field"),
+                ("Enter", "next/submit"),
                 ("Esc", "cancel"),
             ],
             _ if app.confirm.is_some() => &[("y", "confirm"), ("any other key", "cancel")],
@@ -1302,7 +1334,10 @@ fn render_switcher(f: &mut Frame, app: &App) {
         .enumerate()
         .map(|(i, s)| {
             let (g, c) = status_glyph(s.status);
-            let (glyph, glyph_style) = if s.status == Status::AwaitingPermission {
+            let (glyph, glyph_style) = if matches!(
+                s.status,
+                Status::AwaitingPermission | Status::AwaitingQuestion
+            ) {
                 ("◆", Style::new().fg(ASK).add_modifier(Modifier::BOLD))
             } else if s.attention {
                 ("★", Style::new().fg(OK).add_modifier(Modifier::BOLD))
@@ -1318,6 +1353,11 @@ fn render_switcher(f: &mut Frame, app: &App) {
             let trailing: Option<(String, Style)> = if s.status == Status::AwaitingPermission {
                 Some((
                     "◆ needs permission".into(),
+                    Style::new().fg(ASK).add_modifier(Modifier::BOLD),
+                ))
+            } else if s.status == Status::AwaitingQuestion {
+                Some((
+                    "◆ needs answer".into(),
                     Style::new().fg(ASK).add_modifier(Modifier::BOLD),
                 ))
             } else if s.attention {
@@ -1825,6 +1865,254 @@ fn render_permission(f: &mut Frame, s: &Session) {
         Paragraph::new(lines).block(modal("permission requested", ASK, hint)),
         area,
     );
+}
+
+fn render_question(f: &mut Frame, app: &App, s: &Session, req: &ElicitationRequest) {
+    let fallback;
+    let draft = match &app.question_draft {
+        Some(d) if d.session_id == s.id && d.values.len() == req.fields.len() => d,
+        _ => {
+            fallback = QuestionDraft::from_request(s.id, req);
+            &fallback
+        }
+    };
+
+    let max_w = f.area().width.saturating_sub(4).clamp(44, 80);
+    let inner_w = max_w.saturating_sub(6) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut focus_line: usize = 0;
+    let mut text_cursor: Option<(usize, u16)> = None;
+
+    if !req.message.is_empty() {
+        for l in wrap(&req.message, inner_w) {
+            lines.push(Line::styled(l, BOLD));
+        }
+    }
+
+    for (fi, field) in req.fields.iter().enumerate() {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        let active = fi == draft.field_idx;
+        let gutter = if active {
+            Span::styled("▎ ", Style::new().fg(ACCENT))
+        } else {
+            Span::raw("  ")
+        };
+        let body_w = inner_w.saturating_sub(2).max(1);
+
+        if let Some(title) = &field.title {
+            let mut spans = vec![gutter.clone()];
+            spans.push(Span::styled(
+                fit(title, body_w.saturating_sub(2)),
+                if active { BOLD.fg(ACCENT) } else { BOLD },
+            ));
+            if field.required {
+                spans.push(Span::styled(" *", Style::new().fg(ERR)));
+            }
+            lines.push(Line::from(spans));
+        }
+        if let Some(desc) = &field.description {
+            for l in wrap(desc, body_w) {
+                lines.push(Line::from(vec![gutter.clone(), Span::styled(l, DIM)]));
+            }
+        }
+
+        match (&field.kind, draft.values.get(fi)) {
+            (FieldKind::SingleSelect { options, .. }, Some(FieldDraft::Single(sel))) => {
+                for (oi, opt) in options.iter().enumerate() {
+                    let focused = active && oi == draft.option_idx;
+                    if focused {
+                        focus_line = lines.len();
+                    }
+                    let picked = *sel == Some(oi);
+                    let mark = if picked { "◉ " } else { "○ " };
+                    let row_bg = if focused {
+                        Style::new().bg(SELECTED_BG)
+                    } else {
+                        Style::new()
+                    };
+                    let mark_style = if picked {
+                        Style::new().fg(OK).add_modifier(Modifier::BOLD)
+                    } else if focused {
+                        Style::new().fg(ACCENT)
+                    } else {
+                        DIM
+                    };
+                    let mut spans = vec![
+                        gutter.clone(),
+                        Span::styled(mark, mark_style.patch(row_bg)),
+                        Span::styled(format!("{}. ", oi + 1), DIM.patch(row_bg)),
+                        Span::styled(
+                            opt.label.clone(),
+                            if focused { BOLD.patch(row_bg) } else { row_bg },
+                        ),
+                    ];
+                    if let Some(desc) = &opt.description {
+                        let used =
+                            2 + 2 + format!("{}. ", oi + 1).len() + opt.label.chars().count();
+                        let rem = inner_w.saturating_sub(used + 3);
+                        if rem >= 8 {
+                            spans.push(Span::styled(
+                                format!(" — {}", fit(desc, rem)),
+                                DIM.patch(row_bg),
+                            ));
+                        }
+                    }
+                    lines.push(Line::from(spans));
+                }
+            }
+            (FieldKind::MultiSelect { options, .. }, Some(FieldDraft::Multi(checks))) => {
+                for (oi, opt) in options.iter().enumerate() {
+                    let focused = active && oi == draft.option_idx;
+                    if focused {
+                        focus_line = lines.len();
+                    }
+                    let checked = checks.get(oi).copied().unwrap_or(false);
+                    let mark = if checked { "[x] " } else { "[ ] " };
+                    let row_bg = if focused {
+                        Style::new().bg(SELECTED_BG)
+                    } else {
+                        Style::new()
+                    };
+                    let mark_style = if checked {
+                        Style::new().fg(OK).add_modifier(Modifier::BOLD)
+                    } else if focused {
+                        Style::new().fg(ACCENT)
+                    } else {
+                        DIM
+                    };
+                    let mut spans = vec![
+                        gutter.clone(),
+                        Span::styled(mark, mark_style.patch(row_bg)),
+                        Span::styled(format!("{}. ", oi + 1), DIM.patch(row_bg)),
+                        Span::styled(
+                            opt.label.clone(),
+                            if focused { BOLD.patch(row_bg) } else { row_bg },
+                        ),
+                    ];
+                    if let Some(desc) = &opt.description {
+                        let used =
+                            2 + 4 + format!("{}. ", oi + 1).len() + opt.label.chars().count();
+                        let rem = inner_w.saturating_sub(used + 3);
+                        if rem >= 8 {
+                            spans.push(Span::styled(
+                                format!(" — {}", fit(desc, rem)),
+                                DIM.patch(row_bg),
+                            ));
+                        }
+                    }
+                    lines.push(Line::from(spans));
+                }
+            }
+            (FieldKind::Bool { .. }, Some(FieldDraft::Bool(val))) => {
+                if active {
+                    focus_line = lines.len();
+                }
+                let row_bg = if active {
+                    Style::new().bg(SELECTED_BG)
+                } else {
+                    Style::new()
+                };
+                let (mark, label, color) = if *val {
+                    ("[x] ", "yes", OK)
+                } else {
+                    ("[ ] ", "no", Color::DarkGray)
+                };
+                lines.push(Line::from(vec![
+                    gutter.clone(),
+                    Span::styled(
+                        mark,
+                        Style::new()
+                            .fg(color)
+                            .add_modifier(Modifier::BOLD)
+                            .patch(row_bg),
+                    ),
+                    Span::styled(label, if active { BOLD.patch(row_bg) } else { row_bg }),
+                ]));
+            }
+            (FieldKind::Text { .. } | FieldKind::Number { .. }, Some(FieldDraft::Text(buf))) => {
+                let line_idx = lines.len();
+                if active {
+                    focus_line = line_idx;
+                }
+                let room = body_w.saturating_sub(3).max(1);
+                let len = buf.chars().count();
+                let off = (len + 1).saturating_sub(room);
+                let visible: String = buf.chars().skip(off).collect();
+                let prompt_style = if active { Style::new().fg(ACCENT) } else { DIM };
+                if buf.is_empty() && !active {
+                    let ph = match field.kind {
+                        FieldKind::Number { integer: true, .. } => "integer (optional)",
+                        FieldKind::Number { integer: false, .. } => "number (optional)",
+                        _ if field.required => "type answer…",
+                        _ => "type custom answer (optional)…",
+                    };
+                    lines.push(Line::from(vec![
+                        gutter.clone(),
+                        Span::styled("› ", prompt_style),
+                        Span::styled(ph, DIM),
+                    ]));
+                } else {
+                    lines.push(Line::from(vec![
+                        gutter.clone(),
+                        Span::styled("› ", prompt_style),
+                        Span::raw(visible),
+                    ]));
+                }
+                if active {
+                    let col = 4 + (len - off) as u16;
+                    text_cursor = Some((line_idx, col));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(err) = &draft.error {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(format!("  {err}"), Style::new().fg(ERR)));
+    }
+
+    let hint = hint_line(&[
+        ("↑/↓", "move"),
+        ("Space", "toggle"),
+        ("Tab", "field"),
+        ("Enter", "submit"),
+        ("Esc", "cancel"),
+    ]);
+    let min_w = (hint.width() as u16 + 4).max(56).min(max_w);
+    let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let w = (content_w + 6).clamp(min_w, max_w);
+    let max_h = f.area().height.saturating_sub(4).max(7);
+    let h = (lines.len() as u16 + 4).min(max_h);
+    let area = centered(f.area(), w, h);
+    let block = modal("question", ASK, hint);
+    let inner = block.inner(area);
+
+    let scroll_y = if focus_line >= inner.height as usize {
+        (focus_line + 1 - inner.height as usize) as u16
+    } else {
+        0
+    };
+
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).scroll((scroll_y, 0)).block(block),
+        area,
+    );
+
+    if let Some((line_idx, col)) = text_cursor {
+        let rel_y = line_idx.saturating_sub(scroll_y as usize) as u16;
+        if rel_y < inner.height {
+            let cx = inner.x.saturating_add(col);
+            if cx < inner.right() {
+                let pos = (cx, inner.y.saturating_add(rel_y));
+                f.set_cursor_position(pos);
+                app.cursor_pos.set(Some(pos));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2522,5 +2810,77 @@ mod tests {
         assert!(screen.contains("@ma"), "{screen}");
         assert!(screen.contains("src/main.rs"), "{screen}");
         assert!(screen.contains("Tab/Enter insert"), "{screen}");
+    }
+
+    #[test]
+    fn render_shows_question_modal_options_and_background_badge() {
+        use crate::agent::acp::{QuestionField, QuestionOption};
+        use crate::session::{Msg, UiMsg};
+
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (s0, _, _) = Session::detached_with_questions(0, find("claude").unwrap());
+        let (s1, _, _) = Session::detached_with_questions(1, find("codex").unwrap());
+        app.sessions.push(s0);
+        app.sessions.push(s1);
+
+        let req = ElicitationRequest {
+            message: "Which transport?".into(),
+            fields: vec![
+                QuestionField {
+                    key: "question_0".into(),
+                    title: Some("Transport".into()),
+                    description: None,
+                    required: false,
+                    kind: FieldKind::SingleSelect {
+                        options: vec![
+                            QuestionOption {
+                                value: "ACP".into(),
+                                label: "ACP".into(),
+                                description: Some("Standard stdio".into()),
+                            },
+                            QuestionOption {
+                                value: "JSON".into(),
+                                label: "JSON".into(),
+                                description: None,
+                            },
+                        ],
+                        default: None,
+                    },
+                },
+                QuestionField {
+                    key: "question_0_custom".into(),
+                    title: Some("Other".into()),
+                    description: None,
+                    required: false,
+                    kind: FieldKind::Text { default: None },
+                },
+            ],
+        };
+        // Session 1 (background) asks a question: header badge + bell.
+        app.handle_msg(Msg {
+            session: 1,
+            body: UiMsg::Question(req.clone()),
+        });
+        assert!(app.pending_bell);
+        let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        assert!(dump(&term).contains("1 waiting"));
+
+        // Switch to session 1: question modal renders cleanly.
+        app.selected = 1;
+        app.sync_question_draft();
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("question"), "{screen}");
+        assert!(screen.contains("Which transport?"), "{screen}");
+        assert!(screen.contains("1. ACP"), "{screen}");
+        assert!(screen.contains("Standard stdio"), "{screen}");
+        assert!(screen.contains("Other"), "{screen}");
     }
 }

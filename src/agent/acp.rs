@@ -121,6 +121,75 @@ pub enum Event {
     Other(String),
 }
 
+/// One selectable choice inside an ACP form elicitation field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionOption {
+    pub value: String,
+    pub label: String,
+    pub description: Option<String>,
+}
+
+/// Supported JSON Schema field shapes for ACP form elicitation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldKind {
+    SingleSelect {
+        options: Vec<QuestionOption>,
+        default: Option<String>,
+    },
+    MultiSelect {
+        options: Vec<QuestionOption>,
+        default: Vec<String>,
+    },
+    Text {
+        default: Option<String>,
+    },
+    Bool {
+        default: Option<bool>,
+    },
+    Number {
+        integer: bool,
+        default: Option<String>,
+    },
+}
+
+/// One field inside an ACP `elicitation/create` form request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionField {
+    pub key: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub required: bool,
+    pub kind: FieldKind,
+}
+
+/// An ACP `elicitation/create` (form mode) request asking the user questions mid-turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ElicitationRequest {
+    pub message: String,
+    pub fields: Vec<QuestionField>,
+}
+
+/// Client reply to an ACP `elicitation/create` request.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ElicitationResponse {
+    Accept(serde_json::Map<String, Value>),
+    Decline,
+    Cancel,
+}
+
+impl ElicitationResponse {
+    fn to_result_json(&self) -> Value {
+        match self {
+            Self::Accept(content) => json!({
+                "action": "accept",
+                "content": Value::Object(content.clone()),
+            }),
+            Self::Decline => json!({ "action": "decline" }),
+            Self::Cancel => json!({ "action": "cancel" }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PermissionOption {
     pub id: String,
@@ -373,6 +442,7 @@ impl AcpClient {
         params: Value,
         on_event: &mut dyn FnMut(Event),
         on_permission: &mut dyn FnMut(&PermissionRequest) -> Option<String>,
+        on_elicitation: &mut dyn FnMut(&ElicitationRequest) -> ElicitationResponse,
     ) -> Result<Value, AcpError> {
         let id = self.next_id;
         self.next_id += 1;
@@ -413,6 +483,12 @@ impl AcpClient {
                             None => json!({"outcome": "cancelled"}),
                         };
                         json!({"jsonrpc": "2.0", "id": rid, "result": {"outcome": outcome}})
+                    } else if m == "elicitation/create" {
+                        let resp = match parse_elicitation(&msg["params"]) {
+                            Some(req) => on_elicitation(&req),
+                            None => ElicitationResponse::Decline,
+                        };
+                        json!({"jsonrpc": "2.0", "id": rid, "result": resp.to_result_json()})
                     } else {
                         json!({"jsonrpc": "2.0", "id": rid,
                                "error": {"code": -32601, "message": "method not supported"}})
@@ -425,7 +501,9 @@ impl AcpClient {
     }
 
     fn call_quiet(&mut self, method: &str, params: Value) -> Result<Value, AcpError> {
-        self.call(method, params, &mut |_| {}, &mut |_| None)
+        self.call(method, params, &mut |_| {}, &mut |_| None, &mut |_| {
+            ElicitationResponse::Cancel
+        })
     }
 
     /// Negotiate version and capabilities. Returns the agent's display name.
@@ -434,7 +512,11 @@ impl AcpClient {
             "initialize",
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
-                "clientCapabilities": {},
+                "clientCapabilities": {
+                    "elicitation": {
+                        "form": {},
+                    },
+                },
                 "clientInfo": {
                     "name": "mijote",
                     "title": "mijote",
@@ -517,6 +599,7 @@ impl AcpClient {
             &[PromptBlock::Text(text.to_string())],
             on_event,
             on_permission,
+            |_| ElicitationResponse::Cancel,
         )
     }
 
@@ -527,6 +610,7 @@ impl AcpClient {
         blocks: &[PromptBlock],
         mut on_event: impl FnMut(Event),
         mut on_permission: impl FnMut(&PermissionRequest) -> Option<String>,
+        mut on_elicitation: impl FnMut(&ElicitationRequest) -> ElicitationResponse,
     ) -> Result<StopReason, AcpError> {
         let prompt: Vec<Value> = blocks.iter().map(PromptBlock::to_json).collect();
         let result = self.call(
@@ -537,6 +621,7 @@ impl AcpClient {
             }),
             &mut on_event,
             &mut on_permission,
+            &mut on_elicitation,
         )?;
         let reason = result
             .get("stopReason")
@@ -831,6 +916,156 @@ fn parse_permission(p: &Value) -> PermissionRequest {
             })
             .unwrap_or_default(),
     }
+}
+
+fn parse_elicitation(p: &Value) -> Option<ElicitationRequest> {
+    if p.get("mode").and_then(Value::as_str) == Some("url") {
+        return None;
+    }
+    let message = str_of(p, "message");
+    let schema = p.get("requestedSchema");
+    let required: std::collections::HashSet<&str> = schema
+        .and_then(|s| s.get("required"))
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
+    let mut entries: Vec<(&String, &Value)> = schema
+        .and_then(|s| s.get("properties"))
+        .and_then(Value::as_object)
+        .map(|props| props.iter().collect())
+        .unwrap_or_default();
+    entries.sort_by(|(a, _), (b, _)| elicitation_key_order(a).cmp(&elicitation_key_order(b)));
+
+    let fields = entries
+        .into_iter()
+        .map(|(key, prop)| QuestionField {
+            key: key.clone(),
+            title: prop
+                .get("title")
+                .and_then(non_empty_str)
+                .map(str::to_string),
+            description: prop
+                .get("description")
+                .and_then(non_empty_str)
+                .map(str::to_string),
+            required: required.contains(key.as_str()),
+            kind: parse_field_kind(prop),
+        })
+        .collect();
+
+    Some(ElicitationRequest { message, fields })
+}
+
+/// Keep indexed `question_<n>` and `question_<n>_custom` keys in numeric order
+/// even when JSON object keys are sorted alphabetically.
+fn elicitation_key_order(key: &str) -> (u8, usize, u8, &str) {
+    if let Some(rest) = key.strip_prefix("question_") {
+        if let Some(num_str) = rest.strip_suffix("_custom") {
+            if let Ok(n) = num_str.parse::<usize>() {
+                return (0, n, 1, key);
+            }
+        } else if let Ok(n) = rest.parse::<usize>() {
+            return (0, n, 0, key);
+        }
+    }
+    (1, 0, 0, key)
+}
+
+fn parse_field_kind(prop: &Value) -> FieldKind {
+    let ty = prop.get("type").and_then(Value::as_str).unwrap_or("string");
+    match ty {
+        "array" => {
+            let options = prop.get("items").map(parse_options).unwrap_or_default();
+            let default = prop
+                .get("default")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            FieldKind::MultiSelect { options, default }
+        }
+        "boolean" => FieldKind::Bool {
+            default: prop.get("default").and_then(Value::as_bool),
+        },
+        "integer" | "number" => FieldKind::Number {
+            integer: ty == "integer",
+            default: prop.get("default").and_then(|v| match v {
+                Value::Number(n) => Some(n.to_string()),
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            }),
+        },
+        _ => {
+            let options = parse_options(prop);
+            let default = prop
+                .get("default")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if !options.is_empty() {
+                FieldKind::SingleSelect { options, default }
+            } else {
+                FieldKind::Text { default }
+            }
+        }
+    }
+}
+
+fn parse_options(v: &Value) -> Vec<QuestionOption> {
+    if let Some(arr) = v
+        .get("oneOf")
+        .or_else(|| v.get("anyOf"))
+        .and_then(Value::as_array)
+    {
+        let mut out = Vec::new();
+        for item in arr {
+            let Some(val) = item.get("const").and_then(Value::as_str) else {
+                continue;
+            };
+            let label = item
+                .get("title")
+                .and_then(non_empty_str)
+                .unwrap_or(val)
+                .to_string();
+            let description = item
+                .get("description")
+                .and_then(non_empty_str)
+                .map(str::to_string);
+            out.push(QuestionOption {
+                value: val.to_string(),
+                label,
+                description,
+            });
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    if let Some(arr) = v.get("enum").and_then(Value::as_array) {
+        let names = v.get("enumNames").and_then(Value::as_array);
+        return arr
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| {
+                let val = item.as_str()?;
+                let label = names
+                    .and_then(|ns| ns.get(i))
+                    .and_then(non_empty_str)
+                    .unwrap_or(val)
+                    .to_string();
+                Some(QuestionOption {
+                    value: val.to_string(),
+                    label,
+                    description: None,
+                })
+            })
+            .collect();
+    }
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -1156,9 +1391,97 @@ for line in sys.stdin:
                     }
                 },
                 |_| None,
+                |_| ElicitationResponse::Cancel,
             )
             .unwrap();
         assert_eq!(stop, StopReason::EndTurn);
         assert_eq!(out, "text,resource,resource_link");
+    }
+
+    #[test]
+    fn elicitation_create_round_trip_against_fake_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    m, mid = msg.get("method"), msg.get("id")
+    if m == "initialize":
+        caps = msg["params"]["clientCapabilities"]
+        assert "form" in caps.get("elicitation", {}), f"missing elicitation.form: {caps}"
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{
+            "protocolVersion":1,
+            "agentInfo":{"name":"fake"}
+        }}), flush=True)
+    elif m == "session/new":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"sessionId":"s1"}}), flush=True)
+    elif m == "session/prompt":
+        print(json.dumps({"jsonrpc":"2.0","id":99,"method":"elicitation/create","params":{
+            "mode":"form",
+            "sessionId":"s1",
+            "message":"Which database?",
+            "requestedSchema":{
+                "type":"object",
+                "properties":{
+                    "question_0":{
+                        "type":"string",
+                        "title":"Database",
+                        "oneOf":[
+                            {"const":"SQLite","title":"SQLite","description":"Embedded"},
+                            {"const":"Postgres","title":"Postgres","description":"Server"}
+                        ]
+                    },
+                    "question_0_custom":{"type":"string","title":"Other"},
+                    "question_1":{
+                        "type":"array",
+                        "title":"Features",
+                        "items":{"anyOf":[
+                            {"const":"TLS","title":"TLS"},
+                            {"const":"Metrics","title":"Metrics"}
+                        ]}
+                    }
+                }
+            }
+        }}), flush=True)
+        reply = json.loads(sys.stdin.readline())
+        assert reply["id"] == 99
+        res = reply["result"]
+        text = f"{res['action']}:{res['content']['question_0']}:{','.join(res['content']['question_1'])}"
+        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"s1",
+            "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}}
+        }}), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"stopReason":"end_turn"}}), flush=True)
+"#;
+        let mut client = AcpClient::spawn("python3", &["-c", script], dir.path()).unwrap();
+        client.initialize().unwrap();
+        let sid = client.new_session(dir.path()).unwrap();
+        let mut out = String::new();
+        let mut seen_fields = Vec::new();
+        let stop = client
+            .prompt_blocks(
+                &sid,
+                &[PromptBlock::Text("setup db".into())],
+                |ev| {
+                    if let Event::AgentText(t) = ev {
+                        out.push_str(&t);
+                    }
+                },
+                |_| None,
+                |req| {
+                    seen_fields = req.fields.iter().map(|f| f.key.clone()).collect();
+                    let mut map = serde_json::Map::new();
+                    map.insert("question_0".into(), json!("Postgres"));
+                    map.insert("question_1".into(), json!(["TLS", "Metrics"]));
+                    ElicitationResponse::Accept(map)
+                },
+            )
+            .unwrap();
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(
+            seen_fields,
+            vec!["question_0", "question_0_custom", "question_1"]
+        );
+        assert_eq!(out, "accept:Postgres:TLS,Metrics");
     }
 }
