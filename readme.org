@@ -20,45 +20,53 @@ resuming agent context, and a review/merge flow for session branches. See
 * usage
 
 #+begin_src sh
-mijote            # open the TUI on a new session
+mijote            # open the TUI on a new session in the current directory
 mijote --resume   # reopen saved sessions for this directory
 mijote agents     # list backends
 mijote install claude
 mijote ask claude "explain this repo"
 #+end_src
 
+Bare =mijote= starts a session in the current directory using the last-used
+agent (falling back to the first installed backend).
+
 ** keys
 
 The prompt is a vim-style editor: =i= / =Enter= insert, =Esc= back to normal,
 =Enter= send, =Shift-Enter= (or =Alt-Enter=, =Ctrl-J=) newline. Normal mode has
 motions (=h l j k 0 ^ $ w b e gg G=), operators (=d c y= + motion), =x p u
-Ctrl-r= and counts.
+Ctrl-r= and counts. Bracketed paste works in insert mode; pastes over 3 lines
+or 500 characters collapse to a =[Pasted text #1 +N lines]= placeholder and
+expand on send.
 
 App commands sit behind a leader, =Space= in normal mode or =Ctrl-a= anywhere
 (no leader needed while no session is open):
 
-| key           | action                                              |
-|---------------+-----------------------------------------------------|
-| =n=           | new session in its own worktree                     |
-| =N=           | new session in the current directory and branch     |
-| =d=           | close session                                       |
-| =s= / =Tab=   | floating session switcher (=j/k=, =1-9=, =Enter=)   |
-| =j= / =k=     | previous / next session                             |
-| =M=           | model picker (also =/model= in the prompt)          |
-| =m=           | toggle mouse capture                                |
-| =q=           | quit                                                |
+| key         | action                                            |
+|-------------+---------------------------------------------------|
+| =n=         | new session in its own worktree                   |
+| =N=         | new session in the current directory and branch   |
+| =d=         | close session                                     |
+| =s= / =Tab= | floating session switcher (=j/k=, =1-9=, =Enter=) |
+| =j= / =k=   | next / previous session                           |
+| =g= / =G=   | top / bottom of transcript (also =Home= / =End=)  |
+| =M=         | model picker (also =/model= in the prompt)        |
+| =m=         | toggle mouse capture                              |
+| =q=         | quit                                              |
 
-=Ctrl-c= cancels a running turn (or quits when idle). Permission requests pop
-up as a modal: =1-9= choose, =Esc= rejects. Scroll with the wheel, PgUp/PgDn or
-leader + arrows; drag with the mouse to select transcript text, which is
-copied to the clipboard on release. Sessions are saved under
-=~/.local/share/mijote/sessions= and can be reopened (transcript only) with
-=mijote --resume=. =Shift-Enter= needs a terminal with the
-kitty keyboard protocol.
+=Ctrl-c= cancels a running turn (or quits when idle); =Ctrl-d= quits
+immediately from any mode. Permission requests pop up as a modal: =1-9= choose,
+=Esc= rejects. Scroll with the wheel, PgUp/PgDn or leader + arrows; drag with
+the mouse to select transcript text, which is copied to the clipboard on
+release. Sessions are saved under =~/.local/share/mijote/sessions= and can be
+reopened (transcript only) with =mijote --resume=. =Shift-Enter= needs a
+terminal with the kitty keyboard protocol.
 
-By default each session runs in its own git worktree and branch (=mijote/<agent>-<n>=),
-stored under =~/.local/share/mijote/worktrees=. Untouched worktrees are deleted
-when the session closes; ones with changes are kept and reported.
+On startup, =mijote= opens a session directly in the current directory (same as
+=leader + N=). Use =leader + n= to start a session in its own git worktree and
+branch (=mijote/<agent>-<n>=) under =~/.local/share/mijote/worktrees=;
+untouched worktrees are deleted on close, while ones with changes are kept and
+reported.
 
 * build
 
