@@ -304,7 +304,15 @@ fn fit(text: &str, width: usize) -> String {
     out
 }
 
-/// Word-wrap prose to `width` chars. Words longer than a line are split.
+fn char_width(c: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+fn str_width(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
+/// Word-wrap prose to `width` display columns. Words longer than a line are split.
 fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out = Vec::new();
@@ -316,7 +324,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
         let mut cur = String::new();
         let mut n = 0;
         for word in raw.split(' ') {
-            let wl = word.chars().count();
+            let wl = str_width(word);
             if n > 0 && n + 1 + wl <= width {
                 cur.push(' ');
                 cur.push_str(word);
@@ -325,18 +333,65 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
             }
             if n > 0 {
                 out.push(std::mem::take(&mut cur));
+                n = 0;
             }
-            let chars: Vec<char> = word.chars().collect();
-            let mut chunks = chars.chunks(width).map(|c| c.iter().collect::<String>());
-            let mut last = chunks.next().unwrap_or_default();
-            for next in chunks {
-                out.push(std::mem::replace(&mut last, next));
+            if wl <= width {
+                cur.push_str(word);
+                n = wl;
+            } else {
+                for ch in word.chars() {
+                    let cw = char_width(ch);
+                    if n > 0 && n + cw > width {
+                        out.push(std::mem::take(&mut cur));
+                        n = 0;
+                    }
+                    cur.push(ch);
+                    n += cw;
+                }
             }
-            n = last.chars().count();
-            cur = last;
         }
         out.push(cur);
     }
+    out
+}
+
+/// Wrap editable single-line text to `width` display columns while preserving all
+/// spaces so a cursor at the end maps cleanly to the last wrapped row.
+fn wrap_input(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0;
+    let mut last_space_byte: Option<usize> = None;
+
+    for ch in text.chars() {
+        let cw = char_width(ch);
+        if cur_w > 0 && cur_w + cw > width {
+            if let Some(split_at) = last_space_byte.take() {
+                let tail = cur[split_at..].to_string();
+                cur.truncate(split_at);
+                out.push(cur);
+                cur = tail;
+                cur_w = str_width(&cur);
+            } else {
+                out.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            if cur_w > 0 && cur_w + cw > width {
+                out.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+        }
+        cur.push(ch);
+        cur_w += cw;
+        if ch == ' ' {
+            last_space_byte = Some(cur.len());
+        }
+    }
+    out.push(cur);
     out
 }
 
@@ -2995,6 +3050,78 @@ fn render_permission(f: &mut Frame, s: &Session) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn push_question_option_lines(
+    lines: &mut Vec<Line<'static>>,
+    gutter: &Span<'static>,
+    mark: &'static str,
+    mark_style: Style,
+    num: &str,
+    label: &str,
+    description: Option<&str>,
+    focused: bool,
+    body_w: usize,
+) {
+    let row_bg = if focused {
+        Style::new().bg(SELECTED_BG)
+    } else {
+        Style::new()
+    };
+    let label_style = if focused { BOLD.patch(row_bg) } else { row_bg };
+    let desc_style = DIM.patch(row_bg);
+    let prefix_w = str_width(mark) + str_width(num);
+    let opt_w = body_w.saturating_sub(prefix_w).max(1);
+    let indent = " ".repeat(prefix_w);
+
+    // Compact one-line form when label + " — " + description all fit on one line.
+    if let Some(desc) = description {
+        let single_line = !label.contains('\n')
+            && !desc.contains('\n')
+            && str_width(label) + 3 + str_width(desc) <= opt_w;
+        if single_line {
+            lines.push(Line::from(vec![
+                gutter.clone(),
+                Span::styled(mark, mark_style.patch(row_bg)),
+                Span::styled(num.to_string(), DIM.patch(row_bg)),
+                Span::styled(label.to_string(), label_style),
+                Span::styled(format!(" — {desc}"), desc_style),
+            ]));
+            return;
+        }
+    }
+
+    let mut label_lines = wrap(label, opt_w);
+    if label_lines.is_empty() {
+        label_lines.push(String::new());
+    }
+    for (i, part) in label_lines.into_iter().enumerate() {
+        if i == 0 {
+            lines.push(Line::from(vec![
+                gutter.clone(),
+                Span::styled(mark, mark_style.patch(row_bg)),
+                Span::styled(num.to_string(), DIM.patch(row_bg)),
+                Span::styled(part, label_style),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                gutter.clone(),
+                Span::styled(indent.clone(), row_bg),
+                Span::styled(part, label_style),
+            ]));
+        }
+    }
+
+    if let Some(desc) = description {
+        for part in wrap(desc, opt_w) {
+            lines.push(Line::from(vec![
+                gutter.clone(),
+                Span::styled(indent.clone(), row_bg),
+                Span::styled(part, desc_style),
+            ]));
+        }
+    }
+}
+
 fn render_question(f: &mut Frame, app: &App, s: &Session, req: &ElicitationRequest) {
     let fallback;
     let draft = match &app.question_draft {
@@ -3005,10 +3132,16 @@ fn render_question(f: &mut Frame, app: &App, s: &Session, req: &ElicitationReque
         }
     };
 
-    let max_w = f.area().width.saturating_sub(4).clamp(44, 80);
-    let inner_w = max_w.saturating_sub(6) as usize;
+    let term = f.area();
+    let max_w = if term.width > 4 {
+        (term.width - 4).min(80)
+    } else {
+        term.width
+    };
+    let inner_w = (max_w.saturating_sub(6) as usize).max(1);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut focus_line: usize = 0;
+    let mut focus_start: usize = 0;
+    let mut focus_end: usize = 0;
     let mut text_cursor: Option<(usize, u16)> = None;
 
     if !req.message.is_empty() {
@@ -3021,6 +3154,7 @@ fn render_question(f: &mut Frame, app: &App, s: &Session, req: &ElicitationReque
         if !lines.is_empty() {
             lines.push(Line::from(""));
         }
+        let field_start = lines.len();
         let active = fi == draft.field_idx;
         let gutter = if active {
             Span::styled("▎ ", Style::new().fg(ACCENT))
@@ -3030,36 +3164,46 @@ fn render_question(f: &mut Frame, app: &App, s: &Session, req: &ElicitationReque
         let body_w = inner_w.saturating_sub(2).max(1);
 
         if let Some(title) = &field.title {
-            let mut spans = vec![gutter.clone()];
-            spans.push(Span::styled(
-                fit(title, body_w.saturating_sub(2)),
-                if active { BOLD.fg(ACCENT) } else { BOLD },
-            ));
-            if field.required {
-                spans.push(Span::styled(" *", Style::new().fg(ERR)));
+            let title_style = if active { BOLD.fg(ACCENT) } else { BOLD };
+            let mut wrapped = wrap(title, body_w);
+            if wrapped.is_empty() {
+                wrapped.push(String::new());
             }
-            lines.push(Line::from(spans));
+            let last_idx = wrapped.len() - 1;
+            for (i, part) in wrapped.into_iter().enumerate() {
+                let is_last = i == last_idx;
+                let needs_new_line_for_star =
+                    is_last && field.required && str_width(&part) + 2 > body_w;
+                let mut spans = vec![gutter.clone(), Span::styled(part, title_style)];
+                if is_last && field.required && !needs_new_line_for_star {
+                    spans.push(Span::styled(" *", Style::new().fg(ERR)));
+                }
+                lines.push(Line::from(spans));
+                if needs_new_line_for_star {
+                    lines.push(Line::from(vec![
+                        gutter.clone(),
+                        Span::styled("*", Style::new().fg(ERR)),
+                    ]));
+                }
+            }
         }
         if let Some(desc) = &field.description {
             for l in wrap(desc, body_w) {
                 lines.push(Line::from(vec![gutter.clone(), Span::styled(l, DIM)]));
             }
         }
+        if active {
+            focus_start = field_start;
+            focus_end = lines.len().saturating_sub(1);
+        }
 
         match (&field.kind, draft.values.get(fi)) {
             (FieldKind::SingleSelect { options, .. }, Some(FieldDraft::Single(sel))) => {
                 for (oi, opt) in options.iter().enumerate() {
                     let focused = active && oi == draft.option_idx;
-                    if focused {
-                        focus_line = lines.len();
-                    }
+                    let start = lines.len();
                     let picked = *sel == Some(oi);
                     let mark = if picked { "◉ " } else { "○ " };
-                    let row_bg = if focused {
-                        Style::new().bg(SELECTED_BG)
-                    } else {
-                        Style::new()
-                    };
                     let mark_style = if picked {
                         Style::new().fg(OK).add_modifier(Modifier::BOLD)
                     } else if focused {
@@ -3067,42 +3211,30 @@ fn render_question(f: &mut Frame, app: &App, s: &Session, req: &ElicitationReque
                     } else {
                         DIM
                     };
-                    let mut spans = vec![
-                        gutter.clone(),
-                        Span::styled(mark, mark_style.patch(row_bg)),
-                        Span::styled(format!("{}. ", oi + 1), DIM.patch(row_bg)),
-                        Span::styled(
-                            opt.label.clone(),
-                            if focused { BOLD.patch(row_bg) } else { row_bg },
-                        ),
-                    ];
-                    if let Some(desc) = &opt.description {
-                        let used =
-                            2 + 2 + format!("{}. ", oi + 1).len() + opt.label.chars().count();
-                        let rem = inner_w.saturating_sub(used + 3);
-                        if rem >= 8 {
-                            spans.push(Span::styled(
-                                format!(" — {}", fit(desc, rem)),
-                                DIM.patch(row_bg),
-                            ));
-                        }
+                    let num = format!("{}. ", oi + 1);
+                    push_question_option_lines(
+                        &mut lines,
+                        &gutter,
+                        mark,
+                        mark_style,
+                        &num,
+                        &opt.label,
+                        opt.description.as_deref(),
+                        focused,
+                        body_w,
+                    );
+                    if focused {
+                        focus_start = start;
+                        focus_end = lines.len().saturating_sub(1);
                     }
-                    lines.push(Line::from(spans));
                 }
             }
             (FieldKind::MultiSelect { options, .. }, Some(FieldDraft::Multi(checks))) => {
                 for (oi, opt) in options.iter().enumerate() {
                     let focused = active && oi == draft.option_idx;
-                    if focused {
-                        focus_line = lines.len();
-                    }
+                    let start = lines.len();
                     let checked = checks.get(oi).copied().unwrap_or(false);
                     let mark = if checked { "[x] " } else { "[ ] " };
-                    let row_bg = if focused {
-                        Style::new().bg(SELECTED_BG)
-                    } else {
-                        Style::new()
-                    };
                     let mark_style = if checked {
                         Style::new().fg(OK).add_modifier(Modifier::BOLD)
                     } else if focused {
@@ -3110,33 +3242,26 @@ fn render_question(f: &mut Frame, app: &App, s: &Session, req: &ElicitationReque
                     } else {
                         DIM
                     };
-                    let mut spans = vec![
-                        gutter.clone(),
-                        Span::styled(mark, mark_style.patch(row_bg)),
-                        Span::styled(format!("{}. ", oi + 1), DIM.patch(row_bg)),
-                        Span::styled(
-                            opt.label.clone(),
-                            if focused { BOLD.patch(row_bg) } else { row_bg },
-                        ),
-                    ];
-                    if let Some(desc) = &opt.description {
-                        let used =
-                            2 + 4 + format!("{}. ", oi + 1).len() + opt.label.chars().count();
-                        let rem = inner_w.saturating_sub(used + 3);
-                        if rem >= 8 {
-                            spans.push(Span::styled(
-                                format!(" — {}", fit(desc, rem)),
-                                DIM.patch(row_bg),
-                            ));
-                        }
+                    let num = format!("{}. ", oi + 1);
+                    push_question_option_lines(
+                        &mut lines,
+                        &gutter,
+                        mark,
+                        mark_style,
+                        &num,
+                        &opt.label,
+                        opt.description.as_deref(),
+                        focused,
+                        body_w,
+                    );
+                    if focused {
+                        focus_start = start;
+                        focus_end = lines.len().saturating_sub(1);
                     }
-                    lines.push(Line::from(spans));
                 }
             }
             (FieldKind::Bool { .. }, Some(FieldDraft::Bool(val))) => {
-                if active {
-                    focus_line = lines.len();
-                }
+                let start = lines.len();
                 let row_bg = if active {
                     Style::new().bg(SELECTED_BG)
                 } else {
@@ -3158,16 +3283,14 @@ fn render_question(f: &mut Frame, app: &App, s: &Session, req: &ElicitationReque
                     ),
                     Span::styled(label, if active { BOLD.patch(row_bg) } else { row_bg }),
                 ]));
+                if active {
+                    focus_start = start;
+                    focus_end = lines.len().saturating_sub(1);
+                }
             }
             (FieldKind::Text { .. } | FieldKind::Number { .. }, Some(FieldDraft::Text(buf))) => {
-                let line_idx = lines.len();
-                if active {
-                    focus_line = line_idx;
-                }
-                let room = body_w.saturating_sub(3).max(1);
-                let len = buf.chars().count();
-                let off = (len + 1).saturating_sub(room);
-                let visible: String = buf.chars().skip(off).collect();
+                let start = lines.len();
+                let text_w = body_w.saturating_sub(2).max(1);
                 let prompt_style = if active { Style::new().fg(ACCENT) } else { DIM };
                 if buf.is_empty() && !active {
                     let ph = match field.kind {
@@ -3176,21 +3299,42 @@ fn render_question(f: &mut Frame, app: &App, s: &Session, req: &ElicitationReque
                         _ if field.required => "type answer…",
                         _ => "type custom answer (optional)…",
                     };
-                    lines.push(Line::from(vec![
-                        gutter.clone(),
-                        Span::styled("› ", prompt_style),
-                        Span::styled(ph, DIM),
-                    ]));
+                    for (i, part) in wrap(ph, text_w).into_iter().enumerate() {
+                        let lead = if i == 0 {
+                            Span::styled("› ", prompt_style)
+                        } else {
+                            Span::raw("  ")
+                        };
+                        lines.push(Line::from(vec![
+                            gutter.clone(),
+                            lead,
+                            Span::styled(part, DIM),
+                        ]));
+                    }
                 } else {
-                    lines.push(Line::from(vec![
-                        gutter.clone(),
-                        Span::styled("› ", prompt_style),
-                        Span::raw(visible),
-                    ]));
+                    let wrapped = wrap_input(buf, text_w);
+                    let mut last_w = 0;
+                    for (i, part) in wrapped.into_iter().enumerate() {
+                        last_w = str_width(&part);
+                        let lead = if i == 0 {
+                            Span::styled("› ", prompt_style)
+                        } else {
+                            Span::raw("  ")
+                        };
+                        lines.push(Line::from(vec![gutter.clone(), lead, Span::raw(part)]));
+                    }
+                    if active {
+                        if last_w >= text_w {
+                            lines.push(Line::from(vec![gutter.clone(), Span::raw("  ")]));
+                            text_cursor = Some((lines.len() - 1, 4));
+                        } else {
+                            text_cursor = Some((lines.len() - 1, 4 + last_w as u16));
+                        }
+                    }
                 }
                 if active {
-                    let col = 4 + (len - off) as u16;
-                    text_cursor = Some((line_idx, col));
+                    focus_start = start;
+                    focus_end = lines.len().saturating_sub(1);
                 }
             }
             _ => {}
@@ -3199,7 +3343,9 @@ fn render_question(f: &mut Frame, app: &App, s: &Session, req: &ElicitationReque
 
     if let Some(err) = &draft.error {
         lines.push(Line::from(""));
-        lines.push(Line::styled(format!("  {err}"), Style::new().fg(ERR)));
+        for l in wrap(err, inner_w.saturating_sub(2).max(1)) {
+            lines.push(Line::styled(format!("  {l}"), Style::new().fg(ERR)));
+        }
     }
 
     let hint = hint_line(&[
@@ -3210,16 +3356,25 @@ fn render_question(f: &mut Frame, app: &App, s: &Session, req: &ElicitationReque
         ("Esc", "cancel"),
     ]);
     let min_w = (hint.width() as u16 + 4).max(56).min(max_w);
-    let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let mut content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    if let Some((_, col)) = text_cursor {
+        content_w = content_w.max(col.saturating_add(1));
+    }
     let w = (content_w + 6).clamp(min_w, max_w);
-    let max_h = f.area().height.saturating_sub(4).max(7);
+    let max_h = term.height.saturating_sub(4).max(7);
     let h = (lines.len() as u16 + 4).min(max_h);
-    let area = centered(f.area(), w, h);
+    let area = centered(term, w, h);
     let block = modal("question", ASK, hint);
     let inner = block.inner(area);
 
-    let scroll_y = if focus_line >= inner.height as usize {
-        (focus_line + 1 - inner.height as usize) as u16
+    let scroll_y = if focus_end >= inner.height as usize {
+        let need = focus_end + 1 - inner.height as usize;
+        let clamped = if text_cursor.is_some() {
+            need
+        } else {
+            need.min(focus_start)
+        };
+        clamped as u16
     } else {
         0
     };
@@ -4199,6 +4354,230 @@ mod tests {
         assert!(screen.contains("1. ACP"), "{screen}");
         assert!(screen.contains("Standard stdio"), "{screen}");
         assert!(screen.contains("Other"), "{screen}");
+    }
+
+    #[test]
+    fn question_modal_wraps_long_titles_options_descriptions_text_and_errors() {
+        use crate::agent::acp::{QuestionField, QuestionOption};
+        use crate::session::{Msg, UiMsg};
+
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (s0, _, _) = Session::detached_with_questions(0, find("claude").unwrap());
+        app.sessions.push(s0);
+
+        let req = ElicitationRequest {
+            message: "Choose how the migration should proceed when dealing with long identifiers and schemas END_OF_MESSAGE".into(),
+            fields: vec![
+                QuestionField {
+                    key: "question_0".into(),
+                    title: Some(
+                        "Which database rollout strategy should we adopt across every production region END_OF_TITLE"
+                            .into(),
+                    ),
+                    description: None,
+                    required: true,
+                    kind: FieldKind::SingleSelect {
+                        options: vec![
+                            QuestionOption {
+                                value: "blue_green".into(),
+                                label: "Blue-green deployment with automated dual-write verification across all shards END_OF_SINGLE_LABEL".into(),
+                                description: Some(
+                                    "Keeps the previous cluster warm so we can cut back instantaneously if latency spikes END_OF_SINGLE_DESC"
+                                        .into(),
+                                ),
+                            },
+                            QuestionOption {
+                                value: "fast".into(),
+                                label: "Fast".into(),
+                                description: Some("Short inline desc".into()),
+                            },
+                        ],
+                        default: None,
+                    },
+                },
+                QuestionField {
+                    key: "question_1".into(),
+                    title: Some("Checks".into()),
+                    description: None,
+                    required: false,
+                    kind: FieldKind::MultiSelect {
+                        options: vec![QuestionOption {
+                            value: "audit".into(),
+                            label: "Run exhaustive schema compatibility checks against every historical snapshot END_OF_MULTI_LABEL".into(),
+                            description: Some(
+                                "Validates both forward and backward deserialization before approving END_OF_MULTI_DESC"
+                                    .into(),
+                            ),
+                        }],
+                        default: Vec::new(),
+                    },
+                },
+                QuestionField {
+                    key: "question_0_custom".into(),
+                    title: Some("Other".into()),
+                    description: None,
+                    required: false,
+                    kind: FieldKind::Text {
+                        default: Some(
+                            "A very long custom answer typed by the user that definitely exceeds a single modal line END_OF_TEXT_INPUT"
+                                .into(),
+                        ),
+                    },
+                },
+            ],
+        };
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::Question(req),
+        });
+        app.sync_question_draft();
+        if let Some(draft) = app.question_draft.as_mut() {
+            draft.error = Some(
+                "Validation failed because the chosen configuration needs confirmation before proceeding END_OF_ERROR"
+                    .into(),
+            );
+        }
+
+        let mut term = Terminal::new(TestBackend::new(84, 38)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("END_OF_MESSAGE"), "{screen}");
+        assert!(screen.contains("END_OF_TITLE *"), "{screen}");
+        assert!(screen.contains("END_OF_SINGLE_LABEL"), "{screen}");
+        assert!(screen.contains("END_OF_SINGLE_DESC"), "{screen}");
+        // Short option label + description stay compact on one line.
+        assert!(screen.contains("2. Fast — Short inline desc"), "{screen}");
+        assert!(screen.contains("END_OF_MULTI_LABEL"), "{screen}");
+        assert!(screen.contains("END_OF_MULTI_DESC"), "{screen}");
+        assert!(screen.contains("END_OF_TEXT_INPUT"), "{screen}");
+        assert!(screen.contains("END_OF_ERROR"), "{screen}");
+
+        // Narrow terminal (< 48 cols) still wraps cleanly inside borders without clipping.
+        let mut narrow = Terminal::new(TestBackend::new(40, 58)).unwrap();
+        narrow.draw(|f| render(f, &app)).unwrap();
+        let narrow_screen = dump(&narrow);
+        assert!(narrow_screen.contains("END_OF_MESSAGE"), "{narrow_screen}");
+        assert!(narrow_screen.contains("END_OF_TITLE *"), "{narrow_screen}");
+        assert!(
+            narrow_screen.contains("END_OF_SINGLE_LABEL"),
+            "{narrow_screen}"
+        );
+        assert!(
+            narrow_screen.contains("END_OF_SINGLE_DESC"),
+            "{narrow_screen}"
+        );
+        assert!(
+            narrow_screen.contains("END_OF_MULTI_LABEL"),
+            "{narrow_screen}"
+        );
+        assert!(
+            narrow_screen.contains("END_OF_MULTI_DESC"),
+            "{narrow_screen}"
+        );
+        assert!(
+            narrow_screen.contains("END_OF_TEXT_INPUT"),
+            "{narrow_screen}"
+        );
+        assert!(narrow_screen.contains("END_OF_ERROR"), "{narrow_screen}");
+    }
+
+    #[test]
+    fn question_modal_scrolls_wrapped_focused_option_and_places_wrapped_text_cursor() {
+        use crate::agent::acp::{QuestionField, QuestionOption};
+        use crate::session::{Msg, UiMsg};
+
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (s0, _, _) = Session::detached_with_questions(0, find("claude").unwrap());
+        app.sessions.push(s0);
+
+        let req = ElicitationRequest {
+            message: "Pick an option".into(),
+            fields: vec![
+                QuestionField {
+                    key: "question_0".into(),
+                    title: Some("Choices".into()),
+                    description: None,
+                    required: false,
+                    kind: FieldKind::SingleSelect {
+                        options: vec![
+                            QuestionOption {
+                                value: "a".into(),
+                                label: "First option".into(),
+                                description: Some("Line one description that wraps across multiple rows in a short viewport".into()),
+                            },
+                            QuestionOption {
+                                value: "b".into(),
+                                label: "Second option".into(),
+                                description: Some("Line two description that wraps across multiple rows in a short viewport".into()),
+                            },
+                            QuestionOption {
+                                value: "c".into(),
+                                label: "Third option with a long label that wraps cleanly onto a second line".into(),
+                                description: Some("Detailed final option description ending with BOTTOM_MARKER".into()),
+                            },
+                        ],
+                        default: None,
+                    },
+                },
+                QuestionField {
+                    key: "question_0_custom".into(),
+                    title: Some("Other".into()),
+                    description: None,
+                    required: false,
+                    kind: FieldKind::Text {
+                        default: Some(
+                            "Typed a long custom answer that wraps onto multiple lines CURSOR_END"
+                                .into(),
+                        ),
+                    },
+                },
+            ],
+        };
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::Question(req),
+        });
+        app.sync_question_draft();
+        // Focus the last option in a short terminal: its wrapped tail must scroll into view.
+        if let Some(draft) = app.question_draft.as_mut() {
+            draft.field_idx = 0;
+            draft.option_idx = 2;
+        }
+        let mut short = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        short.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&short);
+        assert!(screen.contains("BOTTOM_MARKER"), "{screen}");
+
+        // Focus the wrapped text field: tail and cursor stay visible inside the modal.
+        if let Some(draft) = app.question_draft.as_mut() {
+            draft.field_idx = 1;
+            draft.option_idx = 0;
+        }
+        app.cursor_pos.set(None);
+        short.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&short);
+        assert!(screen.contains("CURSOR_END"), "{screen}");
+        assert!(app.cursor_pos.get().is_some(), "expected text cursor");
+    }
+
+    #[test]
+    fn wrap_input_preserves_spaces_and_breaks_words() {
+        assert_eq!(wrap_input("", 10), vec![""]);
+        assert_eq!(wrap_input("hello world", 7), vec!["hello ", "world"]);
+        assert_eq!(wrap_input("hello ", 6), vec!["hello "]);
+        assert_eq!(wrap_input("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
     }
 
     #[test]
