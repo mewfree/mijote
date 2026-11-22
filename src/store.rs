@@ -6,6 +6,7 @@
 //! session starts a fresh agent behind the old transcript.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -57,6 +58,73 @@ fn key_order(key: &str) -> (Option<u128>, &str) {
     (ts, key)
 }
 
+/// Canonical identifier for the project containing `cwd`: the main git
+/// repository root (shared across subdirectories and linked worktrees), or
+/// the canonicalized `cwd` when outside a git repository.
+pub fn project_root(cwd: &Path) -> PathBuf {
+    if let Some(root) = git_repo_root(cwd) {
+        return root;
+    }
+    std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.components().collect())
+}
+
+fn git_repo_root(cwd: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    let common = cwd.join(raw);
+    let canonical = std::fs::canonicalize(&common).unwrap_or(common);
+    if canonical.file_name().is_some_and(|n| n == ".git") {
+        if let Some(parent) = canonical.parent() {
+            return Some(parent.to_path_buf());
+        }
+    }
+    Some(canonical)
+}
+
+fn project_slug(project: &Path) -> String {
+    let raw = project
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let slug: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = slug.trim_matches('-');
+    if trimmed.is_empty() {
+        "project".to_string()
+    } else {
+        trimmed.chars().take(32).collect()
+    }
+}
+
+/// Deterministic 64-bit FNV-1a hash (stable across Rust versions and runs).
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
 impl Store {
     pub fn new(dir: PathBuf) -> Self {
         Self { dir }
@@ -70,8 +138,12 @@ impl Store {
         self.dir.join("last-agent")
     }
 
-    fn history_path(&self) -> PathBuf {
-        self.dir.join("prompt-history")
+    fn history_path(&self, project: &Path) -> PathBuf {
+        let slug = project_slug(project);
+        let hash = fnv1a_64(project.as_os_str().as_encoded_bytes());
+        self.dir
+            .join("history")
+            .join(format!("{slug}-{hash:016x}.json"))
     }
 
     /// Write atomically (temp file + rename) so a crash never leaves a
@@ -122,22 +194,25 @@ impl Store {
             .map(|(_, agent)| agent)
     }
 
-    /// Persist submitted prompt history atomically, keeping at most `HISTORY_LIMIT`
-    /// most recent entries. Stored without a `.json` extension so session loading
-    /// ignores it.
-    pub fn save_history(&self, entries: &[String]) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.dir)?;
+    /// Persist submitted prompt history for `project` atomically, keeping at
+    /// most `HISTORY_LIMIT` most recent entries. Stored under `history/` so
+    /// concurrent instances in different projects never overwrite each other
+    /// and top-level session loading ignores them.
+    pub fn save_history(&self, project: &Path, entries: &[String]) -> std::io::Result<()> {
+        let path = self.history_path(project);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let start = entries.len().saturating_sub(HISTORY_LIMIT);
-        let path = self.history_path();
-        let tmp = path.with_extension("tmp");
+        let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_vec(&entries[start..])?)?;
         std::fs::rename(tmp, path)
     }
 
-    /// Load persisted prompt history, oldest first. Missing or corrupt files
-    /// return an empty list.
-    pub fn load_history(&self) -> Vec<String> {
-        let Ok(bytes) = std::fs::read(self.history_path()) else {
+    /// Load persisted prompt history for `project`, oldest first. Missing or
+    /// corrupt files return an empty list.
+    pub fn load_history(&self, project: &Path) -> Vec<String> {
+        let Ok(bytes) = std::fs::read(self.history_path(project)) else {
             return Vec::new();
         };
         let Ok(mut entries) = serde_json::from_slice::<Vec<String>>(&bytes) else {
@@ -269,22 +344,38 @@ mod tests {
     }
 
     #[test]
-    fn prompt_history_round_trips_caps_and_ignores_corrupt_files() {
+    fn prompt_history_is_scoped_by_project_caps_and_ignores_corrupt_files() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path().join("sessions"));
-        assert!(store.load_history().is_empty());
+        let proj_a = Path::new("/work/a/app");
+        let proj_b = Path::new("/work/b/app");
+        assert!(store.load_history(proj_a).is_empty());
 
-        let prompts = vec!["first".to_string(), "multi\nline".to_string()];
-        store.save_history(&prompts).unwrap();
-        assert_eq!(store.load_history(), prompts);
+        // An old global prompt-history file is ignored so prompts never leak across projects.
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        std::fs::write(
+            dir.path().join("sessions/prompt-history"),
+            r#"["legacy global"]"#,
+        )
+        .unwrap();
+        assert!(store.load_history(proj_a).is_empty());
+
+        // Two projects with the same directory name stay isolated.
+        let prompts_a = vec!["first".to_string(), "multi\nline".to_string()];
+        let prompts_b = vec!["other repo".to_string()];
+        store.save_history(proj_a, &prompts_a).unwrap();
+        store.save_history(proj_b, &prompts_b).unwrap();
+        assert_eq!(store.load_history(proj_a), prompts_a);
+        assert_eq!(store.load_history(proj_b), prompts_b);
+
         // Must not interfere with session records or last_agent.
-        assert!(store.load(Path::new("/p")).is_empty());
+        assert!(store.load(proj_a).is_empty());
         assert_eq!(store.last_agent(), None);
 
         // Caps at HISTORY_LIMIT, keeping the newest entries.
         let many: Vec<String> = (0..(HISTORY_LIMIT + 10)).map(|i| format!("p{i}")).collect();
-        store.save_history(&many).unwrap();
-        let loaded = store.load_history();
+        store.save_history(proj_a, &many).unwrap();
+        let loaded = store.load_history(proj_a);
         assert_eq!(loaded.len(), HISTORY_LIMIT);
         assert_eq!(loaded.first().map(String::as_str), Some("p10"));
         assert_eq!(
@@ -293,7 +384,52 @@ mod tests {
         );
 
         // Corrupt history file returns empty instead of failing.
-        std::fs::write(dir.path().join("sessions/prompt-history"), "{bad").unwrap();
-        assert!(store.load_history().is_empty());
+        std::fs::write(store.history_path(proj_a), "{bad").unwrap();
+        assert!(store.load_history(proj_a).is_empty());
+        assert_eq!(store.load_history(proj_b), prompts_b);
+    }
+
+    #[test]
+    fn project_root_groups_git_subdirs_and_worktrees_and_separates_other_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let sub = repo.join("src/nested");
+        let other = dir.path().join("other");
+        let wt = dir.path().join("wt-feature");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+
+        let run_git = |cwd: &Path, args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("README.md"), "hi\n").unwrap();
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+        run_git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+
+        let root_from_repo = project_root(&repo);
+        let root_from_sub = project_root(&sub);
+        let root_from_wt = project_root(&wt);
+        let root_from_other = project_root(&other);
+
+        assert_eq!(root_from_repo, std::fs::canonicalize(&repo).unwrap());
+        assert_eq!(root_from_sub, root_from_repo);
+        assert_eq!(root_from_wt, root_from_repo);
+        assert_ne!(root_from_other, root_from_repo);
+        assert_eq!(root_from_other, std::fs::canonicalize(&other).unwrap());
     }
 }

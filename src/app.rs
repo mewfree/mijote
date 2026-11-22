@@ -411,6 +411,8 @@ pub struct App {
     /// notice replaces it.
     notice: Option<Notice>,
     cwd: PathBuf,
+    /// Canonical project root used to scope persistent prompt history.
+    project: PathBuf,
     worktrees_root: PathBuf,
     store: Store,
     ui_tx: Sender<Msg>,
@@ -419,7 +421,8 @@ pub struct App {
 
 impl App {
     pub fn new(cwd: PathBuf, worktrees_root: PathBuf, store: Store, ui_tx: Sender<Msg>) -> Self {
-        let history = store.load_history();
+        let project = crate::store::project_root(&cwd);
+        let history = store.load_history(&project);
         Self {
             sessions: Vec::new(),
             selected: 0,
@@ -463,6 +466,7 @@ impl App {
             question_draft: None,
             notice: None,
             cwd,
+            project,
             worktrees_root,
             store,
             ui_tx,
@@ -1981,7 +1985,7 @@ impl App {
                 let excess = self.history.len() - crate::store::HISTORY_LIMIT;
                 self.history.drain(..excess);
             }
-            let _ = self.store.save_history(&self.history);
+            let _ = self.store.save_history(&self.project, &self.history);
         }
     }
 
@@ -4083,12 +4087,14 @@ mod tests {
             Some(&Entry::User(format!("wip {big_paste}")))
         );
 
-        // History persists on disk for a fresh App sharing the same Store.
+        // History persists on disk for a fresh App in the same project,
+        // including subdirectories of the same git repo, while another project
+        // sharing the same Store starts with an empty history.
         let (tx2, _rx2) = mpsc::channel();
         let mut app2 = App::new(
+            PathBuf::from("src"),
             PathBuf::from("."),
-            PathBuf::from("."),
-            Store::new(store_dir),
+            Store::new(store_dir.clone()),
             tx2,
         );
         let (mut s2, _) = Session::detached(0, agent::find("claude").unwrap());
@@ -4101,6 +4107,17 @@ mod tests {
         assert_eq!(app2.input.text(), "second prompt");
         app2.handle_key(key(KeyCode::Up));
         assert_eq!(app2.input.text(), "first prompt");
+
+        let other_dir = dir.path().join("other-project");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let (tx3, _rx3) = mpsc::channel();
+        let mut app3 = App::new(other_dir, PathBuf::from("."), Store::new(store_dir), tx3);
+        let (mut s3, _) = Session::detached(0, agent::find("claude").unwrap());
+        s3.status = Status::Idle;
+        app3.sessions.push(s3);
+        app3.mode = Mode::Insert;
+        app3.handle_key(key(KeyCode::Up));
+        assert_eq!(app3.input.text(), "");
     }
 
     #[test]
