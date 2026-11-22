@@ -128,6 +128,10 @@ fn ask(id: &str, prompt: &str, effort: Option<&str>) -> Result<()> {
     }
 
     let blocks = files::expand_mentions(prompt, &cwd, client.supports_embedded_context());
+    let mut usage = session::SessionUsage::default();
+    if let Some(u) = client.usage().cloned() {
+        usage.apply_update(u);
+    }
     let stop = client.prompt_blocks(
         &session,
         &blocks,
@@ -142,6 +146,8 @@ fn ask(id: &str, prompt: &str, effort: Option<&str>) -> Result<()> {
                 status: Some(s),
                 ..
             } => eprintln!("[tool {id}] {s}"),
+            Event::UsageUpdated(u) => usage.apply_update(u),
+            Event::TurnUsage(t) => usage.apply_tokens(t),
             _ => {}
         },
         |req| {
@@ -256,6 +262,9 @@ fn ask(id: &str, prompt: &str, effort: Option<&str>) -> Result<()> {
         },
     )?;
     println!();
+    if let Some(summary) = ui::format_usage_summary(&usage) {
+        eprintln!("context: {summary}");
+    }
     if stop != StopReason::EndTurn {
         eprintln!("stopped: {stop:?}");
     }

@@ -37,6 +37,8 @@ pub enum Mode {
     Rename,
     /// Searching the current session's transcript.
     Search,
+    /// Context window & token usage breakdown modal for the current session.
+    Usage,
 }
 
 /// A destructive action waiting for the user to confirm it.
@@ -784,6 +786,7 @@ impl App {
             Mode::Help => self.handle_help(key),
             Mode::Rename => self.handle_rename(key),
             Mode::Search => self.handle_search(key),
+            Mode::Usage => self.handle_usage(key),
         }
     }
 
@@ -850,7 +853,13 @@ impl App {
     pub fn handle_mouse(&mut self, ev: MouseEvent, area: Rect) {
         if matches!(
             self.mode,
-            Mode::Picker | Mode::Model | Mode::Effort | Mode::Switcher | Mode::Help | Mode::Rename
+            Mode::Picker
+                | Mode::Model
+                | Mode::Effort
+                | Mode::Switcher
+                | Mode::Help
+                | Mode::Rename
+                | Mode::Usage
         ) || self.confirm.is_some()
             || self
                 .current()
@@ -1434,6 +1443,7 @@ impl App {
             KeyCode::Char('r') => self.open_rename(self.selected, Mode::Normal),
             KeyCode::Char('M') => self.open_models(),
             KeyCode::Char('e') => self.open_effort(),
+            KeyCode::Char('u') => self.open_usage(),
             KeyCode::Char('s') | KeyCode::Tab => self.open_switcher(),
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('t') => self.toggle_trace(),
@@ -2297,6 +2307,21 @@ impl App {
         if matches!(
             key.code,
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
+        ) {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    fn open_usage(&mut self) {
+        if self.current().is_some() {
+            self.mode = Mode::Usage;
+        }
+    }
+
+    fn handle_usage(&mut self, key: KeyEvent) {
+        if matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('u') | KeyCode::Enter
         ) {
             self.mode = Mode::Normal;
         }
@@ -4277,5 +4302,40 @@ mod tests {
         restored.handle_key(key(KeyCode::Char('k')));
         assert_eq!(restored.input.text(), "restored one");
         let _ = restored.close_all();
+    }
+
+    #[test]
+    fn leader_u_opens_and_closes_usage_modal_without_breaking_ctrl_u_scroll() {
+        let (mut app, _) = app_with_session();
+        app.max_scroll.set(20);
+        app.transcript_height.set(10);
+
+        // `leader + u` opens Mode::Usage.
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.mode, Mode::Usage);
+
+        // `u` (or `Esc`/`q`/`Enter`) closes back to Normal.
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.mode, Mode::Normal);
+
+        // `C-a u` from Insert mode also opens Mode::Usage.
+        app.mode = Mode::Insert;
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.mode, Mode::Usage);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+
+        // `leader + Ctrl-u` still scrolls half a page up (does not open Usage).
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.scroll, 5);
+
+        // `Ctrl-d` quits cleanly when Usage modal is open.
+        app.mode = Mode::Usage;
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
     }
 }

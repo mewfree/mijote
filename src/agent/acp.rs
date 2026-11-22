@@ -107,6 +107,79 @@ pub struct AvailableCommand {
     pub input_hint: Option<String>,
 }
 
+/// Cumulative session cost reported inside an ACP `usage_update`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CostInfo {
+    pub amount: f64,
+    pub currency: String,
+}
+
+impl CostInfo {
+    fn parse(v: &Value) -> Option<Self> {
+        let amount = v
+            .get("amount")
+            .and_then(Value::as_f64)
+            .filter(|a| a.is_finite() && *a >= 0.0)?;
+        let currency = v.get("currency").and_then(non_empty_str)?.to_string();
+        Some(Self { amount, currency })
+    }
+}
+
+/// Live context window occupancy and optional cumulative cost from an ACP
+/// `usage_update` notification.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageUpdate {
+    pub used: u64,
+    pub size: u64,
+    #[serde(default)]
+    pub cost: Option<CostInfo>,
+}
+
+impl UsageUpdate {
+    fn parse(v: &Value) -> Option<Self> {
+        let used = json_u64(v.get("used")?)?;
+        let size = json_u64(v.get("size")?)?;
+        let cost = v.get("cost").and_then(CostInfo::parse);
+        Some(Self { used, size, cost })
+    }
+}
+
+/// Token breakdown returned on an ACP `session/prompt` response (`usage`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub thought_tokens: Option<u64>,
+    #[serde(default)]
+    pub cached_read_tokens: Option<u64>,
+    #[serde(default)]
+    pub cached_write_tokens: Option<u64>,
+}
+
+impl TokenUsage {
+    fn parse(v: &Value) -> Option<Self> {
+        let input = v.get("inputTokens").and_then(json_u64);
+        let output = v.get("outputTokens").and_then(json_u64);
+        let total = v.get("totalTokens").and_then(json_u64);
+        if input.is_none() && output.is_none() && total.is_none() {
+            return None;
+        }
+        let input_tokens = input.unwrap_or(0);
+        let output_tokens = output.unwrap_or(0);
+        let total_tokens = total.unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+        Some(Self {
+            total_tokens,
+            input_tokens,
+            output_tokens,
+            thought_tokens: v.get("thoughtTokens").and_then(json_u64),
+            cached_read_tokens: v.get("cachedReadTokens").and_then(json_u64),
+            cached_write_tokens: v.get("cachedWriteTokens").and_then(json_u64),
+        })
+    }
+}
+
 /// Something the agent told us during a prompt turn.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -138,6 +211,10 @@ pub enum Event {
     },
     /// The agent advertised or replaced its available slash commands.
     AvailableCommands(Vec<AvailableCommand>),
+    /// Live context window occupancy and optional cost (`usage_update`).
+    UsageUpdated(UsageUpdate),
+    /// Token breakdown reported on `session/prompt` completion (`usage`).
+    TurnUsage(TokenUsage),
     /// An update type we don't model yet (kept so nothing is silently lost).
     Other(String),
 }
@@ -490,6 +567,7 @@ pub struct AcpClient {
     models: ModelState,
     effort: EffortState,
     commands: Vec<AvailableCommand>,
+    usage: Option<UsageUpdate>,
     embedded_context: bool,
 }
 
@@ -524,6 +602,7 @@ impl AcpClient {
             models: ModelState::default(),
             effort: EffortState::default(),
             commands: Vec::new(),
+            usage: None,
             embedded_context: false,
         })
     }
@@ -554,6 +633,15 @@ impl AcpClient {
             }
             Event::AvailableCommands(cmds) => {
                 self.commands = cmds.clone();
+            }
+            Event::UsageUpdated(u) => {
+                let prev_cost = self.usage.as_ref().and_then(|cur| cur.cost.clone());
+                let prev_size = self.usage.as_ref().map_or(0, |cur| cur.size);
+                self.usage = Some(UsageUpdate {
+                    used: u.used,
+                    size: if u.size > 0 { u.size } else { prev_size },
+                    cost: u.cost.clone().or(prev_cost),
+                });
             }
             _ => {}
         }
@@ -694,6 +782,7 @@ impl AcpClient {
 
     pub fn new_session(&mut self, cwd: &Path) -> Result<String, AcpError> {
         self.commands.clear();
+        self.usage = None;
         let result = self.call_quiet(
             "session/new",
             json!({"cwd": cwd.to_string_lossy(), "mcpServers": []}),
@@ -735,6 +824,11 @@ impl AcpClient {
     /// Slash commands the agent advertised for the session (empty if none).
     pub fn commands(&self) -> &[AvailableCommand] {
         &self.commands
+    }
+
+    /// Latest context usage update reported by the agent, if any.
+    pub fn usage(&self) -> Option<&UsageUpdate> {
+        self.usage.as_ref()
     }
 
     fn sync_config_options(
@@ -846,6 +940,9 @@ impl AcpClient {
             .get("stopReason")
             .and_then(Value::as_str)
             .ok_or_else(|| AcpError::Protocol("session/prompt: missing stopReason".into()))?;
+        if let Some(usage) = result.get("usage").and_then(TokenUsage::parse) {
+            on_event(Event::TurnUsage(usage));
+        }
         Ok(StopReason::parse(reason))
     }
 }
@@ -963,6 +1060,10 @@ fn parse_update(u: &Value) -> Event {
             None => Event::Other(kind),
         },
         "current_model_update" => Event::ModelChanged(str_of(u, "currentModelId")),
+        "usage_update" => match UsageUpdate::parse(u) {
+            Some(usage) => Event::UsageUpdated(usage),
+            None => Event::Other(kind),
+        },
         _ => Event::Other(kind),
     }
 }
@@ -1003,6 +1104,14 @@ fn parse_available_commands(v: &Value) -> Vec<AvailableCommand> {
 
 fn non_empty_str(v: &Value) -> Option<&str> {
     v.as_str().map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn json_u64(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| {
+        v.as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0 && *f <= u64::MAX as f64)
+            .map(|f| f.round() as u64)
+    })
 }
 
 fn string_array(v: &Value) -> Option<Vec<&str>> {
@@ -2033,6 +2142,160 @@ for line in sys.stdin:
                 description: "Review changes".into(),
                 input_hint: None,
             }])]
+        );
+    }
+
+    #[test]
+    fn parse_usage_update_and_token_usage() {
+        let u = parse_update(&json!({
+            "sessionUpdate": "usage_update",
+            "used": 45200,
+            "size": 200000,
+            "cost": { "amount": 0.14, "currency": "USD" },
+        }));
+        assert_eq!(
+            u,
+            Event::UsageUpdated(UsageUpdate {
+                used: 45_200,
+                size: 200_000,
+                cost: Some(CostInfo {
+                    amount: 0.14,
+                    currency: "USD".into(),
+                }),
+            })
+        );
+
+        // Mid-turn usage_update without cost and with float numbers.
+        let mid = parse_update(&json!({
+            "sessionUpdate": "usage_update",
+            "used": 1200.4,
+            "size": 100000.0,
+        }));
+        assert_eq!(
+            mid,
+            Event::UsageUpdated(UsageUpdate {
+                used: 1200,
+                size: 100_000,
+                cost: None,
+            })
+        );
+
+        // Missing required fields falls back to Event::Other.
+        assert_eq!(
+            parse_update(&json!({"sessionUpdate": "usage_update", "used": 100})),
+            Event::Other("usage_update".into())
+        );
+
+        // Prompt response usage breakdown.
+        let tok = TokenUsage::parse(&json!({
+            "totalTokens": 12345,
+            "inputTokens": 10000,
+            "outputTokens": 2345,
+            "thoughtTokens": 500,
+            "cachedReadTokens": 8000,
+            "cachedWriteTokens": 200,
+        }))
+        .unwrap();
+        assert_eq!(
+            tok,
+            TokenUsage {
+                total_tokens: 12_345,
+                input_tokens: 10_000,
+                output_tokens: 2_345,
+                thought_tokens: Some(500),
+                cached_read_tokens: Some(8_000),
+                cached_write_tokens: Some(200),
+            }
+        );
+        // Empty usage object is ignored.
+        assert_eq!(TokenUsage::parse(&json!({})), None);
+    }
+
+    #[test]
+    fn usage_update_and_prompt_usage_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    m, mid = msg.get("method"), msg.get("id")
+    if m == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{
+            "protocolVersion":1,
+            "agentInfo":{"name":"fake"}
+        }}), flush=True)
+    elif m == "session/new":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"sessionId":"s1"}}), flush=True)
+    elif m == "session/prompt":
+        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"s1",
+            "update":{"sessionUpdate":"usage_update","used":40000,"size":200000}
+        }}), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"s1",
+            "update":{
+                "sessionUpdate":"usage_update",
+                "used":52000,
+                "size":200000,
+                "cost":{"amount":0.18,"currency":"USD"}
+            }
+        }}), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{
+            "stopReason":"end_turn",
+            "usage":{
+                "totalTokens":52000,
+                "inputTokens":48000,
+                "outputTokens":4000,
+                "cachedReadTokens":30000
+            }
+        }}), flush=True)
+"#;
+        let mut client = AcpClient::spawn("python3", &["-c", script], dir.path()).unwrap();
+        client.initialize().unwrap();
+        let sid = client.new_session(dir.path()).unwrap();
+        assert_eq!(client.usage(), None);
+
+        let mut events = Vec::new();
+        let stop = client
+            .prompt(&sid, "hi", |ev| events.push(ev), |_| None)
+            .unwrap();
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(
+            events,
+            vec![
+                Event::UsageUpdated(UsageUpdate {
+                    used: 40_000,
+                    size: 200_000,
+                    cost: None,
+                }),
+                Event::UsageUpdated(UsageUpdate {
+                    used: 52_000,
+                    size: 200_000,
+                    cost: Some(CostInfo {
+                        amount: 0.18,
+                        currency: "USD".into(),
+                    }),
+                }),
+                Event::TurnUsage(TokenUsage {
+                    total_tokens: 52_000,
+                    input_tokens: 48_000,
+                    output_tokens: 4_000,
+                    thought_tokens: None,
+                    cached_read_tokens: Some(30_000),
+                    cached_write_tokens: None,
+                }),
+            ]
+        );
+        assert_eq!(
+            client.usage(),
+            Some(&UsageUpdate {
+                used: 52_000,
+                size: 200_000,
+                cost: Some(CostInfo {
+                    amount: 0.18,
+                    currency: "USD".into(),
+                }),
+            })
         );
     }
 }

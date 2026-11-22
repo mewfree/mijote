@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::acp::{
-    AcpClient, AvailableCommand, CancelHandle, EffortState, ElicitationRequest,
-    ElicitationResponse, Event, ModelState, PermissionRequest, StopReason, ToolContent,
+    AcpClient, AvailableCommand, CancelHandle, CostInfo, EffortState, ElicitationRequest,
+    ElicitationResponse, Event, ModelState, PermissionRequest, StopReason, TokenUsage, ToolContent,
+    UsageUpdate,
 };
 use crate::agent::{install, AgentSpec};
 use crate::store::{self, Record};
@@ -42,10 +43,60 @@ pub enum Status {
     Failed,
 }
 
+/// Aggregated live context-window and token usage for one agent session.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionUsage {
+    /// Current context window occupancy in tokens (from ACP `usage_update`).
+    pub context_used: Option<u64>,
+    /// Context window capacity in tokens (from ACP `usage_update`).
+    pub context_size: Option<u64>,
+    /// Cumulative session cost (from ACP `usage_update.cost`).
+    pub cost: Option<CostInfo>,
+    /// Token breakdown from the latest `session/prompt` response (`usage`).
+    pub tokens: Option<TokenUsage>,
+}
+
+impl SessionUsage {
+    pub fn apply_update(&mut self, update: UsageUpdate) {
+        self.context_used = Some(update.used);
+        if update.size > 0 {
+            self.context_size = Some(update.size);
+        }
+        if update.cost.is_some() {
+            self.cost = update.cost;
+        }
+    }
+
+    pub fn apply_tokens(&mut self, tokens: TokenUsage) {
+        self.tokens = Some(tokens);
+    }
+
+    /// Context occupancy percentage (`0.0..=100.0+`) when both `used` and a
+    /// non-zero `size` have been reported.
+    pub fn context_pct(&self) -> Option<f64> {
+        let used = self.context_used?;
+        let size = self.context_size.filter(|&s| s > 0)?;
+        Some((used as f64 / size as f64) * 100.0)
+    }
+
+    pub fn has_data(&self) -> bool {
+        self.context_used.is_some()
+            || self.context_size.is_some()
+            || self.cost.is_some()
+            || self.tokens.is_some()
+    }
+}
+
 /// Worker -> UI messages.
 #[derive(Debug)]
 pub enum UiMsg {
-    Ready(CancelHandle, ModelState, EffortState, Vec<AvailableCommand>),
+    Ready(
+        CancelHandle,
+        ModelState,
+        EffortState,
+        Vec<AvailableCommand>,
+        Option<UsageUpdate>,
+    ),
     /// `session/set_model` failed; the model is unchanged.
     ModelFailed(String),
     /// Setting the effort level failed; the effort is unchanged.
@@ -102,6 +153,8 @@ pub struct Session {
     preferred_effort: Option<String>,
     /// Slash commands advertised by the agent (`available_commands_update`).
     pub commands: Vec<AvailableCommand>,
+    /// Live context window, cost, and token usage reported by the agent.
+    pub usage: SessionUsage,
     cancel: Option<CancelHandle>,
     cmd_tx: Sender<WorkerCmd>,
     perm_tx: Sender<Option<String>>,
@@ -175,6 +228,7 @@ impl Session {
             effort: EffortState::default(),
             preferred_effort: None,
             commands: Vec::new(),
+            usage: SessionUsage::default(),
             cancel: None,
             cmd_tx,
             perm_tx,
@@ -379,7 +433,7 @@ impl Session {
     pub fn apply(&mut self, body: UiMsg) {
         match body {
             UiMsg::Closed(_) => {}
-            UiMsg::Ready(handle, models, effort, commands) => {
+            UiMsg::Ready(handle, models, effort, commands, usage) => {
                 self.cancel = Some(handle);
                 self.status = Status::Idle;
                 self.models = models;
@@ -387,6 +441,9 @@ impl Session {
                 self.effort = effort;
                 self.preferred_effort = None;
                 self.commands = commands;
+                if let Some(u) = usage {
+                    self.usage.apply_update(u);
+                }
             }
             UiMsg::ModelFailed(e) => self
                 .entries
@@ -519,6 +576,12 @@ impl Session {
             Event::AvailableCommands(cmds) => {
                 self.commands = cmds;
             }
+            Event::UsageUpdated(u) => {
+                self.usage.apply_update(u);
+            }
+            Event::TurnUsage(t) => {
+                self.usage.apply_tokens(t);
+            }
             Event::Other(_) => {}
         }
     }
@@ -570,6 +633,7 @@ fn worker(
             client.models().clone(),
             client.effort().clone(),
             client.commands().to_vec(),
+            client.usage().cloned(),
         ));
         loop {
             let _ = client.poll_updates(|e| send(UiMsg::Event(e)));
@@ -582,6 +646,7 @@ fn worker(
                 WorkerCmd::Prompt(text) => text,
                 WorkerCmd::SetModel(id) => {
                     let prev_cmds = client.commands().to_vec();
+                    let prev_usage = client.usage().cloned();
                     match client.set_model(&sid, &id) {
                         Ok(()) => {
                             let effort = (!client.effort().available.is_empty())
@@ -595,6 +660,11 @@ fn worker(
                                     client.commands().to_vec(),
                                 )));
                             }
+                            if client.usage() != prev_usage.as_ref() {
+                                if let Some(u) = client.usage().cloned() {
+                                    send(UiMsg::Event(Event::UsageUpdated(u)));
+                                }
+                            }
                         }
                         Err(e) => send(UiMsg::ModelFailed(e.to_string())),
                     }
@@ -602,6 +672,7 @@ fn worker(
                 }
                 WorkerCmd::SetEffort(id) => {
                     let prev_cmds = client.commands().to_vec();
+                    let prev_usage = client.usage().cloned();
                     match client.set_effort(&sid, &id) {
                         Ok(()) => {
                             if client.effort().available.is_empty() {
@@ -616,6 +687,11 @@ fn worker(
                                 send(UiMsg::Event(Event::AvailableCommands(
                                     client.commands().to_vec(),
                                 )));
+                            }
+                            if client.usage() != prev_usage.as_ref() {
+                                if let Some(u) = client.usage().cloned() {
+                                    send(UiMsg::Event(Event::UsageUpdated(u)));
+                                }
                             }
                         }
                         Err(e) => send(UiMsg::EffortFailed(e.to_string())),
@@ -980,5 +1056,71 @@ mod tests {
         // Replacement clears previous commands.
         s.apply(UiMsg::Event(Event::AvailableCommands(vec![])));
         assert!(s.commands.is_empty());
+    }
+
+    #[test]
+    fn usage_events_update_context_preserve_cost_and_handle_compaction() {
+        let (mut s, _) = session();
+        assert!(!s.usage.has_data());
+        assert_eq!(s.usage.context_pct(), None);
+
+        // Turn 1 end-of-turn update includes cost.
+        s.apply(UiMsg::Event(Event::UsageUpdated(UsageUpdate {
+            used: 80_000,
+            size: 200_000,
+            cost: Some(CostInfo {
+                amount: 0.12,
+                currency: "USD".into(),
+            }),
+        })));
+        assert!(s.usage.has_data());
+        assert_eq!(s.usage.context_used, Some(80_000));
+        assert_eq!(s.usage.context_size, Some(200_000));
+        assert!((s.usage.context_pct().unwrap() - 40.0).abs() < 1e-6);
+        assert_eq!(
+            s.usage.cost,
+            Some(CostInfo {
+                amount: 0.12,
+                currency: "USD".into(),
+            })
+        );
+
+        // Mid-turn update on Turn 2 omits cost: previous cost is preserved.
+        s.apply(UiMsg::Event(Event::UsageUpdated(UsageUpdate {
+            used: 120_000,
+            size: 200_000,
+            cost: None,
+        })));
+        assert_eq!(s.usage.context_used, Some(120_000));
+        assert!((s.usage.context_pct().unwrap() - 60.0).abs() < 1e-6);
+        assert_eq!(
+            s.usage.cost,
+            Some(CostInfo {
+                amount: 0.12,
+                currency: "USD".into(),
+            })
+        );
+
+        // Compaction drops used tokens while keeping window size and cost.
+        s.apply(UiMsg::Event(Event::UsageUpdated(UsageUpdate {
+            used: 15_000,
+            size: 200_000,
+            cost: None,
+        })));
+        assert_eq!(s.usage.context_used, Some(15_000));
+        assert!((s.usage.context_pct().unwrap() - 7.5).abs() < 1e-6);
+        assert!(s.usage.cost.is_some());
+
+        // TurnUsage stores token breakdown.
+        let tok = TokenUsage {
+            total_tokens: 15_000,
+            input_tokens: 12_000,
+            output_tokens: 3_000,
+            thought_tokens: Some(400),
+            cached_read_tokens: Some(8_000),
+            cached_write_tokens: Some(500),
+        };
+        s.apply(UiMsg::Event(Event::TurnUsage(tok.clone())));
+        assert_eq!(s.usage.tokens, Some(tok));
     }
 }

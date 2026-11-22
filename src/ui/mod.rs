@@ -19,10 +19,10 @@ use ratatui::Frame;
 
 mod markdown;
 
-use crate::agent::acp::{ElicitationRequest, FieldKind, ToolContent};
+use crate::agent::acp::{CostInfo, ElicitationRequest, FieldKind, ToolContent};
 use crate::agent::install::AgentStatus;
 use crate::app::{App, Confirm, FieldDraft, MentionPopup, Mode, QuestionDraft, SlashPopup};
-use crate::session::{Entry, Session, Status};
+use crate::session::{Entry, Session, SessionUsage, Status};
 
 /// A clickable markdown hyperlink on the current screen, in terminal cells.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +121,10 @@ pub fn render(f: &mut Frame, app: &App) {
     }
     if app.mode == Mode::Rename {
         render_rename(f, app);
+        modal_open = true;
+    }
+    if app.mode == Mode::Usage {
+        render_usage(f, app);
         modal_open = true;
     }
     if let Some(s) = app.current() {
@@ -367,6 +371,211 @@ fn worktree_state_spans(s: &Session) -> Vec<Span<'static>> {
         ));
     }
     spans
+}
+
+/// Format a token count compactly (`450`, `1.2k`, `45k`, `200k`, `1.2M`).
+pub fn format_tokens(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 9_950 {
+        let tenths = (n + 50) / 100;
+        let whole = tenths / 10;
+        let frac = tenths % 10;
+        if frac == 0 {
+            format!("{whole}k")
+        } else {
+            format!("{whole}.{frac}k")
+        }
+    } else if n < 999_500 {
+        format!("{}k", (n + 500) / 1_000)
+    } else {
+        let tenths = (n + 50_000) / 100_000;
+        let whole = tenths / 10;
+        let frac = tenths % 10;
+        if frac == 0 {
+            format!("{whole}M")
+        } else {
+            format!("{whole}.{frac}M")
+        }
+    }
+}
+
+fn format_tokens_exact(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Format context window utilization as a compact percentage (`0%`, `<1%`, `42%`).
+pub fn format_pct(used: u64, size: u64) -> String {
+    if size == 0 || used == 0 {
+        return "0%".to_string();
+    }
+    let pct = (used as f64 / size as f64) * 100.0;
+    if pct < 0.5 {
+        "<1%".to_string()
+    } else {
+        format!("{:.0}%", pct.round())
+    }
+}
+
+/// Format a session cost (`$0.14`, `$0.004`, `0.14 EUR`).
+pub fn format_cost(cost: &CostInfo) -> String {
+    if cost.currency.eq_ignore_ascii_case("USD") {
+        if cost.amount > 0.0 && cost.amount < 0.01 {
+            format!("${:.3}", cost.amount)
+        } else {
+            format!("${:.2}", cost.amount)
+        }
+    } else {
+        format!("{:.2} {}", cost.amount, cost.currency)
+    }
+}
+
+/// One-line usage summary suitable for CLI stderr output.
+pub fn format_usage_summary(usage: &SessionUsage) -> Option<String> {
+    if let (Some(used), Some(size)) = (usage.context_used, usage.context_size.filter(|&s| s > 0)) {
+        let mut s = format!(
+            "{} ({}/{})",
+            format_pct(used, size),
+            format_tokens(used),
+            format_tokens(size)
+        );
+        if let Some(cost) = &usage.cost {
+            s.push_str(&format!(" · {}", format_cost(cost)));
+        }
+        return Some(s);
+    }
+    let mut parts = Vec::new();
+    if let Some(tok) = &usage.tokens {
+        parts.push(format!("{} tok", format_tokens(tok.total_tokens)));
+    }
+    if let Some(cost) = &usage.cost {
+        parts.push(format_cost(cost));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+fn context_color(pct: f64) -> Color {
+    if pct >= 80.0 {
+        ERR
+    } else if pct >= 60.0 {
+        WARN
+    } else {
+        OK
+    }
+}
+
+fn context_bar_spans(pct: f64, width: usize) -> Vec<Span<'static>> {
+    let clamped = pct.clamp(0.0, 100.0);
+    let filled = ((clamped / 100.0) * width as f64).round() as usize;
+    let filled = filled.min(width);
+    let empty = width - filled;
+    let color = context_color(pct);
+    let mut spans = Vec::with_capacity(2);
+    if filled > 0 {
+        spans.push(Span::styled("█".repeat(filled), Style::new().fg(color)));
+    }
+    if empty > 0 {
+        spans.push(Span::styled("░".repeat(empty), DIM));
+    }
+    spans
+}
+
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|s| s.content.chars().count()).sum()
+}
+
+/// Right-aligned context/usage gauge for the prompt box border, degrading
+/// gracefully as terminal width shrinks.
+fn prompt_usage_title(usage: &SessionUsage, max_width: usize) -> Option<Line<'static>> {
+    if max_width < 8 {
+        return None;
+    }
+    if let (Some(used), Some(size)) = (usage.context_used, usage.context_size.filter(|&s| s > 0)) {
+        let pct = (used as f64 / size as f64) * 100.0;
+        let color = context_color(pct);
+        let pct_style = if pct >= 80.0 {
+            Style::new().fg(color).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(color)
+        };
+        let pct_str = format_pct(used, size);
+        let tok_str = format!(" · {}/{}", format_tokens(used), format_tokens(size));
+        let cost_str = usage
+            .cost
+            .as_ref()
+            .map(|c| format!(" · {}", format_cost(c)));
+
+        let build = |with_bar: bool, with_tok: bool, with_cost: bool| -> Vec<Span<'static>> {
+            let mut spans = vec![Span::styled(" ctx ", DIM)];
+            if with_bar {
+                spans.extend(context_bar_spans(pct, 8));
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(pct_str.clone(), pct_style));
+            if with_tok {
+                spans.push(Span::styled(tok_str.clone(), DIM));
+            }
+            if with_cost {
+                if let Some(c) = &cost_str {
+                    spans.push(Span::styled(c.clone(), DIM));
+                }
+            }
+            spans.push(Span::raw(" "));
+            spans
+        };
+
+        let candidates = [
+            (true, true, cost_str.is_some()),
+            (true, true, false),
+            (true, false, false),
+            (false, false, false),
+        ];
+        for (bar, tok, cost) in candidates {
+            let spans = build(bar, tok, cost);
+            if spans_width(&spans) <= max_width {
+                return Some(Line::from(spans));
+            }
+        }
+        return None;
+    }
+
+    let tok_part = usage
+        .tokens
+        .as_ref()
+        .map(|t| format!("tok {}", format_tokens(t.total_tokens)));
+    let cost_part = usage.cost.as_ref().map(format_cost);
+    let full = match (&tok_part, &cost_part) {
+        (Some(t), Some(c)) => Some(format!(" {t} · {c} ")),
+        (Some(t), None) => Some(format!(" {t} ")),
+        (None, Some(c)) => Some(format!(" {c} ")),
+        (None, None) => None,
+    };
+    if let Some(text) = full {
+        if text.chars().count() <= max_width {
+            return Some(Line::styled(text, DIM));
+        }
+    }
+    if let Some(t) = tok_part {
+        let compact = format!(" {t} ");
+        if compact.chars().count() <= max_width {
+            return Some(Line::styled(compact, DIM));
+        }
+    }
+    if let Some(c) = cost_part {
+        let compact = format!(" {c} ");
+        if compact.chars().count() <= max_width {
+            return Some(Line::styled(compact, DIM));
+        }
+    }
+    None
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
@@ -1308,11 +1517,17 @@ fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
 fn render_input(f: &mut Frame, app: &App, area: Rect) {
     let active = app.mode == Mode::Insert;
     let border = if active { ACCENT } else { Color::DarkGray };
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(border))
         .padding(Padding::horizontal(1));
+    if let Some(s) = app.current() {
+        let max_title_w = area.width.saturating_sub(4) as usize;
+        if let Some(title) = prompt_usage_title(&s.usage, max_title_w) {
+            block = block.title_top(title.right_aligned());
+        }
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -1395,6 +1610,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         Mode::Help => (" HELP ", ASK),
         Mode::Rename => (" RENAME ", ASK),
         Mode::Search => (" SEARCH ", WARN),
+        Mode::Usage => (" USAGE ", ASK),
     };
     let mut spans = vec![
         Span::styled(
@@ -1510,6 +1726,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("r", "rename"),
                 ("M", "model"),
                 ("e", "effort"),
+                ("u", "usage"),
                 ("s", "sessions"),
                 ("t", trace_label),
                 ("j/k", "select"),
@@ -1591,6 +1808,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("Esc", "close"),
             ],
             Mode::Help => vec![("Esc/q/?", "close")],
+            Mode::Usage => vec![("Esc/q/u", "close")],
             Mode::Rename => vec![("Enter", "save"), ("^U", "clear"), ("Esc", "cancel")],
             Mode::Search => vec![],
         };
@@ -1751,6 +1969,21 @@ fn render_switcher(f: &mut Frame, app: &App) {
             let wt_spans = worktree_state_spans(s);
             let wt_w: usize = wt_spans.iter().map(|sp| sp.content.chars().count()).sum();
 
+            let ctx_badge: Option<(String, Style)> = s.usage.context_pct().map(|pct| {
+                let used = s.usage.context_used.unwrap_or(0);
+                let size = s.usage.context_size.unwrap_or(1);
+                let label = format!("ctx {}", format_pct(used, size));
+                let style = if pct >= 80.0 {
+                    Style::new().fg(ERR).add_modifier(Modifier::BOLD)
+                } else if pct >= 60.0 {
+                    Style::new().fg(WARN)
+                } else {
+                    DIM
+                };
+                (label, style)
+            });
+            let ctx_w = ctx_badge.as_ref().map_or(0, |(t, _)| 2 + t.chars().count());
+
             let trailing: Option<(String, Style)> = if s.status == Status::AwaitingPermission {
                 Some((
                     "◆ needs permission".into(),
@@ -1774,7 +2007,8 @@ fn render_switcher(f: &mut Frame, app: &App) {
             let trailing_w = trailing.as_ref().map_or(0, |(t, _)| 2 + t.chars().count());
 
             let idx_str = format!("{} ", i + 1);
-            let avail = inner_w.saturating_sub(idx_str.chars().count() + 2 + wt_w + trailing_w);
+            let avail =
+                inner_w.saturating_sub(idx_str.chars().count() + 2 + wt_w + ctx_w + trailing_w);
 
             let title = s.display_title();
             let place = match &s.worktree {
@@ -1822,6 +2056,10 @@ fn render_switcher(f: &mut Frame, app: &App) {
                 ));
             }
             spans.extend(wt_spans);
+            if let Some((text, style)) = ctx_badge {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(text, style));
+            }
             if let Some((text, style)) = trailing {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(text, style));
@@ -1990,9 +2228,10 @@ fn render_help(f: &mut Frame) {
         pair("s / Tab", "switcher", "j / k", "next / prev"),
         pair("d", "close session", "r", "rename session"),
         pair("M", "model (/model)", "e", "effort (/effort)"),
-        pair("t", "thoughts & tools", "m", "toggle mouse"),
-        pair("g / G", "top / bottom", "/", "search"),
-        pair("?", "help", "q", "quit"),
+        pair("u", "usage & context", "t", "thoughts & tools"),
+        pair("m", "toggle mouse", "/", "search"),
+        pair("g / G", "top / bottom", "?", "help"),
+        pair("q", "quit", "", ""),
         Line::from(""),
         heading("session & scroll"),
         row("C-o / click", "toggle thoughts & tool details"),
@@ -2006,6 +2245,131 @@ fn render_help(f: &mut Frame) {
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(lines).block(modal("help", ACCENT, hint_line(&[("Esc/q/?", "close")]))),
+        area,
+    );
+}
+
+fn render_usage(f: &mut Frame, app: &App) {
+    let Some(s) = app.current() else { return };
+    let heading = |title: &'static str| {
+        Line::styled(title, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
+    };
+    let kv = |label: &'static str, value: String, style: Style| {
+        Line::from(vec![
+            Span::styled(format!("  {label:<12} "), DIM),
+            Span::styled(value, style),
+        ])
+    };
+
+    let mut header = vec![Span::styled(s.display_title(), BOLD)];
+    if let Some(m) = s.model_name() {
+        header.push(Span::styled(format!("  · {m}"), DIM));
+    }
+    if let Some(e) = s.effort_name() {
+        header.push(Span::styled(format!("  · effort: {e}"), DIM));
+    }
+    let mut lines: Vec<Line<'static>> = vec![Line::from(header), Line::from("")];
+
+    if !s.usage.has_data() {
+        lines.push(Line::styled("No context or token usage reported yet.", DIM));
+        lines.push(Line::styled(
+            "Updates appear once the agent reports ACP usage_update or turn usage.",
+            DIM,
+        ));
+    } else {
+        if let (Some(used), Some(size)) = (
+            s.usage.context_used,
+            s.usage.context_size.filter(|&sz| sz > 0),
+        ) {
+            let pct = (used as f64 / size as f64) * 100.0;
+            let color = context_color(pct);
+            lines.push(heading("context window"));
+            let mut bar = vec![Span::raw("  ")];
+            bar.extend(context_bar_spans(pct, 28));
+            bar.push(Span::styled(
+                format!("  {pct:.1}%"),
+                Style::new().fg(color).add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::from(bar));
+            lines.push(kv(
+                "used",
+                format!(
+                    "{} / {} tokens",
+                    format_tokens_exact(used),
+                    format_tokens_exact(size)
+                ),
+                Style::new(),
+            ));
+            if size >= used {
+                let rem = size - used;
+                let rem_pct = (rem as f64 / size as f64) * 100.0;
+                lines.push(kv(
+                    "remaining",
+                    format!("{} tokens ({rem_pct:.1}%)", format_tokens_exact(rem)),
+                    DIM,
+                ));
+            } else {
+                let over = used - size;
+                lines.push(kv(
+                    "over window",
+                    format!("+{} tokens", format_tokens_exact(over)),
+                    Style::new().fg(ERR).add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+
+        if let Some(cost) = &s.usage.cost {
+            let formatted = if cost.currency.eq_ignore_ascii_case("USD") {
+                format!("{} USD", format_cost(cost))
+            } else {
+                format_cost(cost)
+            };
+            lines.push(kv("session cost", formatted, Style::new()));
+        }
+
+        if let Some(tok) = &s.usage.tokens {
+            if lines.len() > 2 {
+                lines.push(Line::from(""));
+            }
+            lines.push(heading("token usage"));
+            lines.push(kv("total", format_tokens_exact(tok.total_tokens), BOLD));
+            lines.push(kv(
+                "input",
+                format_tokens_exact(tok.input_tokens),
+                Style::new(),
+            ));
+            lines.push(kv(
+                "output",
+                format_tokens_exact(tok.output_tokens),
+                Style::new(),
+            ));
+            if let Some(cr) = tok.cached_read_tokens.filter(|&v| v > 0) {
+                let denom = tok.input_tokens.saturating_add(cr);
+                let val = if denom > 0 {
+                    let hit = (cr as f64 / denom as f64) * 100.0;
+                    format!("{} ({hit:.0}% cache hit)", format_tokens_exact(cr))
+                } else {
+                    format_tokens_exact(cr)
+                };
+                lines.push(kv("cache read", val, Style::new().fg(OK)));
+            }
+            if let Some(cw) = tok.cached_write_tokens.filter(|&v| v > 0) {
+                lines.push(kv("cache write", format_tokens_exact(cw), DIM));
+            }
+            if let Some(th) = tok.thought_tokens.filter(|&v| v > 0) {
+                lines.push(kv("thought", format_tokens_exact(th), DIM));
+            }
+        }
+    }
+
+    let area = centered(f.area(), 62, lines.len() as u16 + 4);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(modal(
+            "usage & context",
+            ACCENT,
+            hint_line(&[("Esc/q/u", "close")]),
+        )),
         area,
     );
 }
@@ -3834,5 +4198,185 @@ mod tests {
             empty_screen.contains("no matching commands"),
             "{empty_screen}"
         );
+    }
+
+    #[test]
+    fn format_tokens_pct_and_cost_handle_boundaries() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_000), "1k");
+        assert_eq!(format_tokens(1_240), "1.2k");
+        assert_eq!(format_tokens(9_949), "9.9k");
+        assert_eq!(format_tokens(9_950), "10k");
+        assert_eq!(format_tokens(45_200), "45k");
+        assert_eq!(format_tokens(200_000), "200k");
+        assert_eq!(format_tokens(999_500), "1M");
+        assert_eq!(format_tokens(1_250_000), "1.3M");
+
+        assert_eq!(format_tokens_exact(0), "0");
+        assert_eq!(format_tokens_exact(84_210), "84,210");
+        assert_eq!(format_tokens_exact(1_000_000), "1,000,000");
+
+        assert_eq!(format_pct(0, 200_000), "0%");
+        assert_eq!(format_pct(500, 200_000), "<1%");
+        assert_eq!(format_pct(84_000, 200_000), "42%");
+        assert_eq!(format_pct(200_000, 200_000), "100%");
+
+        assert_eq!(
+            format_cost(&CostInfo {
+                amount: 0.004,
+                currency: "USD".into()
+            }),
+            "$0.004"
+        );
+        assert_eq!(
+            format_cost(&CostInfo {
+                amount: 0.14,
+                currency: "USD".into()
+            }),
+            "$0.14"
+        );
+        assert_eq!(
+            format_cost(&CostInfo {
+                amount: 1.5,
+                currency: "EUR".into()
+            }),
+            "1.50 EUR"
+        );
+    }
+
+    #[test]
+    fn render_shows_context_gauge_on_prompt_switcher_and_usage_modal() {
+        use crate::agent::acp::{TokenUsage, UsageUpdate};
+
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.status = Status::Idle;
+        app.sessions.push(s);
+
+        // Before any usage arrives, no context gauge is drawn on the prompt box.
+        let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let before = dump(&term);
+        assert!(!before.contains("ctx "), "{before}");
+
+        // Empty Usage modal explains that no usage was reported yet.
+        app.mode = Mode::Usage;
+        term.draw(|f| render(f, &app)).unwrap();
+        let empty_modal = dump(&term);
+        assert!(empty_modal.contains("USAGE"), "{empty_modal}");
+        assert!(empty_modal.contains("usage & context"), "{empty_modal}");
+        assert!(
+            empty_modal.contains("No context or token usage reported yet."),
+            "{empty_modal}"
+        );
+        app.mode = Mode::Normal;
+
+        // Populate context usage + cost + token breakdown.
+        app.sessions[0].usage.apply_update(UsageUpdate {
+            used: 84_000,
+            size: 200_000,
+            cost: Some(CostInfo {
+                amount: 0.14,
+                currency: "USD".into(),
+            }),
+        });
+        app.sessions[0].usage.apply_tokens(TokenUsage {
+            total_tokens: 96_000,
+            input_tokens: 12_000,
+            output_tokens: 4_000,
+            thought_tokens: Some(1_800),
+            cached_read_tokens: Some(78_000),
+            cached_write_tokens: Some(2_000),
+        });
+
+        term.draw(|f| render(f, &app)).unwrap();
+        let main_screen = dump(&term);
+        assert!(
+            main_screen.contains("ctx ███░░░░░ 42% · 84k/200k · $0.14"),
+            "{main_screen}"
+        );
+
+        // Narrow terminal degrades gracefully without panicking or dropping %.
+        let mut narrow = Terminal::new(TestBackend::new(26, 16)).unwrap();
+        narrow.draw(|f| render(f, &app)).unwrap();
+        let narrow_screen = dump(&narrow);
+        assert!(narrow_screen.contains("ctx"), "{narrow_screen}");
+        assert!(narrow_screen.contains("42%"), "{narrow_screen}");
+
+        // Switcher shows compact `ctx 42%` badge.
+        app.mode = Mode::Switcher;
+        term.draw(|f| render(f, &app)).unwrap();
+        let switcher = dump(&term);
+        assert!(switcher.contains("ctx 42%"), "{switcher}");
+
+        // Usage modal shows full breakdown.
+        app.mode = Mode::Usage;
+        term.draw(|f| render(f, &app)).unwrap();
+        let modal_screen = dump(&term);
+        assert!(modal_screen.contains("context window"), "{modal_screen}");
+        assert!(modal_screen.contains("42.0%"), "{modal_screen}");
+        assert!(
+            modal_screen.contains("84,000 / 200,000 tokens"),
+            "{modal_screen}"
+        );
+        assert!(
+            modal_screen.contains("116,000 tokens (58.0%)"),
+            "{modal_screen}"
+        );
+        assert!(modal_screen.contains("$0.14 USD"), "{modal_screen}");
+        assert!(modal_screen.contains("token usage"), "{modal_screen}");
+        assert!(modal_screen.contains("96,000"), "{modal_screen}");
+        assert!(
+            modal_screen.contains("78,000 (87% cache hit)"),
+            "{modal_screen}"
+        );
+        assert!(modal_screen.contains("1,800"), "{modal_screen}");
+
+        // High context (>= 80%) colors the percentage cell red (ERR).
+        app.mode = Mode::Normal;
+        app.sessions[0].usage.apply_update(UsageUpdate {
+            used: 170_000,
+            size: 200_000,
+            cost: None,
+        });
+        term.draw(|f| render(f, &app)).unwrap();
+        let buf = term.backend().buffer();
+        let high_screen = dump(&term);
+        assert!(high_screen.contains("85%"), "{high_screen}");
+        let mut found_err_cell = false;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let c = &buf[(x, y)];
+                if c.symbol() == "█" && c.fg == ERR {
+                    found_err_cell = true;
+                }
+            }
+        }
+        assert!(found_err_cell, "expected red filled bar at 85% context");
+    }
+
+    #[test]
+    fn prompt_usage_title_falls_back_to_tokens_when_window_unknown() {
+        use crate::agent::acp::TokenUsage;
+
+        let mut usage = SessionUsage::default();
+        usage.apply_tokens(TokenUsage {
+            total_tokens: 12_400,
+            input_tokens: 10_000,
+            output_tokens: 2_400,
+            thought_tokens: None,
+            cached_read_tokens: None,
+            cached_write_tokens: None,
+        });
+        let line = prompt_usage_title(&usage, 40).expect("should show token fallback");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, " tok 12k ");
     }
 }
