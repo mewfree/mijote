@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use crate::agent::acp::{ElicitationRequest, ElicitationResponse, FieldKind};
+use crate::agent::acp::{ElicitationRequest, ElicitationResponse, Event, FieldKind};
 use crate::agent::install::AgentStatus;
 use crate::agent::{self, AgentSpec};
 use crate::editor::Editor;
@@ -114,6 +114,193 @@ pub struct MentionPopup {
     pub total_files: usize,
 }
 
+/// One slash command shown in the `/` autocomplete popup (local built-in or
+/// advertised by the agent via ACP `available_commands_update`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashCommandEntry {
+    pub name: String,
+    pub description: String,
+    pub input_hint: Option<String>,
+    pub local: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashMatch {
+    pub command: SlashCommandEntry,
+    /// Character indices in `command.name` that matched the query (for highlighting).
+    pub positions: Vec<usize>,
+    pub score: i64,
+}
+
+/// Active `/` slash-command autocomplete state while typing in Insert mode.
+#[derive(Debug, Clone)]
+pub struct SlashPopup {
+    /// Char index of the triggering `/` in `App::input`.
+    pub slash_start: usize,
+    pub query: String,
+    pub matches: Vec<SlashMatch>,
+    pub cursor: usize,
+    pub total_commands: usize,
+}
+
+/// If the cursor sits inside a leading `/command` token on the first line,
+/// returns `(slash_char_index, query)`.
+pub fn active_slash_command(chars: &[char], cursor: usize) -> Option<(usize, String)> {
+    let cursor = cursor.min(chars.len());
+    let mut slash_start = 0;
+    while slash_start < cursor && chars[slash_start] == ' ' {
+        slash_start += 1;
+    }
+    if slash_start >= cursor || chars[slash_start] != '/' {
+        return None;
+    }
+    if chars[slash_start + 1..cursor]
+        .iter()
+        .any(|c| c.is_whitespace())
+    {
+        return None;
+    }
+    let query: String = chars[slash_start + 1..cursor].iter().collect();
+    Some((slash_start, query))
+}
+
+/// Build the combined slash-command list for `session`: local built-ins
+/// (`/model`, `/effort`) alongside agent-advertised commands (deduplicated
+/// case-insensitively with local commands taking precedence).
+pub fn session_slash_commands(session: &Session) -> Vec<SlashCommandEntry> {
+    let mut out = vec![
+        SlashCommandEntry {
+            name: "model".to_string(),
+            description: "Switch session model".to_string(),
+            input_hint: Some("[model]".to_string()),
+            local: true,
+        },
+        SlashCommandEntry {
+            name: "effort".to_string(),
+            description: "Switch reasoning effort level".to_string(),
+            input_hint: Some("[level]".to_string()),
+            local: true,
+        },
+    ];
+    for cmd in &session.commands {
+        if out
+            .iter()
+            .any(|existing| existing.name.eq_ignore_ascii_case(&cmd.name))
+        {
+            continue;
+        }
+        out.push(SlashCommandEntry {
+            name: cmd.name.clone(),
+            description: cmd.description.clone(),
+            input_hint: cmd.input_hint.clone(),
+            local: false,
+        });
+    }
+    out
+}
+
+/// Rank and filter slash commands against `query`.
+pub fn filter_slash_commands(commands: &[SlashCommandEntry], query: &str) -> Vec<SlashMatch> {
+    let query = query.trim();
+    if query.is_empty() {
+        return commands
+            .iter()
+            .cloned()
+            .map(|command| SlashMatch {
+                command,
+                positions: Vec::new(),
+                score: 0,
+            })
+            .collect();
+    }
+    let needle: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    let needle_str: String = needle.iter().collect();
+    let mut scored: Vec<SlashMatch> = commands
+        .iter()
+        .filter_map(|cmd| score_slash_command(cmd, &needle, &needle_str))
+        .collect();
+    scored.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| b.command.local.cmp(&a.command.local))
+            .then_with(|| a.command.name.cmp(&b.command.name))
+    });
+    scored
+}
+
+fn score_slash_command(
+    cmd: &SlashCommandEntry,
+    needle: &[char],
+    needle_str: &str,
+) -> Option<SlashMatch> {
+    let chars: Vec<char> = cmd.name.chars().collect();
+    let lowered: Vec<char> = chars
+        .iter()
+        .map(|c| c.to_lowercase().next().unwrap_or(*c))
+        .collect();
+
+    if let Some(positions) = find_char_subsequence(&lowered, needle) {
+        let mut score: i64 = 1_000;
+        if lowered == needle {
+            score += 200;
+        } else if lowered.starts_with(needle) {
+            score += 100;
+        }
+        let mut prev: Option<usize> = None;
+        for &idx in &positions {
+            score += 10;
+            if idx == 0 {
+                score += 25;
+            } else if matches!(chars[idx - 1], '-' | '_' | ':' | '.' | '/') {
+                score += 15;
+            }
+            if let Some(p) = prev {
+                if idx == p + 1 {
+                    score += 12;
+                } else {
+                    score -= (idx - p - 1).min(10) as i64;
+                }
+            }
+            prev = Some(idx);
+        }
+        score -= (chars.len() as i64).min(100) / 4;
+        return Some(SlashMatch {
+            command: cmd.clone(),
+            positions,
+            score,
+        });
+    }
+
+    if needle.len() >= 2 {
+        let desc_lower = cmd.description.to_lowercase();
+        if let Some(byte_pos) = desc_lower.find(needle_str) {
+            let char_pos = desc_lower[..byte_pos].chars().count();
+            return Some(SlashMatch {
+                command: cmd.clone(),
+                positions: Vec::new(),
+                score: 100 - (char_pos as i64).min(80),
+            });
+        }
+    }
+
+    None
+}
+
+fn find_char_subsequence(haystack: &[char], needle: &[char]) -> Option<Vec<usize>> {
+    let mut positions = Vec::with_capacity(needle.len());
+    let mut ni = 0;
+    for (hi, &ch) in haystack.iter().enumerate() {
+        if ch == needle[ni] {
+            positions.push(hi);
+            ni += 1;
+            if ni == needle.len() {
+                return Some(positions);
+            }
+        }
+    }
+    None
+}
+
 /// A paste with more lines or characters than this is collapsed to a placeholder.
 const PASTE_COLLAPSE_LINES: usize = 3;
 const PASTE_COLLAPSE_CHARS: usize = 500;
@@ -135,6 +322,8 @@ pub struct App {
     pub mention: Option<MentionPopup>,
     /// Cached file list for the currently open `@` completion session.
     mention_files: Option<(PathBuf, Vec<String>)>,
+    /// Active `/` slash-command completion popup in Insert mode.
+    pub slash: Option<SlashPopup>,
     /// Large pastes shown in `input` as a placeholder: (placeholder, text).
     /// Expanded on submit.
     pastes: Vec<(String, String)>,
@@ -212,6 +401,7 @@ impl App {
             input: Editor::default(),
             mention: None,
             mention_files: None,
+            slash: None,
             pastes: Vec::new(),
             leader: false,
             picker: Vec::new(),
@@ -294,6 +484,8 @@ impl App {
             self.set_message(text);
             return;
         }
+        let is_ready = matches!(msg.body, UiMsg::Ready(..));
+        let is_commands = matches!(msg.body, UiMsg::Event(Event::AvailableCommands(_)));
         let is_turn_done = matches!(msg.body, UiMsg::TurnDone(_));
         let is_permission = matches!(msg.body, UiMsg::Permission(_));
         let is_question = matches!(msg.body, UiMsg::Question(_));
@@ -312,6 +504,9 @@ impl App {
                 s.attention = true;
             }
             self.pending_bell = true;
+        }
+        if !background && (is_ready || is_commands) && self.slash.is_some() {
+            self.update_completions();
         }
         if !background && is_question {
             self.sync_question_draft();
@@ -405,7 +600,7 @@ impl App {
         self.selected = self.sessions.len() - 1;
         self.scroll = 0;
         self.clear_search();
-        self.clear_mention();
+        self.clear_completions();
         self.mode = Mode::Insert;
     }
 
@@ -477,6 +672,9 @@ impl App {
         if self.leader {
             self.leader = false;
             self.handle_command(key);
+            if self.mode != Mode::Insert {
+                self.clear_completions();
+            }
             return;
         }
         if matches!(self.mode, Mode::Normal | Mode::Insert)
@@ -540,14 +738,14 @@ impl App {
         let lines = text.matches('\n').count() + 1;
         if lines <= PASTE_COLLAPSE_LINES && text.chars().count() <= PASTE_COLLAPSE_CHARS {
             self.input.insert_str(&text);
-            self.update_mention();
+            self.update_completions();
             return;
         }
         let n = self.pastes.len() + 1;
         let placeholder = format!("[Pasted text #{n} +{lines} lines]");
         self.input.insert_str(&placeholder);
         self.pastes.push((placeholder, text));
-        self.update_mention();
+        self.update_completions();
     }
 
     /// `text` with paste placeholders replaced by what was pasted. A
@@ -1338,6 +1536,83 @@ impl App {
         self.mention_files = None;
     }
 
+    fn clear_slash(&mut self) {
+        self.slash = None;
+    }
+
+    fn clear_completions(&mut self) {
+        self.clear_mention();
+        self.clear_slash();
+    }
+
+    fn update_completions(&mut self) {
+        if self.mode != Mode::Insert || self.current().is_none() {
+            self.clear_completions();
+            return;
+        }
+        if let Some((slash_start, query)) =
+            active_slash_command(self.input.chars(), self.input.cursor_index())
+        {
+            self.clear_mention();
+            self.update_slash(slash_start, query);
+            return;
+        }
+        self.clear_slash();
+        self.update_mention();
+    }
+
+    fn update_slash(&mut self, slash_start: usize, query: String) {
+        let Some(s) = self.current() else {
+            self.clear_slash();
+            return;
+        };
+        let commands = session_slash_commands(s);
+        let prev_selected = self
+            .slash
+            .as_ref()
+            .and_then(|p| p.matches.get(p.cursor))
+            .map(|m| m.command.name.clone());
+        let matches = filter_slash_commands(&commands, &query);
+        let cursor = prev_selected
+            .and_then(|name| {
+                matches
+                    .iter()
+                    .position(|m| m.command.name.eq_ignore_ascii_case(&name))
+            })
+            .unwrap_or(0);
+        self.slash = Some(SlashPopup {
+            slash_start,
+            query,
+            matches,
+            cursor,
+            total_commands: commands.len(),
+        });
+    }
+
+    fn accept_slash_command(&mut self, trailing_space: bool) -> bool {
+        let Some(popup) = self.slash.as_ref() else {
+            return false;
+        };
+        let Some(chosen) = popup.matches.get(popup.cursor) else {
+            return false;
+        };
+        let slash_start = popup.slash_start;
+        let end = self.input.cursor_index();
+        let next_is_space = self
+            .input
+            .chars()
+            .get(end)
+            .is_some_and(|c| c.is_whitespace());
+        let replacement = if trailing_space && !next_is_space {
+            format!("/{} ", chosen.command.name)
+        } else {
+            format!("/{}", chosen.command.name)
+        };
+        self.input.replace_range(slash_start, end, &replacement);
+        self.clear_slash();
+        true
+    }
+
     fn update_mention(&mut self) {
         if self.mode != Mode::Insert {
             self.clear_mention();
@@ -1399,6 +1674,63 @@ impl App {
 
     fn handle_insert(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(popup) = self.slash.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.clear_slash();
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('n') if key.code == KeyCode::Down || ctrl => {
+                    if !popup.matches.is_empty() {
+                        popup.cursor = (popup.cursor + 1) % popup.matches.len();
+                    }
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('p') if key.code == KeyCode::Up || ctrl => {
+                    if !popup.matches.is_empty() {
+                        popup.cursor =
+                            (popup.cursor + popup.matches.len() - 1) % popup.matches.len();
+                    }
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.accept_slash_command(true);
+                    return;
+                }
+                KeyCode::Enter
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    let end = self.input.cursor_index();
+                    let has_trailing = self.input.chars()[end..].iter().any(|c| !c.is_whitespace());
+                    let chosen = popup.matches.get(popup.cursor).map(|m| {
+                        (
+                            popup.query.eq_ignore_ascii_case(&m.command.name),
+                            m.command.local,
+                            m.command.input_hint.is_some(),
+                        )
+                    });
+                    match chosen {
+                        None => self.clear_slash(),
+                        Some(_) if has_trailing => {
+                            self.accept_slash_command(false);
+                            return;
+                        }
+                        Some((exact, local, has_hint)) => {
+                            if exact || local || !has_hint {
+                                self.accept_slash_command(false);
+                                // Fall through to submit immediately.
+                            } else {
+                                self.accept_slash_command(true);
+                                return;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         if let Some(popup) = self.mention.as_mut() {
             match key.code {
                 KeyCode::Esc => {
@@ -1437,7 +1769,7 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => {
-                self.clear_mention();
+                self.clear_completions();
                 self.input.leave_insert();
                 self.mode = Mode::Normal;
             }
@@ -1447,19 +1779,19 @@ impl App {
                     .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
             {
                 self.input.insert('\n');
-                self.update_mention();
+                self.update_completions();
             }
             KeyCode::Char('j') if ctrl => {
                 self.input.insert('\n');
-                self.update_mention();
+                self.update_completions();
             }
             KeyCode::Char('w') if ctrl => {
                 self.input.delete_word_back();
-                self.update_mention();
+                self.update_completions();
             }
             KeyCode::Char('u') if ctrl => {
                 self.input.kill_line_back();
-                self.update_mention();
+                self.update_completions();
             }
             KeyCode::Enter => {
                 let text = self.input.text().trim().to_string();
@@ -1469,7 +1801,7 @@ impl App {
                 if self.slash_model(&text) || self.slash_effort(&text) {
                     self.input.clear();
                     self.pastes.clear();
-                    self.clear_mention();
+                    self.clear_completions();
                     return;
                 }
                 let text = self.expand_pastes(&text);
@@ -1483,7 +1815,7 @@ impl App {
                 if let Some((id, agent)) = sent {
                     self.input.clear();
                     self.pastes.clear();
-                    self.clear_mention();
+                    self.clear_completions();
                     self.scroll = 0;
                     self.persist(id);
                     let _ = self.store.save_last_agent(agent);
@@ -1493,39 +1825,39 @@ impl App {
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::Backspace => {
                 self.input.backspace();
-                self.update_mention();
+                self.update_completions();
             }
             KeyCode::Delete => {
                 self.input.delete_forward();
-                self.update_mention();
+                self.update_completions();
             }
             KeyCode::Left => {
                 self.input.left();
-                self.update_mention();
+                self.update_completions();
             }
             KeyCode::Right => {
                 self.input.right();
-                self.update_mention();
+                self.update_completions();
             }
             KeyCode::Up => {
                 self.input.up();
-                self.update_mention();
+                self.update_completions();
             }
             KeyCode::Down => {
                 self.input.down();
-                self.update_mention();
+                self.update_completions();
             }
             KeyCode::Home => {
                 self.input.home();
-                self.update_mention();
+                self.update_completions();
             }
             KeyCode::End => {
                 self.input.end();
-                self.update_mention();
+                self.update_completions();
             }
             KeyCode::Char(c) if !ctrl => {
                 self.input.insert(c);
-                self.update_mention();
+                self.update_completions();
             }
             _ => {}
         }
@@ -1752,7 +2084,7 @@ impl App {
                 self.selected = i;
                 self.scroll = 0;
                 self.clear_search();
-                self.clear_mention();
+                self.clear_completions();
                 self.sync_question_draft();
             }
             self.sessions[i].attention = false;
@@ -1900,7 +2232,7 @@ impl App {
         }
         self.scroll = 0;
         self.clear_search();
-        self.clear_mention();
+        self.clear_completions();
         self.sync_question_draft();
         if self.sessions.is_empty() {
             self.mode = Mode::Normal;
@@ -1923,7 +2255,7 @@ impl App {
         }
         if changed {
             self.clear_search();
-            self.clear_mention();
+            self.clear_completions();
             self.sync_question_draft();
         }
         self.scroll = 0;
@@ -3257,5 +3589,148 @@ mod tests {
         });
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(q_rx.try_recv().unwrap(), ElicitationResponse::Cancel);
+    }
+
+    #[test]
+    fn active_slash_command_detects_leading_token_only() {
+        let check = |s: &str, cursor: usize| {
+            let chars: Vec<char> = s.chars().collect();
+            active_slash_command(&chars, cursor)
+        };
+        assert_eq!(check("", 0), None);
+        assert_eq!(check("/", 1), Some((0, String::new())));
+        assert_eq!(check("/mo", 3), Some((0, "mo".into())));
+        assert_eq!(check("  /rev", 6), Some((2, "rev".into())));
+        assert_eq!(check("/model ", 7), None);
+        assert_eq!(check("hello /model", 12), None);
+        assert_eq!(check("/foo\n/bar", 9), None);
+        assert_eq!(check("/review @src/main.rs", 20), None);
+    }
+
+    #[test]
+    fn slash_command_popup_lists_filters_completes_runs_and_refreshes_live() {
+        use crate::agent::acp::{AvailableCommand, ModelInfo, ModelState};
+
+        let (mut app, _) = app_with_session();
+        app.sessions[0].models = ModelState {
+            current: Some("opus".into()),
+            available: vec![ModelInfo {
+                id: "opus".into(),
+                name: "Opus".into(),
+            }],
+            ..Default::default()
+        };
+        app.mode = Mode::Insert;
+
+        // Typing `/` opens popup with local commands even before agent advertises any.
+        app.handle_key(key(KeyCode::Char('/')));
+        let popup = app.slash.as_ref().expect("slash popup should open");
+        assert_eq!(
+            popup
+                .matches
+                .iter()
+                .map(|m| m.command.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["model", "effort"]
+        );
+
+        // Live `available_commands_update` refreshes the open popup and deduplicates `/model`.
+        app.handle_msg(Msg {
+            session: 0,
+            body: UiMsg::Event(Event::AvailableCommands(vec![
+                AvailableCommand {
+                    name: "model".into(),
+                    description: "Agent model".into(),
+                    input_hint: None,
+                },
+                AvailableCommand {
+                    name: "review".into(),
+                    description: "Review recent changes".into(),
+                    input_hint: None,
+                },
+                AvailableCommand {
+                    name: "web".into(),
+                    description: "Search the web".into(),
+                    input_hint: Some("query".into()),
+                },
+            ])),
+        });
+        let popup = app.slash.as_ref().unwrap();
+        assert_eq!(
+            popup
+                .matches
+                .iter()
+                .map(|m| (m.command.name.as_str(), m.command.local))
+                .collect::<Vec<_>>(),
+            vec![
+                ("model", true),
+                ("effort", true),
+                ("review", false),
+                ("web", false),
+            ]
+        );
+
+        // Esc dismisses popup while staying in Insert mode.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.slash.is_none());
+        assert_eq!(app.mode, Mode::Insert);
+
+        // Filtering by description substring finds `/web` when typing `search`.
+        type_keys(&mut app, "search");
+        let popup = app.slash.as_ref().unwrap();
+        assert_eq!(popup.matches.len(), 1);
+        assert_eq!(popup.matches[0].command.name, "web");
+
+        // Enter on a prefix match for a command with `input_hint` inserts `/web ` for args.
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.slash.is_none());
+        assert_eq!(app.input.text(), "/web ");
+        assert_eq!(app.sessions[0].status, Status::Idle);
+
+        // Clear and test `Tab` completion on `/mo` -> `/model `.
+        app.input.clear();
+        type_keys(&mut app, "/mo");
+        assert_eq!(app.slash.as_ref().unwrap().matches[0].command.name, "model");
+        app.handle_key(key(KeyCode::Tab));
+        assert!(app.slash.is_none());
+        assert_eq!(app.input.text(), "/model ");
+
+        // Clear and test `Enter` on `/mo` -> opens local model picker immediately.
+        app.input.clear();
+        type_keys(&mut app, "/mo");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.slash.is_none());
+        assert_eq!(app.mode, Mode::Model);
+        assert!(app.input.is_empty());
+
+        // Return to insert, test `Enter` on `/rev` (no input_hint) -> completes & submits `/review`.
+        app.mode = Mode::Insert;
+        type_keys(&mut app, "/rev");
+        assert_eq!(
+            app.slash.as_ref().unwrap().matches[0].command.name,
+            "review"
+        );
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.slash.is_none());
+        assert!(app.input.is_empty());
+        assert_eq!(app.sessions[0].status, Status::Running);
+        assert_eq!(app.sessions[0].entries, vec![Entry::User("/review".into())]);
+
+        // Exact match on a command WITH `input_hint` (`/web`) + Enter submits directly.
+        app.sessions[0].status = Status::Idle;
+        app.sessions[0].entries.clear();
+        type_keys(&mut app, "/web");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.slash.is_none());
+        assert_eq!(app.sessions[0].entries, vec![Entry::User("/web".into())]);
+
+        // Typing `/review @` closes slash popup and opens `@` file-mention popup.
+        app.sessions[0].status = Status::Idle;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "hello").unwrap();
+        app.cwd = dir.path().to_path_buf();
+        type_keys(&mut app, "/review @");
+        assert!(app.slash.is_none());
+        assert!(app.mention.is_some());
     }
 }

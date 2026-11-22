@@ -21,7 +21,7 @@ mod markdown;
 
 use crate::agent::acp::{ElicitationRequest, FieldKind, ToolContent};
 use crate::agent::install::AgentStatus;
-use crate::app::{App, Confirm, FieldDraft, MentionPopup, Mode, QuestionDraft};
+use crate::app::{App, Confirm, FieldDraft, MentionPopup, Mode, QuestionDraft, SlashPopup};
 use crate::session::{Entry, Session, Status};
 
 /// A clickable markdown hyperlink on the current screen, in terminal cells.
@@ -137,7 +137,10 @@ pub fn render(f: &mut Frame, app: &App) {
         modal_open = true;
     }
     if !modal_open {
-        if let Some(popup) = &app.mention {
+        if let Some(popup) = &app.slash {
+            render_slash_popup(f, popup, input);
+            modal_open = true;
+        } else if let Some(popup) = &app.mention {
             render_mention_popup(f, popup, input);
             modal_open = true;
         }
@@ -1171,6 +1174,12 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("?", "help"),
                 ("^C", "quit"),
             ],
+            Mode::Insert if app.slash.is_some() => &[
+                ("Tab", "complete"),
+                ("Enter", "run"),
+                ("↑/↓", "select"),
+                ("Esc", "close"),
+            ],
             Mode::Insert if app.mention.is_some() => &[
                 ("Tab/Enter", "insert file"),
                 ("↑/↓", "select"),
@@ -1185,6 +1194,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             Mode::Insert => &[
                 ("Enter", "send"),
                 ("S-Enter", "newline"),
+                ("/", "slash"),
                 ("@", "files"),
                 ("^A", "commands"),
                 ("Esc", "normal"),
@@ -1589,7 +1599,7 @@ fn render_help(f: &mut Frame) {
         heading("prompt (vim)"),
         row("i / Enter", "insert mode, Esc for normal"),
         row("S-Enter / C-j", "insert newline (also Alt-Enter)"),
-        row("@", "fuzzy-complete and attach workspace files"),
+        row("/  @", "slash commands & workspace file mentions"),
         row("d c y u C-r", "operators, undo/redo & vim motions"),
         Line::from(""),
         heading("commands (Space in normal · C-a anywhere)"),
@@ -1614,6 +1624,209 @@ fn render_help(f: &mut Frame) {
         Paragraph::new(lines).block(modal("help", ACCENT, hint_line(&[("Esc/q/?", "close")]))),
         area,
     );
+}
+
+fn render_slash_popup(f: &mut Frame, popup: &SlashPopup, input: Rect) {
+    const MAX_ROWS: usize = 10;
+    let max_avail_h = input.y.saturating_sub(2);
+    if max_avail_h < 3 || input.width < 24 {
+        return;
+    }
+    let rows = popup.matches.len().clamp(1, MAX_ROWS) as u16;
+    let h = (rows + 2).min(max_avail_h);
+    let visible_rows = h.saturating_sub(2) as usize;
+    let w = input.width.clamp(48, 88).min(input.width);
+    let area = Rect {
+        x: input.x,
+        y: input.y.saturating_sub(h),
+        width: w,
+        height: h,
+    };
+
+    let title = if popup.matches.is_empty() {
+        format!(" /{} · no matches ", fit(&popup.query, 24))
+    } else if popup.query.is_empty() {
+        format!(" / commands ({}) ", popup.total_commands)
+    } else {
+        format!(
+            " /{} ({}/{}) ",
+            fit(&popup.query, 24),
+            popup.matches.len(),
+            popup.total_commands
+        )
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT))
+        .title(Line::from(Span::styled(
+            title,
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )))
+        .title_bottom(
+            hint_line(&[
+                ("Tab", "complete"),
+                ("Enter", "run"),
+                ("↑/↓", "move"),
+                ("Esc", "close"),
+            ])
+            .right_aligned(),
+        )
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+
+    let items: Vec<Line<'static>> = if popup.matches.is_empty() {
+        vec![Line::styled("  no matching commands", DIM)]
+    } else {
+        let start = if popup.cursor >= visible_rows {
+            popup.cursor + 1 - visible_rows
+        } else {
+            0
+        };
+        let room = inner.width.saturating_sub(2) as usize;
+        let visible: Vec<_> = popup
+            .matches
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible_rows)
+            .collect();
+        let max_name_w = visible
+            .iter()
+            .map(|(_, m)| 1 + m.command.name.chars().count())
+            .max()
+            .unwrap_or(1);
+        let name_col = max_name_w.min((room / 3).max(10)).min(room);
+
+        visible
+            .into_iter()
+            .map(|(idx, m)| {
+                let selected = idx == popup.cursor;
+                let base_style = if selected {
+                    Style::new().bg(SELECTED_BG)
+                } else {
+                    Style::new()
+                };
+                let match_style = if selected {
+                    BOLD.fg(ACCENT).bg(SELECTED_BG)
+                } else {
+                    BOLD.fg(ACCENT)
+                };
+                let dim_style = if selected { DIM.bg(SELECTED_BG) } else { DIM };
+                let local_style = if selected {
+                    Style::new().fg(ACCENT).bg(SELECTED_BG)
+                } else {
+                    Style::new().fg(ACCENT)
+                };
+
+                let mut spans = vec![Span::styled(
+                    if selected { "▌ " } else { "  " },
+                    if selected {
+                        Style::new().fg(ACCENT).bg(SELECTED_BG)
+                    } else {
+                        base_style
+                    },
+                )];
+
+                // Leading `/` + highlighted command name.
+                let mut used = 0;
+                if room > 0 {
+                    spans.push(Span::styled("/", base_style));
+                    used += 1;
+                }
+                let name_budget = name_col.saturating_sub(1);
+                let chars: Vec<char> = m.command.name.chars().collect();
+                let show_len = chars.len().min(name_budget);
+                let mut run = String::new();
+                let mut run_hl = false;
+                for (ci, &ch) in chars.iter().take(show_len).enumerate() {
+                    let hl = m.positions.binary_search(&ci).is_ok();
+                    if !run.is_empty() && hl != run_hl {
+                        spans.push(Span::styled(
+                            std::mem::take(&mut run),
+                            if run_hl { match_style } else { base_style },
+                        ));
+                    }
+                    run_hl = hl;
+                    run.push(ch);
+                }
+                if !run.is_empty() {
+                    spans.push(Span::styled(
+                        run,
+                        if run_hl { match_style } else { base_style },
+                    ));
+                }
+                used += show_len;
+
+                if used < name_col {
+                    let pad = name_col - used;
+                    spans.push(Span::styled(" ".repeat(pad), base_style));
+                    used += pad;
+                }
+
+                // Description, optional input hint, and `local` tag.
+                let rem = room.saturating_sub(used);
+                if rem >= 4 {
+                    spans.push(Span::styled("  ", base_style));
+                    used += 2;
+                    let mut avail = room.saturating_sub(used);
+                    let show_local = m.command.local && avail >= 14;
+                    let local_reserve = if show_local { 8 } else { 0 };
+                    avail = avail.saturating_sub(local_reserve);
+
+                    let hint_fmt = m.command.input_hint.as_deref().map(|h| {
+                        if h.starts_with('[') || h.starts_with('<') {
+                            h.to_string()
+                        } else {
+                            format!("<{h}>")
+                        }
+                    });
+
+                    if !m.command.description.is_empty() && avail > 0 {
+                        let shown = fit(&m.command.description, avail);
+                        let w = shown.chars().count();
+                        spans.push(Span::styled(shown, dim_style));
+                        used += w;
+                        avail = avail.saturating_sub(w);
+                    }
+
+                    if let Some(hint) = hint_fmt {
+                        let sep = if !m.command.description.is_empty() {
+                            "  "
+                        } else {
+                            ""
+                        };
+                        let needed = sep.len() + 4;
+                        if avail >= needed {
+                            if !sep.is_empty() {
+                                spans.push(Span::styled(sep, base_style));
+                                used += sep.len();
+                                avail = avail.saturating_sub(sep.len());
+                            }
+                            let shown = fit(&hint, avail);
+                            let w = shown.chars().count();
+                            spans.push(Span::styled(shown, dim_style));
+                            used += w;
+                        }
+                    }
+
+                    if show_local {
+                        spans.push(Span::styled(" · ", dim_style));
+                        spans.push(Span::styled("local", local_style));
+                        used += 8;
+                    }
+                }
+
+                if selected && used < room {
+                    spans.push(Span::styled(" ".repeat(room - used), base_style));
+                }
+                Line::from(spans)
+            })
+            .collect()
+    };
+
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(items).block(block), area);
 }
 
 fn render_mention_popup(f: &mut Frame, popup: &MentionPopup, input: Rect) {
@@ -2992,5 +3205,61 @@ mod tests {
         assert!(modal_screen.contains("effort"), "{modal_screen}");
         assert!(modal_screen.contains("High ✓"), "{modal_screen}");
         assert!(modal_screen.contains("Deeper reasoning"), "{modal_screen}");
+    }
+
+    #[test]
+    fn render_shows_slash_command_popup_above_prompt() {
+        use crate::agent::acp::AvailableCommand;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.status = Status::Idle;
+        s.commands = vec![
+            AvailableCommand {
+                name: "compact".into(),
+                description: "Compact conversation history".into(),
+                input_hint: None,
+            },
+            AvailableCommand {
+                name: "web".into(),
+                description: "Search the web".into(),
+                input_hint: Some("query".into()),
+            },
+        ];
+        app.sessions.push(s);
+        app.mode = Mode::Insert;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        let mut term = Terminal::new(TestBackend::new(90, 22)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("/ commands (4)"), "{screen}");
+        assert!(screen.contains("/model"), "{screen}");
+        assert!(screen.contains("local"), "{screen}");
+        assert!(screen.contains("/effort"), "{screen}");
+        assert!(screen.contains("/compact"), "{screen}");
+        assert!(screen.contains("Compact conversation history"), "{screen}");
+        assert!(screen.contains("/web"), "{screen}");
+        assert!(screen.contains("<query>"), "{screen}");
+        assert!(screen.contains("Tab"), "{screen}");
+
+        // Narrow query with no matches renders empty-state message.
+        for ch in "zzz".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        term.draw(|f| render(f, &app)).unwrap();
+        let empty_screen = dump(&term);
+        assert!(empty_screen.contains("/zzz · no matches"), "{empty_screen}");
+        assert!(
+            empty_screen.contains("no matching commands"),
+            "{empty_screen}"
+        );
     }
 }

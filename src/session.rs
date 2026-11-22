@@ -2,15 +2,15 @@
 //! owns the ACP client. Never imports from `ui` or `app`.
 
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::agent::acp::{
-    AcpClient, CancelHandle, EffortState, ElicitationRequest, ElicitationResponse, Event,
-    ModelState, PermissionRequest, StopReason, ToolContent,
+    AcpClient, AvailableCommand, CancelHandle, EffortState, ElicitationRequest,
+    ElicitationResponse, Event, ModelState, PermissionRequest, StopReason, ToolContent,
 };
 use crate::agent::{install, AgentSpec};
 use crate::store::{self, Record};
@@ -45,7 +45,7 @@ pub enum Status {
 /// Worker -> UI messages.
 #[derive(Debug)]
 pub enum UiMsg {
-    Ready(CancelHandle, ModelState, EffortState),
+    Ready(CancelHandle, ModelState, EffortState, Vec<AvailableCommand>),
     /// `session/set_model` failed; the model is unchanged.
     ModelFailed(String),
     /// Setting the effort level failed; the effort is unchanged.
@@ -100,6 +100,8 @@ pub struct Session {
     pub effort: EffortState,
     /// Effort level to apply once the agent is up (restored from the record).
     preferred_effort: Option<String>,
+    /// Slash commands advertised by the agent (`available_commands_update`).
+    pub commands: Vec<AvailableCommand>,
     cancel: Option<CancelHandle>,
     cmd_tx: Sender<WorkerCmd>,
     perm_tx: Sender<Option<String>>,
@@ -172,6 +174,7 @@ impl Session {
             preferred_model: None,
             effort: EffortState::default(),
             preferred_effort: None,
+            commands: Vec::new(),
             cancel: None,
             cmd_tx,
             perm_tx,
@@ -376,13 +379,14 @@ impl Session {
     pub fn apply(&mut self, body: UiMsg) {
         match body {
             UiMsg::Closed(_) => {}
-            UiMsg::Ready(handle, models, effort) => {
+            UiMsg::Ready(handle, models, effort, commands) => {
                 self.cancel = Some(handle);
                 self.status = Status::Idle;
                 self.models = models;
                 self.preferred_model = None;
                 self.effort = effort;
                 self.preferred_effort = None;
+                self.commands = commands;
             }
             UiMsg::ModelFailed(e) => self
                 .entries
@@ -512,6 +516,9 @@ impl Session {
                     }
                 }
             }
+            Event::AvailableCommands(cmds) => {
+                self.commands = cmds;
+            }
             Event::Other(_) => {}
         }
     }
@@ -562,11 +569,19 @@ fn worker(
             client.cancel_handle(&sid),
             client.models().clone(),
             client.effort().clone(),
+            client.commands().to_vec(),
         ));
-        while let Ok(cmd) = cmd_rx.recv() {
+        loop {
+            let _ = client.poll_updates(|e| send(UiMsg::Event(e)));
+            let cmd = match cmd_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(cmd) => cmd,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
             let text = match cmd {
                 WorkerCmd::Prompt(text) => text,
                 WorkerCmd::SetModel(id) => {
+                    let prev_cmds = client.commands().to_vec();
                     match client.set_model(&sid, &id) {
                         Ok(()) => {
                             let effort = (!client.effort().available.is_empty())
@@ -575,12 +590,18 @@ fn worker(
                                 models: Some(client.models().clone()),
                                 effort,
                             }));
+                            if client.commands() != prev_cmds.as_slice() {
+                                send(UiMsg::Event(Event::AvailableCommands(
+                                    client.commands().to_vec(),
+                                )));
+                            }
                         }
                         Err(e) => send(UiMsg::ModelFailed(e.to_string())),
                     }
                     continue;
                 }
                 WorkerCmd::SetEffort(id) => {
+                    let prev_cmds = client.commands().to_vec();
                     match client.set_effort(&sid, &id) {
                         Ok(()) => {
                             if client.effort().available.is_empty() {
@@ -590,6 +611,11 @@ fn worker(
                                     models: None,
                                     effort: Some(client.effort().clone()),
                                 }));
+                            }
+                            if client.commands() != prev_cmds.as_slice() {
+                                send(UiMsg::Event(Event::AvailableCommands(
+                                    client.commands().to_vec(),
+                                )));
                             }
                         }
                         Err(e) => send(UiMsg::EffortFailed(e.to_string())),
@@ -930,5 +956,29 @@ mod tests {
                 commits: 1
             })
         );
+    }
+
+    #[test]
+    fn available_commands_update_replaces_session_commands() {
+        let (mut s, _) = session();
+        assert!(s.commands.is_empty());
+        let first = vec![
+            AvailableCommand {
+                name: "compact".into(),
+                description: "Compact history".into(),
+                input_hint: None,
+            },
+            AvailableCommand {
+                name: "web".into(),
+                description: "Search the web".into(),
+                input_hint: Some("query".into()),
+            },
+        ];
+        s.apply(UiMsg::Event(Event::AvailableCommands(first.clone())));
+        assert_eq!(s.commands, first);
+
+        // Replacement clears previous commands.
+        s.apply(UiMsg::Event(Event::AvailableCommands(vec![])));
+        assert!(s.commands.is_empty());
     }
 }

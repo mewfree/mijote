@@ -96,6 +96,17 @@ pub enum ToolContent {
     },
 }
 
+/// A slash command advertised by the agent via `available_commands_update`
+/// (or in the `session/new` response).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvailableCommand {
+    /// Command name without a leading `/` (e.g. `"compact"`, `"review"`).
+    pub name: String,
+    pub description: String,
+    /// Optional argument hint from `input.hint` (e.g. `"query to search for"`).
+    pub input_hint: Option<String>,
+}
+
 /// Something the agent told us during a prompt turn.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -125,6 +136,8 @@ pub enum Event {
         models: Option<ModelState>,
         effort: Option<EffortState>,
     },
+    /// The agent advertised or replaced its available slash commands.
+    AvailableCommands(Vec<AvailableCommand>),
     /// An update type we don't model yet (kept so nothing is silently lost).
     Other(String),
 }
@@ -476,6 +489,7 @@ pub struct AcpClient {
     next_id: u64,
     models: ModelState,
     effort: EffortState,
+    commands: Vec<AvailableCommand>,
     embedded_context: bool,
 }
 
@@ -509,6 +523,7 @@ impl AcpClient {
             next_id: 0,
             models: ModelState::default(),
             effort: EffortState::default(),
+            commands: Vec::new(),
             embedded_context: false,
         })
     }
@@ -524,6 +539,50 @@ impl AcpClient {
             stdin: Arc::clone(&self.stdin),
             session_id: session_id.to_string(),
         }
+    }
+
+    fn handle_session_update(&mut self, update: &Value, on_event: &mut dyn FnMut(Event)) {
+        let ev = parse_update(update);
+        match &ev {
+            Event::ModelChanged(id) => self.models.current = Some(id.clone()),
+            Event::EffortChanged(id) => self.effort.current = Some(id.clone()),
+            Event::ConfigOptionsUpdated { models, effort } => {
+                if let Some(m) = models {
+                    self.models = m.clone();
+                }
+                self.effort = effort.clone().unwrap_or_default();
+            }
+            Event::AvailableCommands(cmds) => {
+                self.commands = cmds.clone();
+            }
+            _ => {}
+        }
+        on_event(ev);
+    }
+
+    /// Non-blocking drain of unsolicited agent notifications (such as
+    /// `available_commands_update` or `config_option_update` emitted between turns).
+    pub fn poll_updates(&mut self, mut on_event: impl FnMut(Event)) -> Result<(), AcpError> {
+        while let Ok(msg) = self.rx.try_recv() {
+            let method = msg.get("method").and_then(Value::as_str);
+            match (method, msg.get("id")) {
+                (Some("session/update"), None) => {
+                    if let Some(update) = msg.pointer("/params/update") {
+                        self.handle_session_update(update, &mut on_event);
+                    }
+                }
+                (Some(_), Some(rid)) => {
+                    let reply = json!({
+                        "jsonrpc": "2.0",
+                        "id": rid,
+                        "error": {"code": -32601, "message": "method not supported"}
+                    });
+                    self.send(&reply)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Send a request and block until its response, dispatching any
@@ -560,19 +619,7 @@ impl AcpClient {
                 // Notification.
                 (Some("session/update"), None) => {
                     if let Some(update) = msg.pointer("/params/update") {
-                        let ev = parse_update(update);
-                        match &ev {
-                            Event::ModelChanged(id) => self.models.current = Some(id.clone()),
-                            Event::EffortChanged(id) => self.effort.current = Some(id.clone()),
-                            Event::ConfigOptionsUpdated { models, effort } => {
-                                if let Some(m) = models {
-                                    self.models = m.clone();
-                                }
-                                self.effort = effort.clone().unwrap_or_default();
-                            }
-                            _ => {}
-                        }
-                        on_event(ev);
+                        self.handle_session_update(update, on_event);
                     }
                 }
                 // Agent->client request.
@@ -646,6 +693,7 @@ impl AcpClient {
     }
 
     pub fn new_session(&mut self, cwd: &Path) -> Result<String, AcpError> {
+        self.commands.clear();
         let result = self.call_quiet(
             "session/new",
             json!({"cwd": cwd.to_string_lossy(), "mcpServers": []}),
@@ -664,6 +712,9 @@ impl AcpClient {
         } else if let Some(models) = result.get("models") {
             self.models = ModelState::parse(models);
         }
+        if let Some(cmds) = result.get("availableCommands").filter(|v| v.is_array()) {
+            self.commands = parse_available_commands(cmds);
+        }
         result
             .get("sessionId")
             .and_then(Value::as_str)
@@ -679,6 +730,11 @@ impl AcpClient {
     /// Effort levels the agent advertised for the current model (empty if none).
     pub fn effort(&self) -> &EffortState {
         &self.effort
+    }
+
+    /// Slash commands the agent advertised for the session (empty if none).
+    pub fn commands(&self) -> &[AvailableCommand] {
+        &self.commands
     }
 
     fn sync_config_options(
@@ -902,9 +958,47 @@ fn parse_update(u: &Value) -> Event {
             },
             None => Event::Other(kind),
         },
+        "available_commands_update" => match u.get("availableCommands").filter(|v| v.is_array()) {
+            Some(cmds) => Event::AvailableCommands(parse_available_commands(cmds)),
+            None => Event::Other(kind),
+        },
         "current_model_update" => Event::ModelChanged(str_of(u, "currentModelId")),
         _ => Event::Other(kind),
     }
+}
+
+fn parse_available_commands(v: &Value) -> Vec<AvailableCommand> {
+    let Some(items) = v.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in items {
+        let Some(raw_name) = item.get("name").and_then(non_empty_str) else {
+            continue;
+        };
+        let name = raw_name.trim_start_matches('/').trim();
+        if name.is_empty() || !seen.insert(name.to_ascii_lowercase()) {
+            continue;
+        }
+        let description = item
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        let input_hint = item
+            .get("input")
+            .and_then(|i| i.get("hint"))
+            .and_then(non_empty_str)
+            .map(str::to_string);
+        out.push(AvailableCommand {
+            name: name.to_string(),
+            description,
+            input_hint,
+        });
+    }
+    out
 }
 
 fn non_empty_str(v: &Value) -> Option<&str> {
@@ -1794,5 +1888,151 @@ for line in sys.stdin:
             vec!["question_0", "question_0_custom", "question_1"]
         );
         assert_eq!(out, "accept:Postgres:TLS,Metrics");
+    }
+
+    #[test]
+    fn available_commands_update_parses_and_handles_edge_cases() {
+        let u = json!({
+            "sessionUpdate": "available_commands_update",
+            "availableCommands": [
+                {
+                    "name": "web",
+                    "description": "Search the web",
+                    "input": {"hint": "query to search for"}
+                },
+                {
+                    "name": "/compact",
+                    "description": "  Compact conversation  ",
+                    "input": null
+                },
+                {
+                    "name": "WEB",
+                    "description": "Duplicate ignored"
+                },
+                {
+                    "name": "  ",
+                    "description": "Empty name skipped"
+                }
+            ]
+        });
+        assert_eq!(
+            parse_update(&u),
+            Event::AvailableCommands(vec![
+                AvailableCommand {
+                    name: "web".into(),
+                    description: "Search the web".into(),
+                    input_hint: Some("query to search for".into()),
+                },
+                AvailableCommand {
+                    name: "compact".into(),
+                    description: "Compact conversation".into(),
+                    input_hint: None,
+                },
+            ])
+        );
+
+        let empty = json!({
+            "sessionUpdate": "available_commands_update",
+            "availableCommands": []
+        });
+        assert_eq!(parse_update(&empty), Event::AvailableCommands(vec![]));
+
+        let malformed = json!({
+            "sessionUpdate": "available_commands_update"
+        });
+        assert_eq!(
+            parse_update(&malformed),
+            Event::Other("available_commands_update".into())
+        );
+    }
+
+    #[test]
+    fn available_commands_received_after_new_session_and_mid_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    m, mid = msg.get("method"), msg.get("id")
+    if m == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{
+            "protocolVersion":1,
+            "agentInfo":{"name":"fake"}
+        }}), flush=True)
+    elif m == "session/new":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"sessionId":"s1"}}), flush=True)
+        # Matches claude-agent-acp: emit available_commands_update right after session/new.
+        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"s1",
+            "update":{
+                "sessionUpdate":"available_commands_update",
+                "availableCommands":[
+                    {"name":"compact","description":"Compact history"},
+                    {"name":"mcp","description":"Manage MCP servers","input":{"hint":"[reconnect]"}}
+                ]
+            }
+        }}), flush=True)
+    elif m == "session/prompt":
+        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"s1",
+            "update":{
+                "sessionUpdate":"available_commands_update",
+                "availableCommands":[
+                    {"name":"review","description":"Review changes"}
+                ]
+            }
+        }}), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"stopReason":"end_turn"}}), flush=True)
+"#;
+        let mut client = AcpClient::spawn("python3", &["-c", script], dir.path()).unwrap();
+        client.initialize().unwrap();
+        let sid = client.new_session(dir.path()).unwrap();
+
+        let mut idle_events = Vec::new();
+        for _ in 0..50 {
+            client.poll_updates(|ev| idle_events.push(ev)).unwrap();
+            if !client.commands().is_empty() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            client.commands(),
+            &[
+                AvailableCommand {
+                    name: "compact".into(),
+                    description: "Compact history".into(),
+                    input_hint: None,
+                },
+                AvailableCommand {
+                    name: "mcp".into(),
+                    description: "Manage MCP servers".into(),
+                    input_hint: Some("[reconnect]".into()),
+                },
+            ]
+        );
+        assert_eq!(idle_events.len(), 1);
+
+        let mut prompt_events = Vec::new();
+        let stop = client
+            .prompt(&sid, "/compact", |ev| prompt_events.push(ev), |_| None)
+            .unwrap();
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(
+            client.commands(),
+            &[AvailableCommand {
+                name: "review".into(),
+                description: "Review changes".into(),
+                input_hint: None,
+            }]
+        );
+        assert_eq!(
+            prompt_events,
+            vec![Event::AvailableCommands(vec![AvailableCommand {
+                name: "review".into(),
+                description: "Review changes".into(),
+                input_hint: None,
+            }])]
+        );
     }
 }
