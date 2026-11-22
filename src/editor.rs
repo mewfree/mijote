@@ -98,9 +98,30 @@ impl Editor {
 
     /// Replace the contents, cursor at the end. Forgets undo history.
     pub fn set_text(&mut self, s: &str) {
+        self.set_text_at(s, usize::MAX, false);
+    }
+
+    /// Replace the contents with `s` and place the cursor at `cur` (clamped to
+    /// valid normal-mode positions when `clamp` is true). Forgets undo history.
+    pub fn set_text_at(&mut self, s: &str, cur: usize, clamp: bool) {
         self.buf = s.chars().collect();
-        self.cur = self.buf.len();
+        self.cur = cur.min(self.buf.len());
         self.reset_history();
+        if clamp {
+            self.clamp();
+        }
+    }
+
+    /// Replace the contents with `s`, placing the cursor at the end of the first
+    /// line (clamped onto the last character when `clamp` is true, for normal mode).
+    /// Forgets undo history.
+    pub fn set_text_first_line_end(&mut self, s: &str, clamp: bool) {
+        self.buf = s.chars().collect();
+        self.cur = self.line_end(0);
+        self.reset_history();
+        if clamp {
+            self.clamp();
+        }
     }
 
     pub fn clear(&mut self) {
@@ -828,5 +849,25 @@ mod tests {
         assert_eq!(e.pending(), "2d");
         e.cancel_pending();
         assert_eq!(e.pending(), "");
+    }
+
+    #[test]
+    fn set_text_cursor_helpers_respect_normal_clamp() {
+        let mut e = Editor::default();
+        e.set_text_first_line_end("abc\ndef", false);
+        assert_eq!(e.cursor_pos(), (0, 3));
+        e.set_text_first_line_end("abc\ndef", true);
+        assert_eq!(e.cursor_pos(), (0, 2));
+        e.set_text_first_line_end("\ndef", true);
+        assert_eq!(e.cursor_pos(), (0, 0));
+        e.set_text_first_line_end("", true);
+        assert_eq!(e.cursor_pos(), (0, 0));
+
+        e.set_text_at("abc\ndef", usize::MAX, false);
+        assert_eq!(e.cursor_pos(), (1, 3));
+        e.set_text_at("abc\ndef", usize::MAX, true);
+        assert_eq!(e.cursor_pos(), (1, 2));
+        e.set_text_at("abc\ndef", 1, true);
+        assert_eq!(e.cursor_pos(), (0, 1));
     }
 }

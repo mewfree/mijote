@@ -32,6 +32,9 @@ pub struct Record {
     pub label: Option<String>,
 }
 
+/// Maximum number of submitted prompts kept in persistent history.
+pub const HISTORY_LIMIT: usize = 500;
+
 #[derive(Debug, Clone)]
 pub struct Store {
     dir: PathBuf,
@@ -65,6 +68,10 @@ impl Store {
 
     fn last_agent_path(&self) -> PathBuf {
         self.dir.join("last-agent")
+    }
+
+    fn history_path(&self) -> PathBuf {
+        self.dir.join("prompt-history")
     }
 
     /// Write atomically (temp file + rename) so a crash never leaves a
@@ -113,6 +120,35 @@ impl Store {
             })
             .max_by(|a, b| key_order(&a.0).cmp(&key_order(&b.0)))
             .map(|(_, agent)| agent)
+    }
+
+    /// Persist submitted prompt history atomically, keeping at most `HISTORY_LIMIT`
+    /// most recent entries. Stored without a `.json` extension so session loading
+    /// ignores it.
+    pub fn save_history(&self, entries: &[String]) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let start = entries.len().saturating_sub(HISTORY_LIMIT);
+        let path = self.history_path();
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&entries[start..])?)?;
+        std::fs::rename(tmp, path)
+    }
+
+    /// Load persisted prompt history, oldest first. Missing or corrupt files
+    /// return an empty list.
+    pub fn load_history(&self) -> Vec<String> {
+        let Ok(bytes) = std::fs::read(self.history_path()) else {
+            return Vec::new();
+        };
+        let Ok(mut entries) = serde_json::from_slice::<Vec<String>>(&bytes) else {
+            return Vec::new();
+        };
+        entries.retain(|s| !s.trim().is_empty());
+        if entries.len() > HISTORY_LIMIT {
+            let excess = entries.len() - HISTORY_LIMIT;
+            entries.drain(..excess);
+        }
+        entries
     }
 
     /// Records saved for `cwd`, oldest first. Unreadable or corrupt files are
@@ -230,5 +266,34 @@ mod tests {
         assert_eq!(loaded[1].0, "2-codex");
         assert_eq!(loaded[1].1.label, None);
         assert_eq!(loaded[1].1.effort, None);
+    }
+
+    #[test]
+    fn prompt_history_round_trips_caps_and_ignores_corrupt_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("sessions"));
+        assert!(store.load_history().is_empty());
+
+        let prompts = vec!["first".to_string(), "multi\nline".to_string()];
+        store.save_history(&prompts).unwrap();
+        assert_eq!(store.load_history(), prompts);
+        // Must not interfere with session records or last_agent.
+        assert!(store.load(Path::new("/p")).is_empty());
+        assert_eq!(store.last_agent(), None);
+
+        // Caps at HISTORY_LIMIT, keeping the newest entries.
+        let many: Vec<String> = (0..(HISTORY_LIMIT + 10)).map(|i| format!("p{i}")).collect();
+        store.save_history(&many).unwrap();
+        let loaded = store.load_history();
+        assert_eq!(loaded.len(), HISTORY_LIMIT);
+        assert_eq!(loaded.first().map(String::as_str), Some("p10"));
+        assert_eq!(
+            loaded.last().map(String::as_str),
+            Some(format!("p{}", HISTORY_LIMIT + 9).as_str())
+        );
+
+        // Corrupt history file returns empty instead of failing.
+        std::fs::write(dir.path().join("sessions/prompt-history"), "{bad").unwrap();
+        assert!(store.load_history().is_empty());
     }
 }

@@ -1981,6 +1981,7 @@ fn render_help(f: &mut Frame) {
         heading("prompt (vim)"),
         row("i / Enter", "insert mode, Esc for normal"),
         row("S-Enter / C-j", "insert newline (also Alt-Enter)"),
+        row("↑/↓ (k/j)", "prompt history (at first/last line)"),
         row("/  @", "slash commands & workspace file mentions"),
         row("d c y u C-r", "operators, undo/redo & vim motions"),
         Line::from(""),

@@ -33,8 +33,9 @@ agent (falling back to the first installed backend).
 ** keys
 
 The prompt is a vim-style editor: =i= / =Enter= insert, =Esc= back to normal,
-=Enter= send, =Shift-Enter= (or =Alt-Enter=, =Ctrl-J=) newline. Normal mode has
-motions (=h l j k 0 ^ $ w b e gg G=), operators (=d c y= + motion), =x p u
+=Enter= send, =Shift-Enter= (or =Alt-Enter=, =Ctrl-J=) newline, =Up=/=Down= (and
+=k=/=j= in normal mode) for prompt history at the first/last line. Normal mode
+has motions (=h l j k 0 ^ $ w b e gg G=), operators (=d c y= + motion), =x p u
 Ctrl-r= and counts. Bracketed paste works in insert mode; pastes over 3 lines
 or 500 characters collapse to a =[Pasted text #1 +N lines]= placeholder and
 expand on send.

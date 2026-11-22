@@ -314,11 +314,28 @@ struct Notice {
     expires_at: Instant,
 }
 
+struct HistoryDraft {
+    text: String,
+    cursor: usize,
+    pastes: Vec<(String, String)>,
+}
+
+struct HistoryNav {
+    /// Index into `App::history` currently loaded in `App::input`.
+    index: usize,
+    /// Prompt state saved before entering history navigation.
+    draft: HistoryDraft,
+}
+
 pub struct App {
     pub sessions: Vec<Session>,
     pub selected: usize,
     pub mode: Mode,
     pub input: Editor,
+    /// Previously submitted prompts, oldest first (persisted in `store`).
+    history: Vec<String>,
+    /// Active prompt-history browsing state (`Up`/`Down` or Normal-mode `k`/`j`).
+    history_nav: Option<HistoryNav>,
     /// Active `@` file-mention completion popup in Insert mode.
     pub mention: Option<MentionPopup>,
     /// Cached file list for the currently open `@` completion session.
@@ -402,11 +419,14 @@ pub struct App {
 
 impl App {
     pub fn new(cwd: PathBuf, worktrees_root: PathBuf, store: Store, ui_tx: Sender<Msg>) -> Self {
+        let history = store.load_history();
         Self {
             sessions: Vec::new(),
             selected: 0,
             mode: Mode::Normal,
             input: Editor::default(),
+            history,
+            history_nav: None,
             mention: None,
             mention_files: None,
             slash: None,
@@ -609,6 +629,24 @@ impl App {
         }
         // Records load oldest first; land on the newest, like `open_session`.
         self.selected = self.sessions.len().saturating_sub(1);
+        // If no persisted prompt history file exists yet, seed from restored transcripts.
+        if self.history.is_empty() {
+            for s in &self.sessions {
+                for entry in &s.entries {
+                    if let Entry::User(text) = entry {
+                        let text = text.trim();
+                        if !text.is_empty() && self.history.last().map(String::as_str) != Some(text)
+                        {
+                            self.history.push(text.to_string());
+                        }
+                    }
+                }
+            }
+            if self.history.len() > crate::store::HISTORY_LIMIT {
+                let excess = self.history.len() - crate::store::HISTORY_LIMIT;
+                self.history.drain(..excess);
+            }
+        }
     }
 
     pub fn open_session(&mut self, spec: &'static AgentSpec, isolated: bool) {
@@ -1327,6 +1365,16 @@ impl App {
                     self.search_step(false);
                     return;
                 }
+                KeyCode::Up | KeyCode::Char('k') if self.input.cursor_pos().0 == 0 => {
+                    self.history_prev();
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('j')
+                    if self.input.cursor_pos().0 + 1 >= self.input.line_count() =>
+                {
+                    self.history_next();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -1848,6 +1896,7 @@ impl App {
                     return;
                 }
                 if self.slash_model(&text) || self.slash_effort(&text) {
+                    self.history_nav = None;
                     self.input.clear();
                     self.pastes.clear();
                     self.clear_completions();
@@ -1857,11 +1906,13 @@ impl App {
                 let mut sent = None;
                 if let Some(s) = self.current_mut() {
                     if s.can_prompt() {
-                        s.send_prompt(text);
+                        s.send_prompt(text.clone());
                         sent = Some((s.id, s.spec.id));
                     }
                 }
                 if let Some((id, agent)) = sent {
+                    self.record_history(text);
+                    self.history_nav = None;
                     self.input.clear();
                     self.pastes.clear();
                     self.clear_completions();
@@ -1889,12 +1940,20 @@ impl App {
                 self.update_completions();
             }
             KeyCode::Up => {
-                self.input.up();
-                self.update_completions();
+                if self.input.cursor_pos().0 == 0 {
+                    self.history_prev();
+                } else {
+                    self.input.up();
+                    self.update_completions();
+                }
             }
             KeyCode::Down => {
-                self.input.down();
-                self.update_completions();
+                if self.input.cursor_pos().0 + 1 >= self.input.line_count() {
+                    self.history_next();
+                } else {
+                    self.input.down();
+                    self.update_completions();
+                }
             }
             KeyCode::Home => {
                 self.input.home();
@@ -1909,6 +1968,92 @@ impl App {
                 self.update_completions();
             }
             _ => {}
+        }
+    }
+
+    fn record_history(&mut self, prompt: String) {
+        if prompt.trim().is_empty() {
+            return;
+        }
+        if self.history.last().map(String::as_str) != Some(prompt.as_str()) {
+            self.history.push(prompt);
+            if self.history.len() > crate::store::HISTORY_LIMIT {
+                let excess = self.history.len() - crate::store::HISTORY_LIMIT;
+                self.history.drain(..excess);
+            }
+            let _ = self.store.save_history(&self.history);
+        }
+    }
+
+    /// Return the active history index if `self.input` still matches the
+    /// unmodified recalled entry; otherwise detach so user edits are preserved.
+    fn active_history_index(&mut self) -> Option<usize> {
+        let index = self.history_nav.as_ref()?.index;
+        let matches = self
+            .history
+            .get(index)
+            .is_some_and(|entry| self.input.text() == *entry);
+        if matches {
+            Some(index)
+        } else {
+            self.history_nav = None;
+            None
+        }
+    }
+
+    fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let normal = self.mode == Mode::Normal;
+        let target = match self.active_history_index() {
+            Some(0) => return,
+            Some(i) => i - 1,
+            None => {
+                let draft = HistoryDraft {
+                    text: self.input.text(),
+                    cursor: self.input.cursor_index(),
+                    pastes: std::mem::take(&mut self.pastes),
+                };
+                let last = self.history.len() - 1;
+                self.history_nav = Some(HistoryNav { index: last, draft });
+                last
+            }
+        };
+        if let Some(nav) = self.history_nav.as_mut() {
+            nav.index = target;
+        }
+        let entry = self.history[target].clone();
+        self.pastes.clear();
+        self.clear_completions();
+        self.input.set_text_first_line_end(&entry, normal);
+        if !normal {
+            self.input.checkpoint();
+        }
+    }
+
+    fn history_next(&mut self) {
+        let Some(index) = self.active_history_index() else {
+            return;
+        };
+        let normal = self.mode == Mode::Normal;
+        if index + 1 < self.history.len() {
+            let target = index + 1;
+            if let Some(nav) = self.history_nav.as_mut() {
+                nav.index = target;
+            }
+            let entry = self.history[target].clone();
+            self.pastes.clear();
+            self.clear_completions();
+            self.input.set_text_at(&entry, usize::MAX, normal);
+        } else if let Some(nav) = self.history_nav.take() {
+            self.pastes = nav.draft.pastes;
+            self.clear_completions();
+            self.input
+                .set_text_at(&nav.draft.text, nav.draft.cursor, normal);
+        }
+        if !normal {
+            self.input.checkpoint();
         }
     }
 
@@ -3865,5 +4010,255 @@ mod tests {
         type_keys(&mut app, "/review @");
         assert!(app.slash.is_none());
         assert!(app.mention.is_some());
+    }
+
+    fn send_prompt(app: &mut App, text: &str) {
+        app.sessions[app.selected].status = Status::Idle;
+        app.mode = Mode::Insert;
+        for c in text.chars() {
+            if c == '\n' {
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+            } else {
+                app.handle_key(key(KeyCode::Char(c)));
+            }
+        }
+        app.handle_key(key(KeyCode::Enter));
+        app.sessions[app.selected].status = Status::Idle;
+    }
+
+    #[test]
+    fn prompt_history_up_down_in_insert_mode_and_draft_restoration() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("sessions");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("."),
+            PathBuf::from("."),
+            Store::new(store_dir.clone()),
+            tx,
+        );
+        let (mut s, _) = Session::detached(0, agent::find("claude").unwrap());
+        s.status = Status::Idle;
+        app.sessions.push(s);
+
+        // Sending prompts records history and skips consecutive duplicates.
+        send_prompt(&mut app, "first prompt");
+        send_prompt(&mut app, "second prompt");
+        send_prompt(&mut app, "second prompt");
+
+        // Type an unsent draft with a collapsed large paste.
+        app.mode = Mode::Insert;
+        for c in "wip ".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        let big_paste = "a\nb\nc\nd\ne";
+        app.handle_paste(big_paste);
+        let draft_text = app.input.text();
+        let draft_cursor = app.input.cursor_index();
+        assert!(draft_text.starts_with("wip [Pasted text #1"));
+
+        // Up steps backward through history; stops cleanly at the oldest entry.
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "second prompt");
+        assert_eq!(app.input.cursor_pos(), (0, "second prompt".len()));
+
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "first prompt");
+
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "first prompt");
+
+        // Down steps forward and restores the exact draft (including collapsed paste).
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.input.text(), "second prompt");
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.input.text(), draft_text);
+        assert_eq!(app.input.cursor_index(), draft_cursor);
+
+        // Submitting the restored draft still expands its collapsed paste.
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.sessions[0].entries.last(),
+            Some(&Entry::User(format!("wip {big_paste}")))
+        );
+
+        // History persists on disk for a fresh App sharing the same Store.
+        let (tx2, _rx2) = mpsc::channel();
+        let mut app2 = App::new(
+            PathBuf::from("."),
+            PathBuf::from("."),
+            Store::new(store_dir),
+            tx2,
+        );
+        let (mut s2, _) = Session::detached(0, agent::find("claude").unwrap());
+        s2.status = Status::Idle;
+        app2.sessions.push(s2);
+        app2.mode = Mode::Insert;
+        app2.handle_key(key(KeyCode::Up));
+        assert_eq!(app2.input.text(), format!("wip {big_paste}"));
+        app2.handle_key(key(KeyCode::Up));
+        assert_eq!(app2.input.text(), "second prompt");
+        app2.handle_key(key(KeyCode::Up));
+        assert_eq!(app2.input.text(), "first prompt");
+    }
+
+    #[test]
+    fn prompt_history_j_k_and_arrows_in_normal_mode_respect_vim_operators() {
+        let (mut app, _) = app_with_session();
+        let (mut s2, _) = Session::detached(1, agent::find("antigravity").unwrap());
+        s2.status = Status::Idle;
+        app.sessions.push(s2);
+
+        send_prompt(&mut app, "alpha");
+        send_prompt(&mut app, "beta");
+
+        app.mode = Mode::Normal;
+        app.input.set_text_at("draft", 2, true);
+
+        // k / j navigate history in Normal mode and clamp the cursor onto a char.
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.input.text(), "beta");
+        assert_eq!(app.input.cursor_pos(), (0, 3));
+
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "alpha");
+        assert_eq!(app.input.cursor_pos(), (0, 4));
+
+        // Horizontal cursor motion does not detach history browsing.
+        app.handle_key(key(KeyCode::Char('0')));
+        assert_eq!(app.input.cursor_pos(), (0, 0));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.input.text(), "beta");
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.input.text(), "draft");
+        assert_eq!(app.input.cursor_pos(), (0, 2));
+
+        // Vim replace `rk` / `rj` and linewise operators `dk` / `dj` still work.
+        app.input.set_text_at("ab\ncd", 0, true);
+        app.handle_key(key(KeyCode::Char('r')));
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.input.text(), "kb\ncd");
+
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.input.text(), "");
+
+        // Leader + j/k still switches sessions rather than browsing prompt history.
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.selected, 1);
+        assert_eq!(app.input.text(), "");
+    }
+
+    #[test]
+    fn prompt_history_multiline_prompts_and_edits_preserve_user_text() {
+        let (mut app, _) = app_with_session();
+        send_prompt(&mut app, "oldest");
+        send_prompt(&mut app, "line1\nline2\nline3");
+        send_prompt(&mut app, "newest");
+
+        // Multi-line draft: Up moves within the buffer first, then recalls history at row 0.
+        app.mode = Mode::Insert;
+        app.input.set_text("d1\nd2");
+        assert_eq!(app.input.cursor_pos(), (1, 2));
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "d1\nd2");
+        assert_eq!(app.input.cursor_pos(), (0, 2));
+
+        // At row 0, repeated Up steps cleanly through multi-line history entries in 1 press each.
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "newest");
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "line1\nline2\nline3");
+        assert_eq!(app.input.cursor_pos().0, 0);
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "oldest");
+
+        // Repeated Down steps cleanly forward through multi-line entries in 1 press each.
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.input.text(), "line1\nline2\nline3");
+        assert_eq!(app.input.cursor_pos().0, 2);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.input.text(), "newest");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.input.text(), "d1\nd2");
+
+        // Reversing direction inside a multi-line recalled entry lets you move across its lines.
+        app.handle_key(key(KeyCode::Up)); // newest
+        app.handle_key(key(KeyCode::Up)); // line1\nline2\nline3 (row 0)
+        app.handle_key(key(KeyCode::Down)); // row 1 inside multi-line prompt
+        assert_eq!(app.input.text(), "line1\nline2\nline3");
+        assert_eq!(app.input.cursor_pos().0, 1);
+
+        // Editing a recalled prompt detaches history so Down never clobbers the edit.
+        app.handle_key(key(KeyCode::Char('!')));
+        assert_eq!(app.input.text(), "line1\nline2!\nline3");
+        app.handle_key(key(KeyCode::Down)); // row 2
+        app.handle_key(key(KeyCode::Down)); // bottom line: must NOT clobber edit
+        assert_eq!(app.input.text(), "line1\nline2!\nline3");
+
+        // Pressing Esc + u undoes the insert-mode edit back to the recalled prompt.
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.input.text(), "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn prompt_history_does_not_conflict_with_popups_and_seeds_on_restore() {
+        let (mut app, _) = app_with_session();
+        send_prompt(&mut app, "plain prompt");
+        send_prompt(&mut app, "/review");
+
+        // Recalling a slash command must NOT open the slash popup and hijack the next Up.
+        app.mode = Mode::Insert;
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "/review");
+        assert!(app.slash.is_none());
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "plain prompt");
+
+        // When the slash popup IS open, Up/Down still navigate the popup rather than history.
+        app.input.clear();
+        app.handle_key(key(KeyCode::Char('/')));
+        assert!(app.slash.is_some());
+        assert_eq!(app.slash.as_ref().unwrap().cursor, 0);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.input.text(), "/");
+        assert_eq!(app.slash.as_ref().unwrap().cursor, 1);
+
+        // Restoring saved sessions seeds history when no prompt-history file exists yet.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("sessions"));
+        let cwd = PathBuf::from("/proj");
+        store
+            .save(
+                "1-claude",
+                &crate::store::Record {
+                    agent: "claude".into(),
+                    cwd: cwd.clone(),
+                    worktree: None,
+                    entries: vec![
+                        Entry::User("restored one".into()),
+                        Entry::Agent("reply".into()),
+                        Entry::User("restored two".into()),
+                    ],
+                    model: None,
+                    effort: None,
+                    label: None,
+                },
+            )
+            .unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let mut restored = App::new(cwd, dir.path().join("wt"), store, tx);
+        restored.restore();
+        restored.mode = Mode::Normal;
+        restored.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(restored.input.text(), "restored two");
+        restored.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(restored.input.text(), "restored one");
+        let _ = restored.close_all();
     }
 }
