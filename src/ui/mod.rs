@@ -22,7 +22,7 @@ mod markdown;
 use crate::agent::acp::{CostInfo, ElicitationRequest, FieldKind, ToolContent};
 use crate::agent::install::AgentStatus;
 use crate::app::{App, Confirm, FieldDraft, MentionPopup, Mode, QuestionDraft, SlashPopup};
-use crate::session::{Entry, Session, SessionUsage, Status};
+use crate::session::{CacheStatus, Entry, Session, SessionUsage, Status};
 
 /// A clickable markdown hyperlink on the current screen, in terminal cells.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -492,12 +492,48 @@ fn spans_width(spans: &[Span<'_>]) -> usize {
     spans.iter().map(|s| s.content.chars().count()).sum()
 }
 
+fn format_cache_remaining(rem: std::time::Duration) -> String {
+    let secs = rem.as_secs().max(1);
+    if secs >= 10 * 60 {
+        format!("{}m", (secs + 30) / 60)
+    } else if secs >= 60 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn cache_border_badge(status: CacheStatus) -> (String, Style) {
+    match status {
+        CacheStatus::Warm { remaining, .. } => {
+            let style = if remaining.as_secs() < 60 {
+                Style::new().fg(WARN)
+            } else {
+                DIM
+            };
+            (
+                format!("cache {}", format_cache_remaining(remaining)),
+                style,
+            )
+        }
+        CacheStatus::Expired {
+            by_model_switch: true,
+            ..
+        } => ("cache cold".to_string(), Style::new().fg(WARN)),
+        CacheStatus::Expired {
+            by_model_switch: false,
+            ..
+        } => ("cache expired".to_string(), Style::new().fg(WARN)),
+    }
+}
+
 /// Right-aligned context/usage gauge for the prompt box border, degrading
 /// gracefully as terminal width shrinks.
 fn prompt_usage_title(usage: &SessionUsage, max_width: usize) -> Option<Line<'static>> {
     if max_width < 8 {
         return None;
     }
+    let cache_badge = usage.cache.status().map(cache_border_badge);
     if let (Some(used), Some(size)) = (usage.context_used, usage.context_size.filter(|&s| s > 0)) {
         let pct = (used as f64 / size as f64) * 100.0;
         let color = context_color(pct);
@@ -513,7 +549,11 @@ fn prompt_usage_title(usage: &SessionUsage, max_width: usize) -> Option<Line<'st
             .as_ref()
             .map(|c| format!(" · {}", format_cost(c)));
 
-        let build = |with_bar: bool, with_tok: bool, with_cost: bool| -> Vec<Span<'static>> {
+        let build = |with_bar: bool,
+                     with_tok: bool,
+                     with_cost: bool,
+                     with_cache: bool|
+         -> Vec<Span<'static>> {
             let mut spans = vec![Span::styled(" ctx ", DIM)];
             if with_bar {
                 spans.extend(context_bar_spans(pct, 8));
@@ -528,18 +568,29 @@ fn prompt_usage_title(usage: &SessionUsage, max_width: usize) -> Option<Line<'st
                     spans.push(Span::styled(c.clone(), DIM));
                 }
             }
+            if with_cache {
+                if let Some((text, style)) = &cache_badge {
+                    spans.push(Span::styled(" · ", DIM));
+                    spans.push(Span::styled(text.clone(), *style));
+                }
+            }
             spans.push(Span::raw(" "));
             spans
         };
 
+        let has_cost = cost_str.is_some();
+        let has_cache = cache_badge.is_some();
         let candidates = [
-            (true, true, cost_str.is_some()),
-            (true, true, false),
-            (true, false, false),
-            (false, false, false),
+            (true, true, has_cost, has_cache),
+            (true, true, false, has_cache),
+            (true, true, has_cost, false),
+            (true, true, false, false),
+            (true, false, false, has_cache),
+            (true, false, false, false),
+            (false, false, false, false),
         ];
-        for (bar, tok, cost) in candidates {
-            let spans = build(bar, tok, cost);
+        for (bar, tok, cost, cache) in candidates {
+            let spans = build(bar, tok, cost, cache);
             if spans_width(&spans) <= max_width {
                 return Some(Line::from(spans));
             }
@@ -552,27 +603,53 @@ fn prompt_usage_title(usage: &SessionUsage, max_width: usize) -> Option<Line<'st
         .as_ref()
         .map(|t| format!("tok {}", format_tokens(t.total_tokens)));
     let cost_part = usage.cost.as_ref().map(format_cost);
-    let full = match (&tok_part, &cost_part) {
-        (Some(t), Some(c)) => Some(format!(" {t} · {c} ")),
-        (Some(t), None) => Some(format!(" {t} ")),
-        (None, Some(c)) => Some(format!(" {c} ")),
-        (None, None) => None,
-    };
-    if let Some(text) = full {
-        if text.chars().count() <= max_width {
-            return Some(Line::styled(text, DIM));
-        }
-    }
-    if let Some(t) = tok_part {
-        let compact = format!(" {t} ");
-        if compact.chars().count() <= max_width {
-            return Some(Line::styled(compact, DIM));
-        }
-    }
-    if let Some(c) = cost_part {
-        let compact = format!(" {c} ");
-        if compact.chars().count() <= max_width {
-            return Some(Line::styled(compact, DIM));
+    let build_fallback =
+        |with_tok: bool, with_cost: bool, with_cache: bool| -> Vec<Span<'static>> {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut push_part = |text: String, style: Style| {
+                if spans.is_empty() {
+                    spans.push(Span::raw(" "));
+                } else {
+                    spans.push(Span::styled(" · ", DIM));
+                }
+                spans.push(Span::styled(text, style));
+            };
+            if with_tok {
+                if let Some(t) = &tok_part {
+                    push_part(t.clone(), DIM);
+                }
+            }
+            if with_cost {
+                if let Some(c) = &cost_part {
+                    push_part(c.clone(), DIM);
+                }
+            }
+            if with_cache {
+                if let Some((text, style)) = &cache_badge {
+                    push_part(text.clone(), *style);
+                }
+            }
+            if !spans.is_empty() {
+                spans.push(Span::raw(" "));
+            }
+            spans
+        };
+    let candidates = [
+        (
+            tok_part.is_some(),
+            cost_part.is_some(),
+            cache_badge.is_some(),
+        ),
+        (tok_part.is_some(), false, cache_badge.is_some()),
+        (tok_part.is_some(), cost_part.is_some(), false),
+        (tok_part.is_some(), false, false),
+        (false, false, cache_badge.is_some()),
+        (false, cost_part.is_some(), false),
+    ];
+    for (tok, cost, cache) in candidates {
+        let spans = build_fallback(tok, cost, cache);
+        if !spans.is_empty() && spans_width(&spans) <= max_width {
+            return Some(Line::from(spans));
         }
     }
     None
@@ -2325,6 +2402,41 @@ fn render_usage(f: &mut Frame, app: &App) {
                 format_cost(cost)
             };
             lines.push(kv("session cost", formatted, Style::new()));
+        }
+
+        if let Some(status) = s.usage.cache.status() {
+            let (val, style) = match status {
+                CacheStatus::Warm { ttl, remaining } => {
+                    let style = if remaining.as_secs() < 60 {
+                        Style::new().fg(WARN)
+                    } else {
+                        Style::new().fg(OK)
+                    };
+                    (
+                        format!(
+                            "warm · {} left ({} TTL)",
+                            format_cache_remaining(remaining),
+                            ttl.label()
+                        ),
+                        style,
+                    )
+                }
+                CacheStatus::Expired {
+                    by_model_switch: true,
+                    ..
+                } => (
+                    "cold (invalidated by model switch)".to_string(),
+                    Style::new().fg(WARN),
+                ),
+                CacheStatus::Expired {
+                    ttl,
+                    by_model_switch: false,
+                } => (
+                    format!("expired ({} TTL elapsed)", ttl.label()),
+                    Style::new().fg(WARN),
+                ),
+            };
+            lines.push(kv("prompt cache", val, style));
         }
 
         if let Some(tok) = &s.usage.tokens {
@@ -4378,5 +4490,81 @@ mod tests {
         let line = prompt_usage_title(&usage, 40).expect("should show token fallback");
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, " tok 12k ");
+    }
+
+    #[test]
+    fn render_shows_prompt_cache_countdown_expired_and_model_switch_cold() {
+        use crate::agent::acp::{CacheTtl, UsageUpdate};
+        use std::time::{Duration, Instant};
+
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.status = Status::Idle;
+        s.usage.apply_update(UsageUpdate {
+            used: 84_000,
+            size: 200_000,
+            cost: Some(CostInfo {
+                amount: 0.14,
+                currency: "USD".into(),
+            }),
+        });
+        // Warm 5m cache (just warmed).
+        s.usage
+            .cache
+            .record(Some(CacheTtl::FiveMinutes), Instant::now());
+        app.sessions.push(s);
+
+        let mut term = Terminal::new(TestBackend::new(96, 24)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let warm_screen = dump(&term);
+        assert!(
+            warm_screen.contains("cache 4m") || warm_screen.contains("cache 5m"),
+            "{warm_screen}"
+        );
+
+        // Usage modal shows warm + TTL tier.
+        app.mode = Mode::Usage;
+        term.draw(|f| render(f, &app)).unwrap();
+        let warm_modal = dump(&term);
+        assert!(warm_modal.contains("prompt cache"), "{warm_modal}");
+        assert!(warm_modal.contains("warm ·"), "{warm_modal}");
+        assert!(warm_modal.contains("(5m TTL)"), "{warm_modal}");
+
+        // Expired cache (warmed 6 minutes ago with 5m TTL).
+        app.mode = Mode::Normal;
+        app.sessions[0].usage.cache.warmed_at =
+            Instant::now().checked_sub(Duration::from_secs(360));
+        term.draw(|f| render(f, &app)).unwrap();
+        let exp_screen = dump(&term);
+        assert!(exp_screen.contains("cache expired"), "{exp_screen}");
+
+        app.mode = Mode::Usage;
+        term.draw(|f| render(f, &app)).unwrap();
+        let exp_modal = dump(&term);
+        assert!(
+            exp_modal.contains("expired (5m TTL elapsed)"),
+            "{exp_modal}"
+        );
+
+        // Model-switch invalidation shows `cache cold`.
+        app.mode = Mode::Normal;
+        app.sessions[0].usage.invalidate_cache_for_model_switch();
+        term.draw(|f| render(f, &app)).unwrap();
+        let cold_screen = dump(&term);
+        assert!(cold_screen.contains("cache cold"), "{cold_screen}");
+
+        app.mode = Mode::Usage;
+        term.draw(|f| render(f, &app)).unwrap();
+        let cold_modal = dump(&term);
+        assert!(
+            cold_modal.contains("cold (invalidated by model switch)"),
+            "{cold_modal}"
+        );
     }
 }

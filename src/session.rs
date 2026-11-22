@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::acp::{
-    AcpClient, AvailableCommand, CancelHandle, CostInfo, EffortState, ElicitationRequest,
+    AcpClient, AvailableCommand, CacheTtl, CancelHandle, CostInfo, EffortState, ElicitationRequest,
     ElicitationResponse, Event, ModelState, PermissionRequest, StopReason, TokenUsage, ToolContent,
     UsageUpdate,
 };
@@ -43,6 +43,71 @@ pub enum Status {
     Failed,
 }
 
+/// Computed warmth of the session's prompt cache at a point in time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheStatus {
+    Warm {
+        ttl: CacheTtl,
+        remaining: Duration,
+    },
+    Expired {
+        ttl: CacheTtl,
+        by_model_switch: bool,
+    },
+}
+
+/// Process-local prompt-cache TTL tracker (populated for Claude sessions via
+/// `_claude/sdkMessage`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CacheState {
+    pub ttl: Option<CacheTtl>,
+    pub warmed_at: Option<Instant>,
+    pub invalidated_by_model: bool,
+}
+
+impl CacheState {
+    pub fn record(&mut self, ttl: Option<CacheTtl>, now: Instant) {
+        if let Some(t) = ttl {
+            self.ttl = Some(t);
+        } else if self.ttl.is_none() {
+            self.ttl = Some(CacheTtl::FiveMinutes);
+        }
+        self.warmed_at = Some(now);
+        self.invalidated_by_model = false;
+    }
+
+    pub fn invalidate_model_switch(&mut self) {
+        if self.ttl.is_some() || self.warmed_at.is_some() {
+            self.warmed_at = None;
+            self.invalidated_by_model = true;
+        }
+    }
+
+    pub fn status(&self) -> Option<CacheStatus> {
+        self.status_at(Instant::now())
+    }
+
+    pub fn status_at(&self, now: Instant) -> Option<CacheStatus> {
+        let ttl = self.ttl?;
+        if self.invalidated_by_model {
+            return Some(CacheStatus::Expired {
+                ttl,
+                by_model_switch: true,
+            });
+        }
+        let warmed_at = self.warmed_at?;
+        let elapsed = now.saturating_duration_since(warmed_at);
+        let limit = ttl.duration();
+        match limit.checked_sub(elapsed) {
+            Some(remaining) if !remaining.is_zero() => Some(CacheStatus::Warm { ttl, remaining }),
+            _ => Some(CacheStatus::Expired {
+                ttl,
+                by_model_switch: false,
+            }),
+        }
+    }
+}
+
 /// Aggregated live context-window and token usage for one agent session.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionUsage {
@@ -54,6 +119,9 @@ pub struct SessionUsage {
     pub cost: Option<CostInfo>,
     /// Token breakdown from the latest `session/prompt` response (`usage`).
     pub tokens: Option<TokenUsage>,
+    /// Prompt-cache TTL / expiration state (live, process-local).
+    #[serde(skip)]
+    pub cache: CacheState,
 }
 
 impl SessionUsage {
@@ -71,6 +139,14 @@ impl SessionUsage {
         self.tokens = Some(tokens);
     }
 
+    pub fn record_cache(&mut self, ttl: Option<CacheTtl>) {
+        self.cache.record(ttl, Instant::now());
+    }
+
+    pub fn invalidate_cache_for_model_switch(&mut self) {
+        self.cache.invalidate_model_switch();
+    }
+
     /// Context occupancy percentage (`0.0..=100.0+`) when both `used` and a
     /// non-zero `size` have been reported.
     pub fn context_pct(&self) -> Option<f64> {
@@ -84,6 +160,7 @@ impl SessionUsage {
             || self.context_size.is_some()
             || self.cost.is_some()
             || self.tokens.is_some()
+            || self.cache.ttl.is_some()
     }
 }
 
@@ -331,6 +408,7 @@ impl Session {
             let name = self.models.display(&id);
             self.entries.push(Entry::Notice(format!("model: {name}")));
             self.models.current = Some(id);
+            self.usage.invalidate_cache_for_model_switch();
         }
     }
 
@@ -557,6 +635,7 @@ impl Session {
                         if prev.as_deref() != Some(id.as_str()) {
                             let name = self.models.display(&id);
                             self.entries.push(Entry::Notice(format!("model: {name}")));
+                            self.usage.invalidate_cache_for_model_switch();
                         }
                     }
                 }
@@ -581,6 +660,9 @@ impl Session {
             }
             Event::TurnUsage(t) => {
                 self.usage.apply_tokens(t);
+            }
+            Event::CacheActivity { ttl } => {
+                self.usage.record_cache(ttl);
             }
             Event::Other(_) => {}
         }
@@ -613,7 +695,19 @@ fn worker(
         let mut client = AcpClient::spawn(&program.to_string_lossy(), spec.args, &cwd)
             .map_err(|e| e.to_string())?;
         client.initialize().map_err(|e| e.to_string())?;
-        let sid = client.new_session(&cwd).map_err(|e| e.to_string())?;
+        let session_meta = (spec.id == "claude").then(|| {
+            serde_json::json!({
+                "claudeCode": {
+                    "emitRawSDKMessages": [
+                        { "type": "assistant" },
+                        { "type": "result" },
+                    ],
+                },
+            })
+        });
+        let sid = client
+            .new_session_with_meta(&cwd, session_meta)
+            .map_err(|e| e.to_string())?;
         // Re-apply a restored model first (changing models may update available
         // effort levels), then re-apply any restored effort level.
         if let Some(want) = preferred_model {
@@ -1122,5 +1216,72 @@ mod tests {
         };
         s.apply(UiMsg::Event(Event::TurnUsage(tok.clone())));
         assert_eq!(s.usage.tokens, Some(tok));
+    }
+
+    #[test]
+    fn cache_state_tracks_ttl_expiration_refresh_and_model_switch() {
+        let mut cache = CacheState::default();
+        assert_eq!(cache.status(), None);
+
+        let t0 = Instant::now();
+        // First turn writes a 1h cache.
+        cache.record(Some(CacheTtl::OneHour), t0);
+        assert_eq!(
+            cache.status_at(t0 + Duration::from_secs(600)),
+            Some(CacheStatus::Warm {
+                ttl: CacheTtl::OneHour,
+                remaining: Duration::from_secs(3000),
+            })
+        );
+
+        // Pure cache read refreshes the timer and preserves the 1h tier.
+        let t1 = t0 + Duration::from_secs(1200);
+        cache.record(None, t1);
+        assert_eq!(
+            cache.status_at(t1 + Duration::from_secs(600)),
+            Some(CacheStatus::Warm {
+                ttl: CacheTtl::OneHour,
+                remaining: Duration::from_secs(3000),
+            })
+        );
+
+        // Passing the 1h mark transitions to Expired.
+        assert_eq!(
+            cache.status_at(t1 + Duration::from_secs(3600)),
+            Some(CacheStatus::Expired {
+                ttl: CacheTtl::OneHour,
+                by_model_switch: false,
+            })
+        );
+
+        // Downgrading to 5m tier (e.g. overage credits) updates TTL.
+        let t2 = t1 + Duration::from_secs(4000);
+        cache.record(Some(CacheTtl::FiveMinutes), t2);
+        assert_eq!(
+            cache.status_at(t2 + Duration::from_secs(300)),
+            Some(CacheStatus::Expired {
+                ttl: CacheTtl::FiveMinutes,
+                by_model_switch: false,
+            })
+        );
+
+        // Switching models invalidates the prompt cache immediately.
+        let (mut s, _) = session();
+        s.models.current = Some("sonnet".into());
+        s.apply(UiMsg::Event(Event::CacheActivity {
+            ttl: Some(CacheTtl::OneHour),
+        }));
+        assert!(matches!(
+            s.usage.cache.status(),
+            Some(CacheStatus::Warm { .. })
+        ));
+        s.apply(UiMsg::Event(Event::ModelChanged("opus".into())));
+        assert_eq!(
+            s.usage.cache.status(),
+            Some(CacheStatus::Expired {
+                ttl: CacheTtl::OneHour,
+                by_model_switch: true,
+            })
+        );
     }
 }

@@ -12,6 +12,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -180,6 +181,29 @@ impl TokenUsage {
     }
 }
 
+/// Prompt-cache TTL tier reported by Claude's raw SDK usage payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CacheTtl {
+    FiveMinutes,
+    OneHour,
+}
+
+impl CacheTtl {
+    pub fn duration(self) -> Duration {
+        match self {
+            Self::FiveMinutes => Duration::from_secs(5 * 60),
+            Self::OneHour => Duration::from_secs(60 * 60),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FiveMinutes => "5m",
+            Self::OneHour => "1h",
+        }
+    }
+}
+
 /// Something the agent told us during a prompt turn.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -215,6 +239,12 @@ pub enum Event {
     UsageUpdated(UsageUpdate),
     /// Token breakdown reported on `session/prompt` completion (`usage`).
     TurnUsage(TokenUsage),
+    /// Main-conversation prompt cache read/write observed (via Claude's
+    /// `_claude/sdkMessage` extension). `ttl` is `Some` when the response
+    /// explicitly created a 5m or 1h cache entry, or `None` on a pure hit.
+    CacheActivity {
+        ttl: Option<CacheTtl>,
+    },
     /// An update type we don't model yet (kept so nothing is silently lost).
     Other(String),
 }
@@ -659,6 +689,11 @@ impl AcpClient {
                         self.handle_session_update(update, &mut on_event);
                     }
                 }
+                (Some("_claude/sdkMessage"), None) => {
+                    if let Some(ev) = parse_claude_sdk_cache(&msg["params"]) {
+                        on_event(ev);
+                    }
+                }
                 (Some(_), Some(rid)) => {
                     let reply = json!({
                         "jsonrpc": "2.0",
@@ -708,6 +743,11 @@ impl AcpClient {
                 (Some("session/update"), None) => {
                     if let Some(update) = msg.pointer("/params/update") {
                         self.handle_session_update(update, on_event);
+                    }
+                }
+                (Some("_claude/sdkMessage"), None) => {
+                    if let Some(ev) = parse_claude_sdk_cache(&msg["params"]) {
+                        on_event(ev);
                     }
                 }
                 // Agent->client request.
@@ -781,12 +821,21 @@ impl AcpClient {
     }
 
     pub fn new_session(&mut self, cwd: &Path) -> Result<String, AcpError> {
+        self.new_session_with_meta(cwd, None)
+    }
+
+    pub fn new_session_with_meta(
+        &mut self,
+        cwd: &Path,
+        meta: Option<Value>,
+    ) -> Result<String, AcpError> {
         self.commands.clear();
         self.usage = None;
-        let result = self.call_quiet(
-            "session/new",
-            json!({"cwd": cwd.to_string_lossy(), "mcpServers": []}),
-        )?;
+        let mut params = json!({"cwd": cwd.to_string_lossy(), "mcpServers": []});
+        if let Some(m) = meta {
+            params["_meta"] = m;
+        }
+        let result = self.call_quiet("session/new", params)?;
         self.models = ModelState::default();
         self.effort = EffortState::default();
         if let Some(opts) = result.get("configOptions") {
@@ -1112,6 +1161,55 @@ fn json_u64(v: &Value) -> Option<u64> {
             .filter(|f| f.is_finite() && *f >= 0.0 && *f <= u64::MAX as f64)
             .map(|f| f.round() as u64)
     })
+}
+
+/// Extract main-conversation prompt-cache activity and TTL tier (`5m` vs `1h`)
+/// from a `claude-agent-acp` `_claude/sdkMessage` extension notification.
+/// Subagent messages (those carrying a non-null `parent_tool_use_id`) are
+/// ignored so their separate 5m caches never skew the main session timer.
+fn parse_claude_sdk_cache(params: &Value) -> Option<Event> {
+    let msg = params.get("message")?;
+    if msg
+        .get("parent_tool_use_id")
+        .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
+    {
+        return None;
+    }
+    let usage = match msg.get("type").and_then(Value::as_str)? {
+        "assistant" => msg.pointer("/message/usage")?,
+        "result" => msg.get("usage")?,
+        _ => return None,
+    };
+    let eph_1h = usage
+        .pointer("/cache_creation/ephemeral_1h_input_tokens")
+        .and_then(json_u64)
+        .unwrap_or(0);
+    let eph_5m = usage
+        .pointer("/cache_creation/ephemeral_5m_input_tokens")
+        .and_then(json_u64)
+        .unwrap_or(0);
+    if eph_1h > 0 {
+        return Some(Event::CacheActivity {
+            ttl: Some(CacheTtl::OneHour),
+        });
+    }
+    if eph_5m > 0 {
+        return Some(Event::CacheActivity {
+            ttl: Some(CacheTtl::FiveMinutes),
+        });
+    }
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(json_u64)
+        .unwrap_or(0);
+    let cache_write = usage
+        .get("cache_creation_input_tokens")
+        .and_then(json_u64)
+        .unwrap_or(0);
+    if cache_read > 0 || cache_write > 0 {
+        return Some(Event::CacheActivity { ttl: None });
+    }
+    None
 }
 
 fn string_array(v: &Value) -> Option<Vec<&str>> {
@@ -2296,6 +2394,165 @@ for line in sys.stdin:
                     currency: "USD".into(),
                 }),
             })
+        );
+    }
+
+    #[test]
+    fn parse_claude_sdk_cache_detects_ttl_and_skips_subagents() {
+        // Explicit 1h tier on assistant message.
+        let ev_1h = parse_claude_sdk_cache(&json!({
+            "sessionId": "s1",
+            "message": {
+                "type": "assistant",
+                "parent_tool_use_id": null,
+                "message": {
+                    "usage": {
+                        "cache_creation_input_tokens": 12000,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": 0,
+                            "ephemeral_1h_input_tokens": 12000
+                        }
+                    }
+                }
+            }
+        }));
+        assert_eq!(
+            ev_1h,
+            Some(Event::CacheActivity {
+                ttl: Some(CacheTtl::OneHour)
+            })
+        );
+
+        // Explicit 5m tier on result message.
+        let ev_5m = parse_claude_sdk_cache(&json!({
+            "sessionId": "s1",
+            "message": {
+                "type": "result",
+                "usage": {
+                    "cache_creation_input_tokens": 8000,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 8000,
+                        "ephemeral_1h_input_tokens": 0
+                    }
+                }
+            }
+        }));
+        assert_eq!(
+            ev_5m,
+            Some(Event::CacheActivity {
+                ttl: Some(CacheTtl::FiveMinutes)
+            })
+        );
+
+        // Pure cache read refreshes timer without overriding TTL tier.
+        let ev_hit = parse_claude_sdk_cache(&json!({
+            "sessionId": "s1",
+            "message": {
+                "type": "assistant",
+                "message": {
+                    "usage": {
+                        "cache_read_input_tokens": 45000,
+                        "cache_creation_input_tokens": 0
+                    }
+                }
+            }
+        }));
+        assert_eq!(ev_hit, Some(Event::CacheActivity { ttl: None }));
+
+        // Subagent message with parent_tool_use_id is ignored.
+        let sub = parse_claude_sdk_cache(&json!({
+            "sessionId": "s1",
+            "message": {
+                "type": "assistant",
+                "parent_tool_use_id": "toolu_123",
+                "message": {
+                    "usage": {
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": 5000,
+                            "ephemeral_1h_input_tokens": 0
+                        }
+                    }
+                }
+            }
+        }));
+        assert_eq!(sub, None);
+
+        // Unrelated message type or zero cache tokens is ignored.
+        assert_eq!(
+            parse_claude_sdk_cache(&json!({
+                "sessionId": "s1",
+                "message": {
+                    "type": "assistant",
+                    "message": { "usage": { "input_tokens": 50, "output_tokens": 10 } }
+                }
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn new_session_with_meta_forwards_meta_and_receives_claude_sdk_cache_notifications() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"
+import json, sys
+saw_meta = False
+for line in sys.stdin:
+    msg = json.loads(line)
+    m, mid = msg.get("method"), msg.get("id")
+    if m == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{
+            "protocolVersion":1,
+            "agentInfo":{"name":"fake-claude"}
+        }}), flush=True)
+    elif m == "session/new":
+        meta = msg.get("params", {}).get("_meta", {})
+        saw_meta = bool(meta.get("claudeCode", {}).get("emitRawSDKMessages"))
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"sessionId":"s1"}}), flush=True)
+    elif m == "session/prompt":
+        if saw_meta:
+            print(json.dumps({"jsonrpc":"2.0","method":"_claude/sdkMessage","params":{
+                "sessionId":"s1",
+                "message":{
+                    "type":"assistant",
+                    "parent_tool_use_id":None,
+                    "message":{
+                        "usage":{
+                            "cache_creation_input_tokens":9000,
+                            "cache_creation":{
+                                "ephemeral_5m_input_tokens":0,
+                                "ephemeral_1h_input_tokens":9000
+                            }
+                        }
+                    }
+                }
+            }}), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"stopReason":"end_turn"}}), flush=True)
+"#;
+        let mut client = AcpClient::spawn("python3", &["-c", script], dir.path()).unwrap();
+        client.initialize().unwrap();
+        let sid = client
+            .new_session_with_meta(
+                dir.path(),
+                Some(json!({
+                    "claudeCode": {
+                        "emitRawSDKMessages": [
+                            { "type": "assistant" },
+                            { "type": "result" }
+                        ]
+                    }
+                })),
+            )
+            .unwrap();
+        let mut events = Vec::new();
+        let stop = client
+            .prompt(&sid, "hi", |ev| events.push(ev), |_| None)
+            .unwrap();
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(
+            events,
+            vec![Event::CacheActivity {
+                ttl: Some(CacheTtl::OneHour)
+            }]
         );
     }
 }
