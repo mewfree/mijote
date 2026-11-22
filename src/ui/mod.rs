@@ -400,6 +400,9 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     if let Some(e) = s.effort_name() {
         left.push(Span::styled(format!("  · effort: {e}"), DIM));
     }
+    if app.show_trace {
+        left.push(Span::styled("  · full trace", Style::new().fg(ACCENT)));
+    }
     f.render_widget(Paragraph::new(Line::from(left)), inner);
 
     let (label, color) = status_label(s);
@@ -614,22 +617,250 @@ fn render_tool_detail(detail: &[ToolContent], width: usize, out: &mut Vec<Line<'
     }
 }
 
+struct TranscriptOutput {
+    lines: Vec<Line<'static>>,
+    links: Vec<markdown::LinkSpan>,
+    toggles: Vec<(usize, usize)>,
+}
+
+fn is_trace_entry(e: &Entry) -> bool {
+    matches!(e, Entry::Thought(_) | Entry::Tool { .. })
+}
+
+fn is_meaningful_trace_entry(e: &Entry) -> bool {
+    match e {
+        Entry::Thought(t) => !t.trim().is_empty(),
+        Entry::Tool { .. } => true,
+        _ => false,
+    }
+}
+
+struct TraceStats<'a> {
+    thought_entries: usize,
+    thought_lines: usize,
+    tool_count: usize,
+    failed_tools: usize,
+    active_tools: usize,
+    any_tool_detail: bool,
+    single_tool: Option<(&'a str, &'a str, &'a str, &'a [ToolContent])>,
+    kinds: Vec<(&'a str, usize)>,
+}
+
+impl TraceStats<'_> {
+    fn is_empty(&self) -> bool {
+        self.thought_entries == 0 && self.tool_count == 0
+    }
+
+    fn is_collapsible(&self) -> bool {
+        self.thought_entries > 0
+            || self.tool_count > 1
+            || (self.tool_count == 1 && self.any_tool_detail)
+    }
+}
+
+fn collect_trace_stats(entries: &[Entry]) -> TraceStats<'_> {
+    let mut stats = TraceStats {
+        thought_entries: 0,
+        thought_lines: 0,
+        tool_count: 0,
+        failed_tools: 0,
+        active_tools: 0,
+        any_tool_detail: false,
+        single_tool: None,
+        kinds: Vec::new(),
+    };
+    for e in entries {
+        match e {
+            Entry::Thought(t) => {
+                let trimmed = t.trim();
+                if !trimmed.is_empty() {
+                    stats.thought_entries += 1;
+                    stats.thought_lines += trimmed.lines().count().max(1);
+                }
+            }
+            Entry::Tool {
+                title,
+                kind,
+                status,
+                detail,
+                ..
+            } => {
+                stats.tool_count += 1;
+                if status == "failed" {
+                    stats.failed_tools += 1;
+                } else if status != "completed" {
+                    stats.active_tools += 1;
+                }
+                if !detail.is_empty() {
+                    stats.any_tool_detail = true;
+                }
+                if stats.tool_count == 1 {
+                    stats.single_tool = Some((title, kind, status, detail));
+                } else {
+                    stats.single_tool = None;
+                }
+                if !kind.is_empty() {
+                    if let Some((_, count)) = stats.kinds.iter_mut().find(|(k, _)| *k == kind) {
+                        *count += 1;
+                    } else {
+                        stats.kinds.push((kind, 1));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    stats
+}
+
+fn render_tool_row(
+    s: &Session,
+    title: &str,
+    kind: &str,
+    status: &str,
+    arrow: Option<&'static str>,
+    width: usize,
+) -> Line<'static> {
+    let (g, c) = tool_glyph(s, status);
+    let kind_txt = if kind.is_empty() {
+        String::new()
+    } else {
+        format!("  {kind}")
+    };
+    let lead_w = if arrow.is_some() { 6 } else { 4 };
+    let room = width
+        .saturating_sub(lead_w + kind_txt.chars().count())
+        .max(1);
+    let mut spans = Vec::with_capacity(4);
+    if let Some(a) = arrow {
+        spans.push(Span::styled(format!("  {a} "), DIM));
+    } else {
+        spans.push(Span::raw("  "));
+    }
+    spans.push(Span::styled(format!("{g} "), Style::new().fg(c)));
+    spans.push(Span::raw(fit(title, room)));
+    if !kind_txt.is_empty() {
+        spans.push(Span::styled(kind_txt, DIM));
+    }
+    Line::from(spans)
+}
+
+fn render_trace_summary(
+    s: &Session,
+    stats: &TraceStats<'_>,
+    width: usize,
+    expanded: bool,
+) -> Line<'static> {
+    let arrow = if expanded { "▾" } else { "▸" };
+    if stats.thought_entries == 0 {
+        if let Some((title, kind, status, _)) = stats.single_tool {
+            return render_tool_row(s, title, kind, status, Some(arrow), width);
+        }
+    }
+
+    let (g, c) = if stats.failed_tools > 0 {
+        ("✗", ERR)
+    } else if stats.active_tools > 0 {
+        if s.status == Status::Running {
+            (spinner(s), WARN)
+        } else {
+            ("○", WARN)
+        }
+    } else if stats.tool_count > 0 {
+        ("✓", OK)
+    } else {
+        ("┊", Color::DarkGray)
+    };
+
+    if stats.tool_count == 0 {
+        let label = if stats.thought_lines == 1 {
+            "thought (1 line)".to_string()
+        } else {
+            format!("thought ({} lines)", stats.thought_lines)
+        };
+        let room = width.saturating_sub(6).max(1);
+        return Line::from(vec![
+            Span::styled(format!("  {arrow} "), DIM),
+            Span::styled(format!("{g} "), Style::new().fg(c)),
+            Span::styled(fit(&label, room), DIM.add_modifier(Modifier::ITALIC)),
+        ]);
+    }
+
+    if let Some((title, kind, _, _)) = stats.single_tool {
+        let thought_prefix = "thought · ";
+        let kind_txt = if kind.is_empty() {
+            String::new()
+        } else {
+            format!("  {kind}")
+        };
+        let room = width
+            .saturating_sub(6 + thought_prefix.chars().count() + kind_txt.chars().count())
+            .max(1);
+        let mut spans = vec![
+            Span::styled(format!("  {arrow} "), DIM),
+            Span::styled(format!("{g} "), Style::new().fg(c)),
+            Span::styled(thought_prefix, DIM),
+            Span::raw(fit(title, room)),
+        ];
+        if !kind_txt.is_empty() {
+            spans.push(Span::styled(kind_txt, DIM));
+        }
+        return Line::from(spans);
+    }
+
+    let kind_part = match stats.kinds.as_slice() {
+        [] => String::new(),
+        [(k, _)] => format!(" ({k})"),
+        many => {
+            let list = many
+                .iter()
+                .map(|(k, n)| format!("{n} {k}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(" ({list})")
+        }
+    };
+    let prefix = if stats.thought_entries > 0 {
+        "thought · "
+    } else {
+        ""
+    };
+    let body = format!("{prefix}{} tools{kind_part}", stats.tool_count);
+    let fail_suffix = if stats.failed_tools > 0 {
+        format!(" · {} failed", stats.failed_tools)
+    } else {
+        String::new()
+    };
+    let room = width.saturating_sub(6 + fail_suffix.chars().count()).max(1);
+    let mut spans = vec![
+        Span::styled(format!("  {arrow} "), DIM),
+        Span::styled(format!("{g} "), Style::new().fg(c)),
+        Span::styled(fit(&body, room), DIM),
+    ];
+    if !fail_suffix.is_empty() {
+        spans.push(Span::styled(fail_suffix, Style::new().fg(ERR)));
+    }
+    Line::from(spans)
+}
+
 #[cfg(test)]
-fn transcript_lines(s: &Session, width: usize, show_tool_details: bool) -> Vec<Line<'static>> {
-    transcript_lines_with_links(s, width, show_tool_details, None).0
+fn transcript_lines(s: &Session, width: usize, show_trace: bool) -> Vec<Line<'static>> {
+    transcript_lines_with_links(s, width, |_| show_trace, None).lines
 }
 
 /// Transcript body for one session, already wrapped to `width` columns, so
-/// scrolling is exact and every wrapped line keeps its gutter. Also returns
-/// link column ranges in transcript coordinates for OSC 8 hyperlink rendering.
+/// scrolling is exact and every wrapped line keeps its gutter. Contiguous
+/// chain-of-thought and tool-call entries are grouped into collapsible trace
+/// blocks controlled by `is_expanded(block_start_entry_idx)`.
 fn transcript_lines_with_links(
     s: &Session,
     width: usize,
-    show_tool_details: bool,
+    is_expanded: impl Fn(usize) -> bool,
     cwd: Option<&Path>,
-) -> (Vec<Line<'static>>, Vec<markdown::LinkSpan>) {
+) -> TranscriptOutput {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<markdown::LinkSpan> = Vec::new();
+    let mut toggles: Vec<(usize, usize)> = Vec::new();
     let body = width.saturating_sub(4).max(1);
     let prose = |t: &str, gutter: &'static str, gutter_style: Style, style: Style| {
         wrap(t, body)
@@ -643,9 +874,14 @@ fn transcript_lines_with_links(
             .collect::<Vec<_>>()
     };
 
-    for (i, e) in s.entries.iter().enumerate() {
-        match e {
-            Entry::User(t) => out.extend(prose(t, "  ▎ ", Style::new().fg(ACCENT), BOLD)),
+    let mut i = 0;
+    while i < s.entries.len() {
+        match &s.entries[i] {
+            Entry::User(t) => {
+                out.extend(prose(t, "  ▎ ", Style::new().fg(ACCENT), BOLD));
+                out.push(Line::from(""));
+                i += 1;
+            }
             Entry::Agent(t) => {
                 let base_line = out.len();
                 let rendered = markdown::render_with_links(t, body, cwd);
@@ -660,48 +896,177 @@ fn transcript_lines_with_links(
                     ls.end_col = ls.end_col.saturating_add(4);
                     links.push(ls);
                 }
-            }
-            Entry::Thought(t) => {
-                out.extend(prose(t, "  ┊ ", DIM, DIM.add_modifier(Modifier::ITALIC)))
-            }
-            Entry::Tool {
-                title,
-                kind,
-                status,
-                detail,
-                ..
-            } => {
-                let (g, c) = tool_glyph(s, status);
-                let toggle = if detail.is_empty() {
-                    ""
-                } else if show_tool_details {
-                    " ▾"
-                } else {
-                    " ▸"
-                };
-                let kind_txt = format!("  {kind}{toggle}");
-                let room = width.saturating_sub(4 + kind_txt.chars().count());
-                out.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(format!("{g} "), Style::new().fg(c)),
-                    Span::raw(fit(title, room)),
-                    Span::styled(kind_txt, DIM),
-                ]));
-                if show_tool_details && !detail.is_empty() {
-                    render_tool_detail(detail, width, &mut out);
-                }
+                out.push(Line::from(""));
+                i += 1;
             }
             Entry::Notice(t) => {
-                out.extend(prose(t, "  ▎ ", Style::new().fg(ERR), Style::new().fg(ERR)))
+                out.extend(prose(t, "  ▎ ", Style::new().fg(ERR), Style::new().fg(ERR)));
+                out.push(Line::from(""));
+                i += 1;
+            }
+            e if is_trace_entry(e) => {
+                let start = i;
+                while i < s.entries.len() && is_trace_entry(&s.entries[i]) {
+                    i += 1;
+                }
+                let slice = &s.entries[start..i];
+                let stats = collect_trace_stats(slice);
+                if stats.is_empty() {
+                    continue;
+                }
+
+                let is_live_tail = i == s.entries.len()
+                    && matches!(
+                        s.status,
+                        Status::Running | Status::AwaitingPermission | Status::AwaitingQuestion
+                    );
+
+                if !stats.is_collapsible() {
+                    if let Some((title, kind, status, _)) = stats.single_tool {
+                        out.push(render_tool_row(s, title, kind, status, None, width));
+                    }
+                    out.push(Line::from(""));
+                    continue;
+                }
+
+                if is_expanded(start) {
+                    if stats.thought_entries == 0 {
+                        if let Some((title, kind, status, detail)) = stats.single_tool {
+                            toggles.push((out.len(), start));
+                            out.push(render_tool_row(s, title, kind, status, Some("▾"), width));
+                            if !detail.is_empty() {
+                                render_tool_detail(detail, width, &mut out);
+                            }
+                            out.push(Line::from(""));
+                            continue;
+                        }
+                    }
+
+                    toggles.push((out.len(), start));
+                    out.push(render_trace_summary(s, &stats, width, true));
+                    let meaningful: Vec<&Entry> = slice
+                        .iter()
+                        .filter(|entry| is_meaningful_trace_entry(entry))
+                        .collect();
+                    for (j, entry) in meaningful.iter().enumerate() {
+                        match entry {
+                            Entry::Thought(t) => {
+                                out.extend(prose(
+                                    t,
+                                    "  ┊ ",
+                                    DIM,
+                                    DIM.add_modifier(Modifier::ITALIC),
+                                ));
+                            }
+                            Entry::Tool {
+                                title,
+                                kind,
+                                status,
+                                detail,
+                                ..
+                            } => {
+                                out.push(render_tool_row(s, title, kind, status, None, width));
+                                if !detail.is_empty() {
+                                    render_tool_detail(detail, width, &mut out);
+                                }
+                            }
+                            _ => {}
+                        }
+                        if let Some(next) = meaningful.get(j + 1) {
+                            let both_tools = matches!(entry, Entry::Tool { .. })
+                                && matches!(next, Entry::Tool { .. });
+                            if !both_tools {
+                                out.push(Line::from(""));
+                            }
+                        }
+                    }
+                    out.push(Line::from(""));
+                    continue;
+                }
+
+                // Collapsed view: show a live pulse when actively working at the tail.
+                if is_live_tail {
+                    if let Some(last_rel) = slice.iter().rposition(is_meaningful_trace_entry) {
+                        match &slice[last_rel] {
+                            Entry::Tool {
+                                title,
+                                kind,
+                                status,
+                                ..
+                            } if status != "completed" && status != "failed" => {
+                                let earlier = collect_trace_stats(&slice[..last_rel]);
+                                if !earlier.is_empty() {
+                                    toggles.push((out.len(), start));
+                                    out.push(render_trace_summary(s, &earlier, width, false));
+                                    out.push(render_tool_row(s, title, kind, status, None, width));
+                                } else {
+                                    toggles.push((out.len(), start));
+                                    out.push(render_tool_row(
+                                        s,
+                                        title,
+                                        kind,
+                                        status,
+                                        Some("▸"),
+                                        width,
+                                    ));
+                                }
+                                out.push(Line::from(""));
+                                continue;
+                            }
+                            Entry::Thought(t) if s.status == Status::Running => {
+                                let latest = t
+                                    .lines()
+                                    .rev()
+                                    .map(str::trim)
+                                    .find(|l| !l.is_empty())
+                                    .unwrap_or("");
+                                let earlier = collect_trace_stats(&slice[..last_rel]);
+                                if !earlier.is_empty() {
+                                    toggles.push((out.len(), start));
+                                    out.push(render_trace_summary(s, &earlier, width, false));
+                                    out.push(Line::from(vec![
+                                        Span::styled("  ┊ ", DIM),
+                                        Span::styled(
+                                            fit(latest, body),
+                                            DIM.add_modifier(Modifier::ITALIC),
+                                        ),
+                                    ]));
+                                } else {
+                                    toggles.push((out.len(), start));
+                                    let prefix = "thinking · ";
+                                    let room =
+                                        width.saturating_sub(6 + prefix.chars().count()).max(1);
+                                    out.push(Line::from(vec![
+                                        Span::styled("  ▸ ", DIM),
+                                        Span::styled("┊ ", DIM),
+                                        Span::styled(
+                                            format!("{prefix}{}", fit(latest, room)),
+                                            DIM.add_modifier(Modifier::ITALIC),
+                                        ),
+                                    ]));
+                                }
+                                out.push(Line::from(""));
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                toggles.push((out.len(), start));
+                out.push(render_trace_summary(s, &stats, width, false));
+                out.push(Line::from(""));
+            }
+            _ => {
+                i += 1;
             }
         }
-        // Breathing room between entries, except inside a run of tool calls.
-        let next_is_tool = matches!(s.entries.get(i + 1), Some(Entry::Tool { .. }));
-        if !(matches!(e, Entry::Tool { .. }) && next_is_tool) {
-            out.push(Line::from(""));
-        }
     }
-    (out, links)
+    TranscriptOutput {
+        lines: out,
+        links,
+        toggles,
+    }
 }
 
 /// Trailing "the agent is busy" line, so a long silent turn never looks hung.
@@ -824,6 +1189,7 @@ fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
         app.max_scroll.set(0);
         app.transcript_text.borrow_mut().clear();
         app.visible_links.borrow_mut().clear();
+        app.trace_toggles.borrow_mut().clear();
         render_welcome(f, inner);
         return;
     };
@@ -831,6 +1197,7 @@ fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
         app.max_scroll.set(0);
         app.transcript_text.borrow_mut().clear();
         app.visible_links.borrow_mut().clear();
+        app.trace_toggles.borrow_mut().clear();
         let msg = match s.status {
             Status::Starting => "starting agent (first run may install the adapter)…",
             Status::Failed => "agent failed to start",
@@ -848,8 +1215,17 @@ fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
         .as_ref()
         .map(|w| w.path.as_path())
         .unwrap_or_else(|| app.cwd());
-    let (mut lines, link_spans) =
-        transcript_lines_with_links(s, inner.width as usize, app.show_tool_details, Some(cwd));
+    let TranscriptOutput {
+        mut lines,
+        links: link_spans,
+        toggles,
+    } = transcript_lines_with_links(
+        s,
+        inner.width as usize,
+        |block_start| app.is_trace_expanded(s.id, block_start),
+        Some(cwd),
+    );
+    *app.trace_toggles.borrow_mut() = toggles;
     lines.extend(activity_line(s));
     let total = lines.len().min(u16::MAX as usize) as u16;
     let max_scroll = total.saturating_sub(inner.height);
@@ -1111,22 +1487,23 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 Status::Running | Status::AwaitingPermission | Status::AwaitingQuestion
             )
         });
-        let hints: &[(&'static str, &'static str)] = match app.mode {
-            _ if has_pending_perm => &[
+        let trace_label = if app.show_trace { "compact" } else { "details" };
+        let hints: Vec<(&'static str, &'static str)> = match app.mode {
+            _ if has_pending_perm => vec![
                 ("a", "allow"),
                 ("r", "reject"),
                 ("1-9", "choose"),
                 ("Esc", "cancel"),
             ],
-            _ if has_pending_question => &[
+            _ if has_pending_question => vec![
                 ("↑/↓", "option"),
                 ("Space", "toggle"),
                 ("Tab", "field"),
                 ("Enter", "next/submit"),
                 ("Esc", "cancel"),
             ],
-            _ if app.confirm.is_some() => &[("y", "confirm"), ("any other key", "cancel")],
-            _ if app.leader => &[
+            _ if app.confirm.is_some() => vec![("y", "confirm"), ("any other key", "cancel")],
+            _ if app.leader => vec![
                 ("n", "new"),
                 ("N", "new here"),
                 ("d", "close"),
@@ -1134,7 +1511,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("M", "model"),
                 ("e", "effort"),
                 ("s", "sessions"),
-                ("t", "tools"),
+                ("t", trace_label),
                 ("j/k", "select"),
                 ("g/G", "top/bottom"),
                 ("/", "search"),
@@ -1143,74 +1520,79 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("q", "quit"),
                 ("Esc", "cancel"),
             ],
-            Mode::Normal if app.sessions.is_empty() => &[
+            Mode::Normal if app.sessions.is_empty() => vec![
                 ("n", "new"),
                 ("N/Enter", "new here"),
                 ("m", "mouse"),
                 ("?", "help"),
                 ("q", "quit"),
             ],
-            Mode::Normal if app.scroll > 0 => &[
+            Mode::Normal if app.scroll > 0 => vec![
                 ("␣G", "follow"),
+                ("^O", trace_label),
                 ("^U/^D", "half-page"),
                 ("/", "search"),
                 ("i", "insert"),
                 ("␣", "commands"),
                 ("?", "help"),
             ],
-            Mode::Normal if busy => &[
+            Mode::Normal if busy => vec![
                 ("^C", "cancel turn"),
+                ("^O", trace_label),
                 ("␣", "commands"),
                 ("^U/^D", "half-page"),
                 ("/", "search"),
                 ("i", "insert"),
                 ("?", "help"),
             ],
-            Mode::Normal => &[
+            Mode::Normal => vec![
                 ("i", "insert"),
                 ("␣", "commands"),
+                ("^O", trace_label),
                 ("^U/^D", "half-page"),
                 ("/", "search"),
                 ("?", "help"),
                 ("^C", "quit"),
             ],
-            Mode::Insert if app.slash.is_some() => &[
+            Mode::Insert if app.slash.is_some() => vec![
                 ("Tab", "complete"),
                 ("Enter", "run"),
                 ("↑/↓", "select"),
                 ("Esc", "close"),
             ],
-            Mode::Insert if app.mention.is_some() => &[
+            Mode::Insert if app.mention.is_some() => vec![
                 ("Tab/Enter", "insert file"),
                 ("↑/↓", "select"),
                 ("Esc", "close"),
             ],
-            Mode::Insert if busy => &[
+            Mode::Insert if busy => vec![
                 ("Enter", "send when idle"),
                 ("^C", "cancel turn"),
+                ("^O", trace_label),
                 ("^A", "commands"),
                 ("Esc", "normal"),
             ],
-            Mode::Insert => &[
+            Mode::Insert => vec![
                 ("Enter", "send"),
                 ("S-Enter", "newline"),
                 ("/", "slash"),
                 ("@", "files"),
+                ("^O", trace_label),
                 ("^A", "commands"),
                 ("Esc", "normal"),
             ],
             Mode::Picker | Mode::Model | Mode::Effort => {
-                &[("j/k", "move"), ("Enter/1-9", "choose"), ("Esc", "close")]
+                vec![("j/k", "move"), ("Enter/1-9", "choose"), ("Esc", "close")]
             }
-            Mode::Switcher => &[
+            Mode::Switcher => vec![
                 ("j/k", "move"),
                 ("Enter/1-9", "switch"),
                 ("r", "rename"),
                 ("Esc", "close"),
             ],
-            Mode::Help => &[("Esc/q/?", "close")],
-            Mode::Rename => &[("Enter", "save"), ("^U", "clear"), ("Esc", "cancel")],
-            Mode::Search => &[],
+            Mode::Help => vec![("Esc/q/?", "close")],
+            Mode::Rename => vec![("Enter", "save"), ("^U", "clear"), ("Esc", "cancel")],
+            Mode::Search => vec![],
         };
         for (i, (k, what)) in hints.iter().enumerate() {
             if i > 0 {
@@ -1607,11 +1989,12 @@ fn render_help(f: &mut Frame) {
         pair("s / Tab", "switcher", "j / k", "next / prev"),
         pair("d", "close session", "r", "rename session"),
         pair("M", "model (/model)", "e", "effort (/effort)"),
-        pair("t", "tool details", "m", "toggle mouse"),
+        pair("t", "thoughts & tools", "m", "toggle mouse"),
         pair("g / G", "top / bottom", "/", "search"),
         pair("?", "help", "q", "quit"),
         Line::from(""),
         heading("session & scroll"),
+        row("C-o / click", "toggle thoughts & tool details"),
         row("PgUp/Dn C-u/d", "scroll transcript (half-page in normal)"),
         row("/  n / N", "search transcript, next / prev match"),
         row("drag", "select and copy transcript text"),
@@ -2716,14 +3099,15 @@ mod tests {
 
         let expanded = transcript_lines(&s, 80, true);
         let exp_text = to_text(&expanded);
-        assert!(exp_text[0].contains("Read Cargo.toml") && !exp_text[0].contains('▾'));
-        assert!(exp_text.iter().any(|l| l.contains("edit ▾")));
+        assert!(exp_text[0].contains("▾ ✓ 3 tools (1 read, 1 edit, 1 execute)"));
+        assert!(exp_text.iter().any(|l| l.contains("Read Cargo.toml")));
+        assert!(exp_text.iter().any(|l| l.contains("Edit src/main.rs")));
         assert!(exp_text.iter().any(|l| l == "    ┄ src/main.rs"));
         assert!(exp_text.iter().any(|l| l == "      fn main() {"));
         assert!(exp_text.iter().any(|l| l == "    -     old();"));
         assert!(exp_text.iter().any(|l| l == "    +     new();"));
         assert!(exp_text.iter().any(|l| l == "      }"));
-        assert!(exp_text.iter().any(|l| l.contains("execute ▾")));
+        assert!(exp_text.iter().any(|l| l.contains("Run tests")));
         assert!(exp_text.iter().any(|l| l == "    │ test ok"));
         assert!(exp_text.iter().any(|l| l == "    │ passed"));
 
@@ -2741,11 +3125,199 @@ mod tests {
 
         let collapsed = transcript_lines(&s, 80, false);
         let col_text = to_text(&collapsed);
-        assert!(col_text.iter().any(|l| l.contains("edit ▸")));
-        assert!(col_text.iter().any(|l| l.contains("execute ▸")));
+        assert!(col_text
+            .iter()
+            .any(|l| l.contains("▸ ✓ 3 tools (1 read, 1 edit, 1 execute)")));
         assert!(!col_text.iter().any(|l| l.contains("┄ src/main.rs")));
         assert!(!col_text.iter().any(|l| l.contains("    - ")));
         assert!(!col_text.iter().any(|l| l.contains("    │ ")));
+    }
+
+    #[test]
+    fn trace_blocks_collapse_thoughts_tools_and_live_tail_smartly() {
+        let to_text = |lines: &[Line<'static>]| -> Vec<String> {
+            lines
+                .iter()
+                .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+                .collect()
+        };
+
+        // 1. Completed mixed trace (thoughts + tools + one failure) folds to 1 line.
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.status = Status::Idle;
+        s.entries.push(Entry::User("fix tests".into()));
+        s.entries.push(Entry::Thought(
+            "First line of reasoning\nSecond line".into(),
+        ));
+        s.entries.push(Entry::Tool {
+            id: "t1".into(),
+            title: "Read src/lib.rs".into(),
+            kind: "read".into(),
+            status: "completed".into(),
+            detail: vec![ToolContent::Text("fn foo() {}".into())],
+        });
+        s.entries.push(Entry::Tool {
+            id: "t2".into(),
+            title: "Run cargo test".into(),
+            kind: "execute".into(),
+            status: "failed".into(),
+            detail: vec![ToolContent::Text("FAILED".into())],
+        });
+        s.entries.push(Entry::Agent("Found the issue.".into()));
+
+        let compact = to_text(&transcript_lines(&s, 90, false));
+        assert!(
+            compact
+                .iter()
+                .any(|l| l.contains("▸ ✗ thought · 2 tools (1 read, 1 execute) · 1 failed")),
+            "{compact:?}"
+        );
+        assert!(!compact
+            .iter()
+            .any(|l| l.contains("First line of reasoning")));
+        assert!(!compact.iter().any(|l| l.contains("FAILED")));
+        assert!(compact.iter().any(|l| l.contains("Found the issue.")));
+
+        let full = to_text(&transcript_lines(&s, 90, true));
+        assert!(
+            full.iter()
+                .any(|l| l.contains("▾ ✗ thought · 2 tools (1 read, 1 execute) · 1 failed")),
+            "{full:?}"
+        );
+        assert!(full.iter().any(|l| l.contains("┊ First line of reasoning")));
+        assert!(full.iter().any(|l| l.contains("│ FAILED")));
+
+        // 2. Thoughts-only block collapses to line count.
+        let (mut s2, _) = Session::detached(1, find("claude").unwrap());
+        s2.status = Status::Idle;
+        s2.entries
+            .push(Entry::Thought("Line A\nLine B\nLine C".into()));
+        s2.entries.push(Entry::Agent("Answer.".into()));
+        let compact2 = to_text(&transcript_lines(&s2, 80, false));
+        assert!(
+            compact2.iter().any(|l| l.contains("▸ ┊ thought (3 lines)")),
+            "{compact2:?}"
+        );
+        assert!(!compact2.iter().any(|l| l.contains("Line A")));
+
+        // 3. Single tool with no detail renders without a misleading toggle arrow;
+        //    single tool with detail toggles directly on its row.
+        let (mut s3, _) = Session::detached(2, find("claude").unwrap());
+        s3.status = Status::Idle;
+        s3.entries.push(Entry::Tool {
+            id: "a".into(),
+            title: "Read Cargo.toml".into(),
+            kind: "read".into(),
+            status: "completed".into(),
+            detail: vec![],
+        });
+        s3.entries.push(Entry::Agent("mid".into()));
+        s3.entries.push(Entry::Tool {
+            id: "b".into(),
+            title: "Edit src/lib.rs".into(),
+            kind: "edit".into(),
+            status: "completed".into(),
+            detail: vec![ToolContent::Text("diff here".into())],
+        });
+        let compact3 = to_text(&transcript_lines(&s3, 80, false));
+        assert!(
+            compact3
+                .iter()
+                .any(|l| l.contains("✓ Read Cargo.toml") && !l.contains('▸')),
+            "{compact3:?}"
+        );
+        assert!(
+            compact3.iter().any(|l| l.contains("▸ ✓ Edit src/lib.rs")),
+            "{compact3:?}"
+        );
+        assert!(!compact3.iter().any(|l| l.contains("diff here")));
+
+        let full3 = to_text(&transcript_lines(&s3, 80, true));
+        assert!(
+            full3.iter().any(|l| l.contains("▾ ✓ Edit src/lib.rs")),
+            "{full3:?}"
+        );
+        assert!(full3.iter().any(|l| l.contains("│ diff here")));
+
+        // 4. Live tail while running shows a 1-line pulse for streaming thoughts and active tools.
+        let (mut s4, _) = Session::detached(3, find("claude").unwrap());
+        s4.status = Status::Running;
+        s4.entries.push(Entry::Thought(
+            "Earlier reasoning\nChecking parser.rs now".into(),
+        ));
+        let live_thought = to_text(&transcript_lines(&s4, 80, false));
+        assert!(
+            live_thought
+                .iter()
+                .any(|l| l.contains("▸ ┊ thinking · Checking parser.rs now")),
+            "{live_thought:?}"
+        );
+        assert!(!live_thought.iter().any(|l| l.contains("Earlier reasoning")));
+
+        s4.entries.push(Entry::Tool {
+            id: "run1".into(),
+            title: "Run cargo test".into(),
+            kind: "execute".into(),
+            status: "in_progress".into(),
+            detail: vec![],
+        });
+        let live_tool = to_text(&transcript_lines(&s4, 80, false));
+        assert!(
+            live_tool
+                .iter()
+                .any(|l| l.contains("▸ ┊ thought (2 lines)")),
+            "{live_tool:?}"
+        );
+        assert!(
+            live_tool.iter().any(|l| l.contains("Run cargo test")),
+            "{live_tool:?}"
+        );
+    }
+
+    #[test]
+    fn render_shows_full_trace_indicator_and_per_block_toggle() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.status = Status::Idle;
+        s.entries.push(Entry::User("hi".into()));
+        s.entries.push(Entry::Thought("hidden reasoning".into()));
+        s.entries.push(Entry::Agent("first reply".into()));
+        s.entries.push(Entry::Thought("second reasoning".into()));
+        s.entries.push(Entry::Agent("second reply".into()));
+        app.sessions.push(s);
+
+        let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
+
+        // Compact by default: both thoughts collapsed, status shows ^O details.
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+        assert!(!screen.contains("full trace"), "{screen}");
+        assert!(screen.contains("^O details"), "{screen}");
+        assert!(!screen.contains("hidden reasoning"), "{screen}");
+        assert!(!screen.contains("second reasoning"), "{screen}");
+        assert_eq!(app.trace_toggles.borrow().len(), 2);
+
+        // Expanding only the first block leaves the second collapsed.
+        let first_block = app.trace_toggles.borrow()[0].1;
+        app.trace_overrides.insert((0, first_block));
+        term.draw(|f| render(f, &app)).unwrap();
+        let partial = dump(&term);
+        assert!(partial.contains("hidden reasoning"), "{partial}");
+        assert!(!partial.contains("second reasoning"), "{partial}");
+
+        // Global toggle expands everything and shows header badge + ^O compact.
+        app.toggle_trace();
+        term.draw(|f| render(f, &app)).unwrap();
+        let expanded = dump(&term);
+        assert!(expanded.contains("· full trace"), "{expanded}");
+        assert!(expanded.contains("hidden reasoning"), "{expanded}");
+        assert!(expanded.contains("second reasoning"), "{expanded}");
     }
 
     #[test]

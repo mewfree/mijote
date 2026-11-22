@@ -1,6 +1,7 @@
 //! TUI application state and key handling. No rendering here.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
@@ -366,6 +367,9 @@ pub struct App {
     pub transcript_text: RefCell<Vec<String>>,
     /// Clickable markdown links currently visible on screen (for OSC 8).
     pub visible_links: RefCell<Vec<ui::ScreenLink>>,
+    /// Rendered transcript line index -> trace block start entry index, for
+    /// clicking `▸`/`▾` summary rows to expand or collapse individual blocks.
+    pub trace_toggles: RefCell<Vec<(usize, usize)>>,
     /// Cursor position requested during the last render, if visible.
     pub cursor_pos: Cell<Option<(u16, u16)>>,
     /// Text to put on the clipboard; the event loop owns the terminal I/O.
@@ -376,8 +380,12 @@ pub struct App {
     /// Whether the terminal reports mouse events (`m` toggles; off lets the
     /// terminal select text natively).
     pub mouse: bool,
-    /// Whether tool call diffs and text output are expanded in the transcript (`leader + t`).
-    pub show_tool_details: bool,
+    /// Whether chain-of-thought and tool-call details are expanded globally
+    /// (`Ctrl-o` or `leader + t`). Defaults to `false` (compact summary lines).
+    pub show_trace: bool,
+    /// Per-block overrides `(session_id, block_start_entry_idx)` inverting
+    /// `show_trace`, toggled by clicking a block's `▸`/`▾` line.
+    pub trace_overrides: HashSet<(usize, usize)>,
     /// Action awaiting y/n; owns the keyboard while set.
     pub confirm: Option<Confirm>,
     /// In-progress form state for the active session's pending question modal.
@@ -423,12 +431,14 @@ impl App {
             selection: None,
             transcript_text: RefCell::new(Vec::new()),
             visible_links: RefCell::new(Vec::new()),
+            trace_toggles: RefCell::new(Vec::new()),
             cursor_pos: Cell::new(None),
             pending_copy: None,
             pending_bell: false,
             should_quit: false,
             mouse: true,
-            show_tool_details: true,
+            show_trace: false,
+            trace_overrides: HashSet::new(),
             confirm: None,
             question_draft: None,
             notice: None,
@@ -442,6 +452,35 @@ impl App {
 
     pub fn cwd(&self) -> &std::path::Path {
         &self.cwd
+    }
+
+    /// Whether the trace block starting at `block_start` in `session_id` is
+    /// currently expanded.
+    pub fn is_trace_expanded(&self, session_id: usize, block_start: usize) -> bool {
+        self.show_trace ^ self.trace_overrides.contains(&(session_id, block_start))
+    }
+
+    /// Flip global expansion of chain-of-thought and tool-call details, clearing
+    /// any per-block overrides so all blocks match the new global state.
+    pub fn toggle_trace(&mut self) {
+        self.show_trace = !self.show_trace;
+        self.trace_overrides.clear();
+        self.set_message(if self.show_trace {
+            "showing full thoughts & tool details"
+        } else {
+            "compact view: thoughts & tools collapsed"
+        });
+    }
+
+    /// Toggle expansion of one specific trace block in the current session.
+    fn toggle_trace_block(&mut self, block_start: usize) {
+        let Some(sid) = self.current().map(|s| s.id) else {
+            return;
+        };
+        let key = (sid, block_start);
+        if !self.trace_overrides.remove(&key) {
+            self.trace_overrides.insert(key);
+        }
     }
 
     /// Show a transient notice in the status bar for `NOTICE_TTL`.
@@ -685,6 +724,14 @@ impl App {
             self.leader = true;
             return;
         }
+        if matches!(self.mode, Mode::Normal | Mode::Insert)
+            && !self.sessions.is_empty()
+            && ctrl
+            && key.code == KeyCode::Char('o')
+        {
+            self.toggle_trace();
+            return;
+        }
         match self.mode {
             Mode::Normal => self.handle_normal(key),
             Mode::Insert => self.handle_insert(key),
@@ -807,6 +854,15 @@ impl App {
                 if let Some(sel) = self.selection {
                     if sel.is_empty() {
                         self.selection = None;
+                        let clicked_line = sel.anchor.0;
+                        let block_start = self
+                            .trace_toggles
+                            .borrow()
+                            .iter()
+                            .find_map(|&(line, start)| (line == clicked_line).then_some(start));
+                        if let Some(start) = block_start {
+                            self.toggle_trace_block(start);
+                        }
                     } else {
                         let text = sel.extract(&self.transcript_text.borrow());
                         if !text.is_empty() {
@@ -1328,14 +1384,7 @@ impl App {
             KeyCode::Char('e') => self.open_effort(),
             KeyCode::Char('s') | KeyCode::Tab => self.open_switcher(),
             KeyCode::Char('?') => self.mode = Mode::Help,
-            KeyCode::Char('t') => {
-                self.show_tool_details = !self.show_tool_details;
-                self.set_message(if self.show_tool_details {
-                    "tool details expanded"
-                } else {
-                    "tool details collapsed"
-                });
-            }
+            KeyCode::Char('t') => self.toggle_trace(),
             KeyCode::Char('m') => {
                 self.mouse = !self.mouse;
                 self.set_message(if self.mouse {
@@ -2222,6 +2271,8 @@ impl App {
             return;
         }
         let s = self.sessions.remove(self.selected);
+        self.trace_overrides.retain(|(sid, _)| *sid != s.id);
+        self.trace_toggles.borrow_mut().clear();
         self.store.remove(&s.key);
         self.selected = self
             .selected
@@ -2777,21 +2828,103 @@ mod tests {
     }
 
     #[test]
-    fn leader_t_toggles_tool_details() {
+    fn ctrl_o_and_leader_t_toggle_trace_and_clear_overrides() {
         let (mut app, _) = app_with_session();
-        assert!(app.show_tool_details);
+        // Compact by default.
+        assert!(!app.show_trace);
+        assert!(!app.is_trace_expanded(0, 1));
+
+        // Per-block override flips just that block.
+        app.trace_overrides.insert((0, 1));
+        assert!(app.is_trace_expanded(0, 1));
+        assert!(!app.is_trace_expanded(0, 5));
+
+        // leader + t expands globally and clears per-block overrides.
         app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Char('t')));
-        assert!(!app.show_tool_details);
-        assert_eq!(app.message(), Some("tool details collapsed"));
+        assert!(app.show_trace);
+        assert!(app.trace_overrides.is_empty());
+        assert!(app.is_trace_expanded(0, 1));
+        assert!(app.is_trace_expanded(0, 5));
+        assert_eq!(app.message(), Some("showing full thoughts & tool details"));
 
-        // Also works from insert mode via Ctrl-A.
+        // Ctrl-o toggles directly from Insert mode too.
         app.mode = Mode::Insert;
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(!app.show_trace);
+        assert_eq!(
+            app.message(),
+            Some("compact view: thoughts & tools collapsed")
+        );
+        assert_eq!(app.mode, Mode::Insert);
+
+        // Ctrl-a + t also works from Insert mode.
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
         app.handle_key(key(KeyCode::Char('t')));
-        assert!(app.show_tool_details);
-        assert_eq!(app.message(), Some("tool details expanded"));
+        assert!(app.show_trace);
         assert_eq!(app.mode, Mode::Insert);
+
+        // Ctrl-o is ignored while a modal is open.
+        app.mode = Mode::Help;
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(app.show_trace);
+    }
+
+    #[test]
+    fn clicking_trace_toggle_row_flips_only_that_block() {
+        let (mut app, _) = app_with_session();
+        let area = Rect::new(0, 0, 80, 20);
+        // Simulate a rendered transcript with a toggleable trace block on line 2 (entry 1).
+        app.max_scroll.set(0);
+        *app.transcript_text.borrow_mut() = vec![
+            "  ▎ fix it".into(),
+            "".into(),
+            "  ▸ ✓ thought · 2 tools (read, edit)".into(),
+            "".into(),
+            "    Done.".into(),
+        ];
+        *app.trace_toggles.borrow_mut() = vec![(2, 1)];
+
+        // Transcript starts at row 2 (header is 2 rows), so content line 2 is terminal row 4.
+        let click = |kind| MouseEvent {
+            kind,
+            column: 6,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)), area);
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)), area);
+        assert!(app.is_trace_expanded(0, 1));
+        assert!(!app.is_trace_expanded(0, 5));
+        assert!(app.pending_copy.is_none());
+
+        // Clicking the same row again collapses it back.
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)), area);
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left)), area);
+        assert!(!app.is_trace_expanded(0, 1));
+
+        // Dragging across the row still selects & copies instead of toggling.
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)), area);
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 18,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 18,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert!(!app.is_trace_expanded(0, 1));
+        assert!(app.pending_copy.is_some());
     }
 
     #[test]
