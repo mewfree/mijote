@@ -319,6 +319,10 @@ const PASTE_COLLAPSE_CHARS: usize = 500;
 /// How long a transient status-bar notice stays visible before expiring.
 const NOTICE_TTL: Duration = Duration::from_secs(4);
 
+/// Idle time after pressing the leader key before the floating which-key
+/// popup appears, so fluent typists never see it flash.
+const LEADER_HINT_DELAY: Duration = Duration::from_millis(350);
+
 struct Notice {
     text: String,
     expires_at: Instant,
@@ -357,6 +361,10 @@ pub struct App {
     pastes: Vec<(String, String)>,
     /// The leader key was pressed; the next key is an app-level command.
     pub leader: bool,
+    /// Whether the delayed floating which-key popup is currently visible.
+    pub leader_hint: bool,
+    /// When to reveal the floating which-key popup after entering leader mode.
+    leader_due: Option<Instant>,
     /// Agents offered by the new-session picker.
     pub picker: Vec<&'static AgentSpec>,
     /// Cached local install/login status for each entry in `picker`.
@@ -449,6 +457,8 @@ impl App {
             slash: None,
             pastes: Vec::new(),
             leader: false,
+            leader_hint: false,
+            leader_due: None,
             picker: Vec::new(),
             picker_status: Vec::new(),
             picker_cursor: 0,
@@ -539,15 +549,29 @@ impl App {
             .map(|n| n.text.as_str())
     }
 
-    /// Periodic housekeeping called from the event loop (expires old notices).
+    /// Periodic housekeeping called from the event loop (expires old notices
+    /// and reveals the delayed leader which-key popup).
     pub fn tick(&mut self) {
-        if self
-            .notice
-            .as_ref()
-            .is_some_and(|n| Instant::now() >= n.expires_at)
-        {
+        let now = Instant::now();
+        if self.notice.as_ref().is_some_and(|n| now >= n.expires_at) {
             self.notice = None;
         }
+        if self.leader && self.leader_due.is_some_and(|due| now >= due) {
+            self.leader_due = None;
+            self.leader_hint = true;
+        }
+    }
+
+    fn enter_leader(&mut self) {
+        self.leader = true;
+        self.leader_hint = false;
+        self.leader_due = Some(Instant::now() + LEADER_HINT_DELAY);
+    }
+
+    fn clear_leader(&mut self) {
+        self.leader = false;
+        self.leader_hint = false;
+        self.leader_due = None;
     }
 
     pub fn current(&self) -> Option<&Session> {
@@ -723,6 +747,7 @@ impl App {
         self.selection = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
+            self.clear_leader();
             match self.current_mut() {
                 Some(s)
                     if matches!(
@@ -769,7 +794,7 @@ impl App {
             return;
         }
         if self.leader {
-            self.leader = false;
+            self.clear_leader();
             self.handle_command(key);
             if self.mode != Mode::Insert {
                 self.clear_completions();
@@ -781,7 +806,7 @@ impl App {
             && (ctrl && key.code == KeyCode::Char('a')
                 || self.mode == Mode::Normal && key.code == KeyCode::Char(' '))
         {
-            self.leader = true;
+            self.enter_leader();
             return;
         }
         if matches!(self.mode, Mode::Normal | Mode::Insert)
@@ -901,6 +926,7 @@ impl App {
                 self.scroll = self.scroll.saturating_sub(3)
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                self.clear_leader();
                 self.selection = None;
                 match region {
                     Region::Transcript => {
@@ -2929,10 +2955,10 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         };
-        // The transcript starts below the 2-row header.
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, 2), area);
-        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2, 3), area);
-        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2, 3), area);
+        // The transcript starts below the 1-row header.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, 1), area);
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2, 2), area);
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2, 2), area);
         assert_eq!(app.pending_copy.as_deref(), Some("world\nsec"));
         app.handle_key(key(KeyCode::Char('x')));
         assert!(app.selection.is_none());
@@ -3318,11 +3344,11 @@ mod tests {
         ];
         *app.trace_toggles.borrow_mut() = vec![(2, 1)];
 
-        // Transcript starts at row 2 (header is 2 rows), so content line 2 is terminal row 4.
+        // Transcript starts at row 1 (header is 1 row), so content line 2 is terminal row 3.
         let click = |kind| MouseEvent {
             kind,
             column: 6,
-            row: 4,
+            row: 3,
             modifiers: KeyModifiers::NONE,
         };
         app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left)), area);
@@ -3342,7 +3368,7 @@ mod tests {
             MouseEvent {
                 kind: MouseEventKind::Drag(MouseButton::Left),
                 column: 18,
-                row: 4,
+                row: 3,
                 modifiers: KeyModifiers::NONE,
             },
             area,
@@ -3351,7 +3377,7 @@ mod tests {
             MouseEvent {
                 kind: MouseEventKind::Up(MouseButton::Left),
                 column: 18,
-                row: 4,
+                row: 3,
                 modifiers: KeyModifiers::NONE,
             },
             area,
@@ -3409,6 +3435,38 @@ mod tests {
         assert_eq!(app.mode, Mode::Insert);
         type_keys(&mut app, "d");
         assert_eq!(app.input.text(), "d");
+    }
+
+    #[test]
+    fn leader_hint_delays_until_tick_and_clears_on_command_or_cancel() {
+        let (mut app, _) = app_with_session();
+
+        // Entering leader mode does not flash the popup immediately.
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.leader);
+        assert!(!app.leader_hint);
+        app.tick();
+        assert!(!app.leader_hint);
+
+        // Once the delay elapses, tick reveals the which-key popup.
+        app.leader_due = Instant::now().checked_sub(Duration::from_millis(1));
+        app.tick();
+        assert!(app.leader);
+        assert!(app.leader_hint);
+
+        // Pressing a command key runs the command and dismisses the popup.
+        app.handle_key(key(KeyCode::Char('m')));
+        assert!(!app.leader);
+        assert!(!app.leader_hint);
+        assert!(!app.mouse);
+
+        // Esc cancels leader + popup cleanly.
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.leader_due = Instant::now().checked_sub(Duration::from_millis(1));
+        app.tick();
+        assert!(app.leader_hint);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.leader && !app.leader_hint);
     }
 
     #[test]

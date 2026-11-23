@@ -56,7 +56,7 @@ fn layout(area: Rect, input_lines: usize) -> [Rect; 4] {
     // The prompt box grows with the number of lines typed, up to a cap.
     let rows = (input_lines as u16).min(MAX_INPUT_ROWS);
     Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(rows + 2),
         Constraint::Length(1),
@@ -145,7 +145,10 @@ pub fn render(f: &mut Frame, app: &App) {
         modal_open = true;
     }
     if !modal_open {
-        if let Some(popup) = &app.slash {
+        if app.leader && app.leader_hint {
+            render_leader_popup(f, app, status);
+            modal_open = true;
+        } else if let Some(popup) = &app.slash {
             render_slash_popup(f, popup, input);
             modal_open = true;
         } else if let Some(popup) = &app.mention {
@@ -714,49 +717,47 @@ fn prompt_usage_title(usage: &SessionUsage, max_width: usize) -> Option<Line<'st
     None
 }
 
+fn spans_display_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|s| str_width(s.content.as_ref())).sum()
+}
+
+/// Truncate a sequence of styled spans to `max_width` display columns,
+/// appending `…` if any text had to be cut.
+fn truncate_spans<'a>(spans: Vec<Span<'a>>, max_width: usize) -> Vec<Span<'a>> {
+    if max_width == 0 {
+        return Vec::new();
+    }
+    if spans_display_width(&spans) <= max_width {
+        return spans;
+    }
+    let limit = max_width.saturating_sub(1);
+    let mut out = Vec::new();
+    let mut used = 0;
+    for span in spans {
+        let mut buf = String::new();
+        for ch in span.content.chars() {
+            let cw = char_width(ch);
+            if used + cw > limit {
+                if !buf.is_empty() {
+                    out.push(Span::styled(buf, span.style));
+                }
+                out.push(Span::styled("…", DIM));
+                return out;
+            }
+            buf.push(ch);
+            used += cw;
+        }
+        if !buf.is_empty() {
+            out.push(Span::styled(buf, span.style));
+        }
+    }
+    out.push(Span::styled("…", DIM));
+    out
+}
+
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default().borders(Borders::BOTTOM).border_style(DIM);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
     let Some(s) = app.current() else { return };
 
-    let mut left = vec![Span::raw("  ")];
-    match &s.label {
-        Some(label) => {
-            left.push(Span::styled(label.as_str(), BOLD));
-            left.push(Span::styled(format!(" · {}", s.spec.name), DIM));
-        }
-        None => {
-            left.push(Span::styled(s.spec.name, BOLD));
-        }
-    }
-    match &s.worktree {
-        Some(w) => {
-            left.push(Span::styled(format!("  ⎇ {}", w.branch), DIM));
-            left.extend(worktree_state_spans(s));
-        }
-        None => {
-            left.push(Span::styled("  current directory", DIM));
-        }
-    }
-    if let Some(m) = s.model_name() {
-        left.push(Span::styled(format!("  · {m}"), DIM));
-    }
-    if let Some(e) = s.effort_name() {
-        left.push(Span::styled(format!("  · effort: {e}"), DIM));
-    }
-    if let (Some(mode_id), Some(mode_name)) = (s.session_mode(), s.session_mode_name()) {
-        left.push(Span::styled(
-            format!("  · mode: {mode_name}"),
-            session_mode_style(mode_id, &mode_name),
-        ));
-    }
-    if app.show_trace {
-        left.push(Span::styled("  · full trace", Style::new().fg(ACCENT)));
-    }
-    f.render_widget(Paragraph::new(Line::from(left)), inner);
-
-    let (label, color) = status_label(s);
     let waiting = app
         .sessions
         .iter()
@@ -782,44 +783,97 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
                 )
         })
         .count();
-    let mut right = Vec::new();
+
+    let mut right: Vec<Span<'static>> = Vec::new();
+    let push_sep = |v: &mut Vec<Span<'static>>| {
+        if !v.is_empty() {
+            v.push(Span::raw("  "));
+        }
+    };
     if app.scroll > 0 {
-        right.push(Span::styled(
-            "↓ scrolled · G follows   ",
-            Style::new().fg(WARN),
-        ));
+        push_sep(&mut right);
+        right.push(Span::styled("↓ scrolled", Style::new().fg(WARN)));
     }
     if waiting > 0 {
-        let badge = if done == 0 {
-            format!(" ◆ {waiting} waiting · s switch ")
-        } else {
-            format!(" ◆ {waiting} waiting ")
-        };
+        push_sep(&mut right);
         right.push(Span::styled(
-            badge,
+            format!(" ◆ {waiting} waiting "),
             Style::new()
                 .fg(Color::Black)
                 .bg(ASK)
                 .add_modifier(Modifier::BOLD),
         ));
-        right.push(Span::raw(if done == 0 { "  " } else { " " }));
     }
     if done > 0 {
+        push_sep(&mut right);
         right.push(Span::styled(
-            format!(" ★ {done} done · s switch "),
+            format!(" ★ {done} done "),
             Style::new()
                 .fg(Color::Black)
                 .bg(OK)
                 .add_modifier(Modifier::BOLD),
         ));
+    }
+    if s.status != Status::Idle {
+        push_sep(&mut right);
+        if s.status == Status::Running {
+            right.push(Span::styled(
+                format!("{} working {}", spinner(s), elapsed(s)),
+                Style::new().fg(ACCENT),
+            ));
+        } else {
+            let (label, color) = status_label(s);
+            right.push(Span::styled(label, Style::new().fg(color)));
+        }
+    }
+    if !right.is_empty() {
         right.push(Span::raw("  "));
     }
-    right.push(Span::styled(label, Style::new().fg(color)));
-    right.push(Span::raw("  "));
-    f.render_widget(
-        Paragraph::new(Line::from(right)).alignment(Alignment::Right),
-        inner,
-    );
+
+    let mut left: Vec<Span<'static>> = vec![Span::raw("  ")];
+    match &s.label {
+        Some(label) => {
+            left.push(Span::styled(label.clone(), BOLD));
+            left.push(Span::styled(format!(" · {}", s.spec.name), DIM));
+        }
+        None => {
+            left.push(Span::styled(s.spec.name, BOLD));
+        }
+    }
+    if let Some(w) = &s.worktree {
+        left.push(Span::styled(format!("  ⎇ {}", w.branch), DIM));
+        left.extend(worktree_state_spans(s));
+    }
+    if let Some(m) = s.model_name() {
+        left.push(Span::styled(format!(" · {m}"), DIM));
+    }
+    if let Some(e) = s.effort_name() {
+        left.push(Span::styled(format!(" · {e}"), DIM));
+    }
+    if let (Some(mode_id), Some(mode_name)) = (s.session_mode(), s.session_mode_name()) {
+        left.push(Span::styled(
+            format!(" · {mode_name}"),
+            session_mode_style(mode_id, &mode_name),
+        ));
+    }
+    if app.show_trace {
+        left.push(Span::styled(" · full trace", Style::new().fg(ACCENT)));
+    }
+
+    let right_w = spans_display_width(&right);
+    let left_budget = if right_w == 0 {
+        area.width as usize
+    } else {
+        (area.width as usize).saturating_sub(right_w + 1)
+    };
+    let left = truncate_spans(left, left_budget);
+    f.render_widget(Paragraph::new(Line::from(left)), area);
+    if !right.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(right)).alignment(Alignment::Right),
+            area,
+        );
+    }
 }
 
 fn tool_glyph(s: &Session, status: &str) -> (&'static str, Color) {
@@ -1463,11 +1517,12 @@ fn logo_lines() -> Vec<Line<'static>> {
 
 fn render_logo(f: &mut Frame, area: Rect) {
     let lines = logo_lines();
+    let pad_y = u16::from(area.height > lines.len() as u16);
     let r = Rect {
         x: area.x + 1,
-        y: area.y,
+        y: area.y + pad_y,
         width: area.width.saturating_sub(1),
-        height: (lines.len() as u16).min(area.height),
+        height: (lines.len() as u16).min(area.height.saturating_sub(pad_y)),
     };
     f.render_widget(Paragraph::new(lines), r);
 }
@@ -1549,15 +1604,16 @@ fn render_transcript(f: &mut Frame, app: &App, area: Rect) {
         app.transcript_text.borrow_mut().clear();
         app.visible_links.borrow_mut().clear();
         app.trace_toggles.borrow_mut().clear();
-        let msg = match s.status {
-            Status::Starting => "starting agent (first run may install the adapter)…",
-            Status::Failed => "agent failed to start",
-            _ if app.mode == Mode::Insert => "type a prompt, Enter to send, Esc for normal mode",
-            _ => "press i to write a prompt, Enter to send",
-        };
         render_logo(f, inner);
-        let r = centered(inner, 52, 1);
-        f.render_widget(Paragraph::new(Line::styled(msg, DIM)), r);
+        let msg = match s.status {
+            Status::Starting => Some("starting agent (first run may install the adapter)…"),
+            Status::Failed => Some("agent failed to start"),
+            _ => None,
+        };
+        if let Some(msg) = msg {
+            let r = centered(inner, 52, 1);
+            f.render_widget(Paragraph::new(Line::styled(msg, DIM)), r);
+        }
         return;
     }
 
@@ -1690,7 +1746,7 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
         let first = (crow + 1).saturating_sub(rows);
         // Insert mode uses the terminal cursor; normal mode paints a block.
         let paint_block = app.mode == Mode::Normal && !app.sessions.is_empty();
-        if active {
+        if active && !(app.leader && app.leader_hint) {
             let x = inner.x + 2 + (ccol - off) as u16;
             if x < inner.right() {
                 let pos = (x, inner.y + (crow - first) as u16);
@@ -1740,6 +1796,18 @@ fn search_count_span(app: &App) -> Span<'static> {
     }
 }
 
+fn format_cwd(path: &Path, home: Option<&Path>) -> String {
+    if let Some(home) = home {
+        if let Ok(rel) = path.strip_prefix(home) {
+            if rel.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", rel.display());
+        }
+    }
+    path.display().to_string()
+}
+
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
     let (badge, badge_bg) = match app.mode {
         _ if app.leader => (" LEADER ", ASK),
@@ -1785,14 +1853,10 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             f.set_cursor_position(pos);
             app.cursor_pos.set(Some(pos));
         }
-        spans.push(Span::raw("  "));
         if !app.search_query.is_empty() {
-            spans.push(search_count_span(app));
             spans.push(Span::raw("  "));
+            spans.push(search_count_span(app));
         }
-        spans.extend(key_hint("Enter", "jump"));
-        spans.push(Span::styled(" · ", DIM));
-        spans.extend(key_hint("Esc", "clear"));
         f.render_widget(Paragraph::new(Line::from(spans)), area);
         return;
     }
@@ -1814,167 +1878,245 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         && app.confirm.is_none()
         && !has_pending_perm
         && !has_pending_question
-        && app.mode == Mode::Normal
+        && matches!(app.mode, Mode::Normal | Mode::Insert)
     {
         spans.push(Span::styled(
             format!("/{} ", fit(&app.search_query, 24)),
             BOLD,
         ));
         spans.push(search_count_span(app));
-        spans.push(Span::raw("  "));
-        spans.extend(key_hint("n/N", "next/prev"));
-        spans.push(Span::styled(" · ", DIM));
-        spans.extend(key_hint("Esc", "clear"));
-    } else {
-        if !app.search_query.is_empty()
-            && !app.leader
-            && app.confirm.is_none()
-            && !has_pending_perm
-            && !has_pending_question
-            && app.mode == Mode::Insert
-        {
-            spans.push(Span::styled(
-                format!("/{} ", fit(&app.search_query, 20)),
-                BOLD,
-            ));
-            spans.push(search_count_span(app));
-            spans.push(Span::raw("  "));
+        if app.mode == Mode::Normal {
+            spans.push(Span::styled("  n/N · Esc", DIM));
         }
-        let busy = app.current().is_some_and(|s| {
-            matches!(
-                s.status,
-                Status::Running | Status::AwaitingPermission | Status::AwaitingQuestion
-            )
-        });
-        let trace_label = if app.show_trace { "compact" } else { "details" };
-        let hints: Vec<(&'static str, &'static str)> = match app.mode {
-            _ if has_pending_perm => vec![
-                ("a", "allow"),
-                ("r", "reject"),
-                ("1-9", "choose"),
-                ("Esc", "cancel"),
-            ],
-            _ if has_pending_question => vec![
-                ("↑/↓", "option"),
-                ("Space", "toggle"),
-                ("Tab", "field"),
-                ("Enter", "next/submit"),
-                ("Esc", "cancel"),
-            ],
-            _ if app.confirm.is_some() => vec![("y", "confirm"), ("any other key", "cancel")],
-            _ if app.leader => vec![
-                ("n", "new"),
-                ("N", "new here"),
-                ("d", "close"),
-                ("r", "rename"),
-                ("M", "model"),
-                ("e", "effort"),
-                ("o", "mode"),
-                ("u", "usage"),
-                ("s", "sessions"),
-                ("t", trace_label),
-                ("j/k", "select"),
-                ("g/G", "top/bottom"),
-                ("/", "search"),
-                ("m", "mouse"),
-                ("?", "help"),
-                ("q", "quit"),
-                ("Esc", "cancel"),
-            ],
-            Mode::Normal if app.sessions.is_empty() => vec![
-                ("n", "new"),
-                ("N/Enter", "new here"),
-                ("m", "mouse"),
-                ("?", "help"),
-                ("q", "quit"),
-            ],
-            Mode::Normal if app.scroll > 0 => vec![
-                ("␣G", "follow"),
-                ("^O", trace_label),
-                ("^U/^D", "half-page"),
-                ("/", "search"),
-                ("i", "insert"),
-                ("␣", "commands"),
-                ("?", "help"),
-            ],
-            Mode::Normal if busy => vec![
-                ("^C", "cancel turn"),
-                ("^O", trace_label),
-                ("␣", "commands"),
-                ("^U/^D", "half-page"),
-                ("/", "search"),
-                ("i", "insert"),
-                ("?", "help"),
-            ],
-            Mode::Normal => vec![
-                ("i", "insert"),
-                ("␣", "commands"),
-                ("^O", trace_label),
-                ("^U/^D", "half-page"),
-                ("/", "search"),
-                ("?", "help"),
-                ("^C", "quit"),
-            ],
-            Mode::Insert if app.slash.is_some() => vec![
-                ("Tab", "complete"),
-                ("Enter", "run"),
-                ("↑/↓", "select"),
-                ("Esc", "close"),
-            ],
-            Mode::Insert if app.mention.is_some() => vec![
-                ("Tab/Enter", "insert file"),
-                ("↑/↓", "select"),
-                ("Esc", "close"),
-            ],
-            Mode::Insert if busy => vec![
-                ("Enter", "send when idle"),
-                ("^C", "cancel turn"),
-                ("^O", trace_label),
-                ("^A", "commands"),
-                ("Esc", "normal"),
-            ],
-            Mode::Insert => vec![
-                ("Enter", "send"),
-                ("S-Enter", "newline"),
-                ("/", "slash"),
-                ("@", "files"),
-                ("^O", trace_label),
-                ("^A", "commands"),
-                ("Esc", "normal"),
-            ],
-            Mode::Picker | Mode::Model | Mode::Effort | Mode::SessionModes => {
-                vec![("j/k", "move"), ("Enter/1-9", "choose"), ("Esc", "close")]
-            }
-            Mode::Switcher => vec![
-                ("j/k", "move"),
-                ("Enter/1-9", "switch"),
-                ("r", "rename"),
-                ("Esc", "close"),
-            ],
-            Mode::Help => vec![("Esc/q/?", "close")],
-            Mode::Usage => vec![("Esc/q/u", "close")],
-            Mode::Rename => vec![("Enter", "save"), ("^U", "clear"), ("Esc", "cancel")],
-            Mode::Search => vec![],
-        };
-        for (i, (k, what)) in hints.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw("  "));
-            }
-            spans.extend(key_hint(k, what));
-        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
     }
 
-    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let cwd = app.cwd().display().to_string();
-    // Only show the cwd when the hints leave room for it.
-    let show_cwd = used + cwd.chars().count() + 3 <= area.width as usize;
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
-    if show_cwd {
+    // Quiet status line: location, multi-session count, mouse-off indicator,
+    // and a subtle right-aligned `? help` breadcrumb.
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let cwd = format_cwd(app.cwd(), home.as_deref());
+    spans.push(Span::styled(cwd, DIM));
+    if app.sessions.len() > 1 {
+        spans.push(Span::styled(
+            format!("  [{}/{} sessions]", app.selected + 1, app.sessions.len()),
+            DIM,
+        ));
+    }
+    if !app.mouse {
+        spans.push(Span::styled("  [mouse off]", Style::new().fg(WARN)));
+    }
+
+    let show_help_cue = !app.leader
+        && app.confirm.is_none()
+        && !has_pending_perm
+        && !has_pending_question
+        && matches!(app.mode, Mode::Normal | Mode::Insert);
+    let right_text = "? help ";
+    let right_w = if show_help_cue {
+        str_width(right_text)
+    } else {
+        0
+    };
+    let left_w = spans_display_width(&spans);
+    let fits_right = show_help_cue && left_w + right_w + 2 <= area.width as usize;
+    let left_budget = if fits_right {
+        (area.width as usize).saturating_sub(right_w + 2)
+    } else {
+        area.width as usize
+    };
+    let left = truncate_spans(spans, left_budget);
+    f.render_widget(Paragraph::new(Line::from(left)), area);
+    if fits_right {
         f.render_widget(
-            Paragraph::new(Line::styled(format!("{cwd} "), DIM)).alignment(Alignment::Right),
+            Paragraph::new(Line::styled(right_text, DIM)).alignment(Alignment::Right),
             area,
         );
     }
+}
+
+fn leader_item_spans(
+    key: &'static str,
+    desc: &'static str,
+    key_w: usize,
+    col_w: usize,
+) -> Vec<Span<'static>> {
+    let key_pad = key_w.saturating_sub(str_width(key));
+    let desc_room = col_w.saturating_sub(key_w + 2).max(1);
+    let desc_fit = fit(desc, desc_room);
+    let used = key_w + 2 + str_width(&desc_fit);
+    let trail = col_w.saturating_sub(used);
+    vec![
+        Span::styled(key, Style::new().fg(ASK).add_modifier(Modifier::BOLD)),
+        Span::raw(" ".repeat(key_pad + 2)),
+        Span::raw(desc_fit),
+        Span::raw(" ".repeat(trail)),
+    ]
+}
+
+fn render_leader_popup(f: &mut Frame, app: &App, status: Rect) {
+    let max_avail_h = status.y.saturating_sub(1);
+    if max_avail_h < 3 || status.width < 22 {
+        return;
+    }
+    let trace_label = if app.show_trace { "compact" } else { "details" };
+    let mouse_label = if app.mouse { "mouse off" } else { "mouse on" };
+
+    let session_items: &[(&str, &str)] = &[
+        ("n", "new worktree"),
+        ("N", "new here"),
+        ("s", "sessions"),
+        ("j/k", "next / prev"),
+        ("r", "rename"),
+        ("d", "close"),
+    ];
+    let agent_items: &[(&str, &str)] = &[
+        ("M", "model"),
+        ("e", "effort"),
+        ("o", "mode"),
+        ("u", "usage & context"),
+        ("t", trace_label),
+    ];
+    let view_items: &[(&str, &str)] = &[
+        ("/", "search"),
+        ("g/G", "top / bottom"),
+        ("m", mouse_label),
+        ("?", "help"),
+        ("q", "quit"),
+    ];
+
+    let w = status.width.min(92);
+    let inner_w = w.saturating_sub(6) as usize;
+    let heading_style = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if inner_w >= 66 {
+        let gap = 3usize;
+        let col_w = (inner_w - gap * 2) / 3;
+        let hdr = |name: &'static str| {
+            let pad = col_w.saturating_sub(str_width(name));
+            vec![
+                Span::styled(name, heading_style),
+                Span::raw(" ".repeat(pad)),
+            ]
+        };
+        let mut h_spans = Vec::new();
+        h_spans.extend(hdr("session"));
+        h_spans.push(Span::raw(" ".repeat(gap)));
+        h_spans.extend(hdr("agent"));
+        h_spans.push(Span::raw(" ".repeat(gap)));
+        h_spans.extend(hdr("view"));
+        lines.push(Line::from(h_spans));
+
+        let rows = session_items
+            .len()
+            .max(agent_items.len())
+            .max(view_items.len());
+        for i in 0..rows {
+            let mut spans = Vec::new();
+            for (ci, group) in [session_items, agent_items, view_items].iter().enumerate() {
+                if ci > 0 {
+                    spans.push(Span::raw(" ".repeat(gap)));
+                }
+                if let Some(&(k, d)) = group.get(i) {
+                    spans.extend(leader_item_spans(k, d, 3, col_w));
+                } else {
+                    spans.push(Span::raw(" ".repeat(col_w)));
+                }
+            }
+            lines.push(Line::from(spans));
+        }
+    } else if inner_w >= 42 {
+        let gap = 3usize;
+        let col_w = (inner_w - gap) / 2;
+        let hdr = |name: &'static str| {
+            let pad = col_w.saturating_sub(str_width(name));
+            vec![
+                Span::styled(name, heading_style),
+                Span::raw(" ".repeat(pad)),
+            ]
+        };
+        let mut h_spans = Vec::new();
+        h_spans.extend(hdr("session"));
+        h_spans.push(Span::raw(" ".repeat(gap)));
+        h_spans.extend(hdr("agent"));
+        lines.push(Line::from(h_spans));
+
+        let top_rows = session_items.len().max(agent_items.len());
+        for i in 0..top_rows {
+            let mut spans = Vec::new();
+            if let Some(&(k, d)) = session_items.get(i) {
+                spans.extend(leader_item_spans(k, d, 3, col_w));
+            } else {
+                spans.push(Span::raw(" ".repeat(col_w)));
+            }
+            spans.push(Span::raw(" ".repeat(gap)));
+            if let Some(&(k, d)) = agent_items.get(i) {
+                spans.extend(leader_item_spans(k, d, 3, col_w));
+            } else {
+                spans.push(Span::raw(" ".repeat(col_w)));
+            }
+            lines.push(Line::from(spans));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::styled("view", heading_style));
+        let half = view_items.len().div_ceil(2);
+        for i in 0..half {
+            let mut spans = Vec::new();
+            if let Some(&(k, d)) = view_items.get(i) {
+                spans.extend(leader_item_spans(k, d, 3, col_w));
+            }
+            if let Some(&(k, d)) = view_items.get(i + half) {
+                spans.push(Span::raw(" ".repeat(gap)));
+                spans.extend(leader_item_spans(k, d, 3, col_w));
+            }
+            lines.push(Line::from(spans));
+        }
+    } else {
+        for (gi, (title, group)) in [
+            ("session", session_items),
+            ("agent", agent_items),
+            ("view", view_items),
+        ]
+        .iter()
+        .enumerate()
+        {
+            if gi > 0 {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::styled(*title, heading_style));
+            for &(k, d) in *group {
+                lines.push(Line::from(leader_item_spans(k, d, 3, inner_w)));
+            }
+        }
+    }
+
+    let h = (lines.len() as u16 + 2).min(max_avail_h);
+    let x = status.x + (status.width.saturating_sub(w)) / 2;
+    let area = Rect {
+        x,
+        y: status.y.saturating_sub(h),
+        width: w,
+        height: h,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ASK))
+        .title(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "commands",
+                Style::new().fg(ASK).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]))
+        .title_bottom(hint_line(&[("Esc", "cancel")]).right_aligned())
+        .padding(Padding::horizontal(2));
+
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
@@ -4015,11 +4157,11 @@ mod tests {
 
         let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
 
-        // Compact by default: both thoughts collapsed, status shows ^O details.
+        // Compact by default: both thoughts collapsed, status stays quiet.
         term.draw(|f| render(f, &app)).unwrap();
         let screen = dump(&term);
         assert!(!screen.contains("full trace"), "{screen}");
-        assert!(screen.contains("^O details"), "{screen}");
+        assert!(!screen.contains("^O details"), "{screen}");
         assert!(!screen.contains("hidden reasoning"), "{screen}");
         assert!(!screen.contains("second reasoning"), "{screen}");
         assert_eq!(app.trace_toggles.borrow().len(), 2);
@@ -4167,7 +4309,8 @@ mod tests {
         assert!(screen.contains("fix-retry · Claude Code"), "{screen}");
         assert!(screen.contains("⎇ mijote/claude-1 * +2"), "{screen}");
         assert!(screen.contains("◆ 1 waiting"), "{screen}");
-        assert!(screen.contains("★ 1 done · s switch"), "{screen}");
+        assert!(screen.contains("★ 1 done"), "{screen}");
+        assert!(screen.contains("[1/3 sessions]"), "{screen}");
 
         // Switcher shows all labels/branches, worktree badges, attention states, and rename hint.
         app.mode = Mode::Switcher;
@@ -4224,7 +4367,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 16)).unwrap();
         // Initial draw populates transcript_text and transcript_height.
         term.draw(|f| render(f, &app)).unwrap();
-        assert_eq!(app.transcript_height.get(), 10);
+        assert_eq!(app.transcript_height.get(), 11);
 
         app.handle_key(key(KeyCode::Char('/')));
         for c in "bug".chars() {
@@ -4235,7 +4378,6 @@ mod tests {
         assert!(screen.contains("SEARCH"), "{screen}");
         assert!(screen.contains("/bug"), "{screen}");
         assert!(screen.contains("[1/2]"), "{screen}");
-        assert!(screen.contains("Enter jump"), "{screen}");
 
         let transcript_highlights = |term: &Terminal<TestBackend>, app: &App| {
             let buf = term.backend().buffer();
@@ -4262,13 +4404,13 @@ mod tests {
             ("bug".to_string(), "BUG".to_string())
         );
 
-        // Enter returns to Normal mode with compact counter and hints.
+        // Enter returns to Normal mode with compact counter and quiet n/N · Esc cue.
         app.handle_key(key(KeyCode::Enter));
         term.draw(|f| render(f, &app)).unwrap();
         let screen = dump(&term);
         assert!(screen.contains("NORMAL"), "{screen}");
         assert!(screen.contains("/bug [1/2]"), "{screen}");
-        assert!(screen.contains("n/N next/prev"), "{screen}");
+        assert!(screen.contains("n/N · Esc"), "{screen}");
 
         // Stepping to the next match swaps current highlight to the second line.
         app.handle_key(key(KeyCode::Char('n')));
@@ -4712,7 +4854,8 @@ mod tests {
         term.draw(|f| render(f, &app)).unwrap();
         let screen = dump(&term);
         assert!(screen.contains("· Opus"), "{screen}");
-        assert!(screen.contains("· effort: High"), "{screen}");
+        assert!(screen.contains("· High"), "{screen}");
+        assert!(!screen.contains("effort:"), "{screen}");
 
         app.mode = Mode::Effort;
         app.effort_cursor = 1;
@@ -4758,7 +4901,8 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
         term.draw(|f| render(f, &app)).unwrap();
         let screen = dump(&term);
-        assert!(screen.contains("· mode: Auto"), "{screen}");
+        assert!(screen.contains("· Auto"), "{screen}");
+        assert!(!screen.contains("mode:"), "{screen}");
 
         app.mode = Mode::SessionModes;
         app.session_mode_cursor = 1;
@@ -5083,5 +5227,190 @@ mod tests {
             cold_modal.contains("cold (invalidated by model switch)"),
             "{cold_modal}"
         );
+    }
+
+    #[test]
+    fn format_cwd_abbreviates_home_prefix() {
+        let home = Path::new("/Users/alice");
+        assert_eq!(format_cwd(Path::new("/Users/alice"), Some(home)), "~");
+        assert_eq!(
+            format_cwd(Path::new("/Users/alice/dev/mijote"), Some(home)),
+            "~/dev/mijote"
+        );
+        assert_eq!(
+            format_cwd(Path::new("/var/tmp/repo"), Some(home)),
+            "/var/tmp/repo"
+        );
+        assert_eq!(
+            format_cwd(Path::new("/Users/alice/dev"), None),
+            "/Users/alice/dev"
+        );
+    }
+
+    #[test]
+    fn slim_header_omits_idle_and_current_directory_and_never_overlaps() {
+        use crate::agent::acp::{EffortInfo, EffortState, ModelInfo, ModelState};
+
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work/mijote"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.status = Status::Idle;
+        s.label = Some("very-long-session-label-name".into());
+        s.models = ModelState {
+            current: Some("sonnet".into()),
+            available: vec![ModelInfo {
+                id: "sonnet".into(),
+                name: "Claude Sonnet 4.6".into(),
+            }],
+            config_id: Some("model".into()),
+        };
+        s.effort = EffortState {
+            current: Some("high".into()),
+            available: vec![EffortInfo {
+                id: "high".into(),
+                name: "High".into(),
+                description: None,
+            }],
+            config_id: Some("effort".into()),
+        };
+        app.sessions.push(s);
+
+        // Idle default session: no "current directory", no "idle", no horizontal rule on row 1.
+        let mut term = Terminal::new(TestBackend::new(90, 18)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+        let rows: Vec<&str> = screen.lines().collect();
+        assert!(!rows[0].contains("current directory"), "{}", rows[0]);
+        assert!(!rows[0].contains("idle"), "{}", rows[0]);
+        assert!(!rows[1].contains('─'), "{}", rows[1]);
+
+        // Narrow terminal with active right status: left truncates cleanly with `…` and right stays intact.
+        app.sessions[0].status = Status::Running;
+        app.sessions[0].turn_started = Some(std::time::Instant::now());
+        app.scroll = 3;
+        let mut narrow = Terminal::new(TestBackend::new(48, 16)).unwrap();
+        narrow.draw(|f| render(f, &app)).unwrap();
+        let narrow_screen = dump(&narrow);
+        let header_row = narrow_screen.lines().next().unwrap();
+        assert!(header_row.contains('…'), "{header_row}");
+        assert!(header_row.contains("↓ scrolled"), "{header_row}");
+        assert!(header_row.contains("working 0s"), "{header_row}");
+    }
+
+    #[test]
+    fn quiet_status_bar_hides_command_hints_and_surfaces_context_badges() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work/mijote"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (mut s0, _) = Session::detached(0, find("claude").unwrap());
+        s0.status = Status::Idle;
+        app.sessions.push(s0);
+
+        let mut term = Terminal::new(TestBackend::new(100, 18)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+        let status_row = screen.lines().last().unwrap();
+        assert!(status_row.contains(" NORMAL "), "{status_row}");
+        assert!(status_row.contains("/work/mijote"), "{status_row}");
+        assert!(status_row.contains("? help"), "{status_row}");
+        assert!(!status_row.contains("i insert"), "{status_row}");
+        assert!(!status_row.contains("␣ commands"), "{status_row}");
+        assert!(!status_row.contains("^U/^D"), "{status_row}");
+
+        // Insert mode also stays quiet (no wall of command hints).
+        app.mode = Mode::Insert;
+        term.draw(|f| render(f, &app)).unwrap();
+        let insert_screen = dump(&term);
+        let insert_status = insert_screen.lines().last().unwrap();
+        assert!(insert_status.contains(" INSERT "), "{insert_status}");
+        assert!(!insert_status.contains("S-Enter"), "{insert_status}");
+        assert!(!insert_status.contains("^A commands"), "{insert_status}");
+
+        // Multiple sessions and mouse-off show compact indicators.
+        let (mut s1, _) = Session::detached(1, find("codex").unwrap());
+        s1.status = Status::Idle;
+        app.sessions.push(s1);
+        app.selected = 1;
+        app.mouse = false;
+        term.draw(|f| render(f, &app)).unwrap();
+        let multi_screen = dump(&term);
+        let multi_status = multi_screen.lines().last().unwrap();
+        assert!(multi_status.contains("[2/2 sessions]"), "{multi_status}");
+        assert!(multi_status.contains("[mouse off]"), "{multi_status}");
+    }
+
+    #[test]
+    fn delayed_leader_popup_renders_adaptively_and_suppresses_links_and_cursor() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.status = Status::Idle;
+        s.entries.push(Entry::Agent(
+            "See [docs](https://example.com/docs) for details.".into(),
+        ));
+        app.sessions.push(s);
+        app.mode = Mode::Insert;
+
+        // Immediately after pressing leader, only the LEADER badge changes (no popup flash).
+        app.leader = true;
+        app.leader_hint = false;
+        let mut term = Terminal::new(TestBackend::new(96, 24)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let early = dump(&term);
+        assert!(early.contains(" LEADER "), "{early}");
+        assert!(!early.contains("new worktree"), "{early}");
+        assert!(!app.visible_links.borrow().is_empty());
+
+        // Once leader_hint activates, the floating which-key popup appears and clears links/cursor.
+        app.leader_hint = true;
+        term.draw(|f| render(f, &app)).unwrap();
+        let wide = dump(&term);
+        assert!(wide.contains("commands"), "{wide}");
+        assert!(wide.contains("session"), "{wide}");
+        assert!(wide.contains("agent"), "{wide}");
+        assert!(wide.contains("view"), "{wide}");
+        assert!(wide.contains("new worktree"), "{wide}");
+        assert!(wide.contains("usage & context"), "{wide}");
+        assert!(wide.contains("details"), "{wide}");
+        assert!(wide.contains("mouse off"), "{wide}");
+        assert!(wide.contains("Esc cancel"), "{wide}");
+        assert!(app.visible_links.borrow().is_empty());
+        assert!(app.cursor_pos.get().is_none());
+
+        // Dynamic labels flip when trace/mouse toggles are active.
+        app.show_trace = true;
+        app.mouse = false;
+        term.draw(|f| render(f, &app)).unwrap();
+        let toggled = dump(&term);
+        assert!(toggled.contains("compact"), "{toggled}");
+        assert!(toggled.contains("mouse on"), "{toggled}");
+
+        // Medium (2-column) and narrow (1-column) widths render cleanly without panicking.
+        let mut medium = Terminal::new(TestBackend::new(56, 22)).unwrap();
+        medium.draw(|f| render(f, &app)).unwrap();
+        let med_screen = dump(&medium);
+        assert!(med_screen.contains("commands"), "{med_screen}");
+        assert!(med_screen.contains("new worktree"), "{med_screen}");
+        assert!(med_screen.contains("quit"), "{med_screen}");
+
+        let mut narrow = Terminal::new(TestBackend::new(34, 24)).unwrap();
+        narrow.draw(|f| render(f, &app)).unwrap();
+        let nar_screen = dump(&narrow);
+        assert!(nar_screen.contains("commands"), "{nar_screen}");
+        assert!(nar_screen.contains("new worktree"), "{nar_screen}");
     }
 }
