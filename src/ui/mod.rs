@@ -111,6 +111,10 @@ pub fn render(f: &mut Frame, app: &App) {
         render_effort(f, app);
         modal_open = true;
     }
+    if app.mode == Mode::SessionModes {
+        render_session_mode(f, app);
+        modal_open = true;
+    }
     if app.mode == Mode::Switcher {
         render_switcher(f, app);
         modal_open = true;
@@ -740,6 +744,12 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(e) = s.effort_name() {
         left.push(Span::styled(format!("  · effort: {e}"), DIM));
+    }
+    if let (Some(mode_id), Some(mode_name)) = (s.session_mode(), s.session_mode_name()) {
+        left.push(Span::styled(
+            format!("  · mode: {mode_name}"),
+            session_mode_style(mode_id, &mode_name),
+        ));
     }
     if app.show_trace {
         left.push(Span::styled("  · full trace", Style::new().fg(ACCENT)));
@@ -1738,6 +1748,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         Mode::Picker => (" PICK ", ASK),
         Mode::Model => (" MODEL ", ASK),
         Mode::Effort => (" EFFORT ", ASK),
+        Mode::SessionModes => (" MODE ", ASK),
         Mode::Switcher => (" SESSIONS ", ASK),
         Mode::Help => (" HELP ", ASK),
         Mode::Rename => (" RENAME ", ASK),
@@ -1858,6 +1869,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("r", "rename"),
                 ("M", "model"),
                 ("e", "effort"),
+                ("o", "mode"),
                 ("u", "usage"),
                 ("s", "sessions"),
                 ("t", trace_label),
@@ -1930,7 +1942,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("^A", "commands"),
                 ("Esc", "normal"),
             ],
-            Mode::Picker | Mode::Model | Mode::Effort => {
+            Mode::Picker | Mode::Model | Mode::Effort | Mode::SessionModes => {
                 vec![("j/k", "move"), ("Enter/1-9", "choose"), ("Esc", "close")]
             }
             Mode::Switcher => vec![
@@ -2328,6 +2340,76 @@ fn render_effort(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+fn session_mode_style(id: &str, name: &str) -> Style {
+    let lower_id = id.to_ascii_lowercase();
+    let lower_name = name.to_ascii_lowercase();
+    if lower_id.contains("bypass")
+        || lower_id.contains("yolo")
+        || lower_id.contains("dontask")
+        || lower_id == "auto"
+        || lower_name.contains("bypass")
+        || lower_name.contains("yolo")
+        || lower_name == "auto"
+    {
+        Style::new().fg(WARN)
+    } else if lower_id.contains("plan")
+        || lower_id.contains("architect")
+        || lower_id == "ask"
+        || lower_name.contains("plan")
+    {
+        Style::new().fg(ACCENT)
+    } else if lower_id.contains("accept") || lower_name.contains("accept") {
+        Style::new().fg(OK)
+    } else {
+        DIM
+    }
+}
+
+fn render_session_mode(f: &mut Frame, app: &App) {
+    let Some(s) = app.current() else { return };
+    let current = s.session_mode();
+    let has_desc = s.modes.available.iter().any(|m| m.description.is_some());
+    let width = if has_desc { 66 } else { 44 };
+    let area = centered(f.area(), width, s.modes.available.len() as u16 + 4);
+    let inner_w = area.width.saturating_sub(8) as usize;
+    let items: Vec<ListItem> = s
+        .modes
+        .available
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let mark = if current == Some(m.id.as_str()) {
+                " ✓"
+            } else {
+                ""
+            };
+            let idx = format!("{} ", i + 1);
+            let label = format!("{}{mark}", m.name);
+            let mut spans = vec![Span::styled(idx.clone(), DIM), Span::raw(label.clone())];
+            if let Some(desc) = &m.description {
+                let used = idx.chars().count() + label.chars().count() + 2;
+                let room = inner_w.saturating_sub(used);
+                if room >= 4 {
+                    spans.push(Span::styled(format!("  {}", fit(desc, room)), DIM));
+                }
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(app.session_mode_cursor));
+    let list = List::new(items)
+        .block(modal(
+            "mode",
+            ACCENT,
+            hint_line(&[("Enter", "choose"), ("Esc", "close")]),
+        ))
+        .highlight_symbol("▌ ")
+        .highlight_style(BOLD.fg(ACCENT).bg(SELECTED_BG));
+    f.render_widget(Clear, area);
+    f.render_stateful_widget(list, area, &mut state);
+}
+
 fn render_help(f: &mut Frame) {
     let heading = |title: &'static str| {
         Line::styled(title, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
@@ -2360,12 +2442,13 @@ fn render_help(f: &mut Frame) {
         pair("s / Tab", "switcher", "j / k", "next / prev"),
         pair("d", "close session", "r", "rename session"),
         pair("M", "model (/model)", "e", "effort (/effort)"),
-        pair("u", "usage & context", "t", "thoughts & tools"),
-        pair("m", "toggle mouse", "/", "search"),
-        pair("g / G", "top / bottom", "?", "help"),
-        pair("q", "quit", "", ""),
+        pair("o", "mode (/mode)", "u", "usage & context"),
+        pair("t", "thoughts & tools", "m", "toggle mouse"),
+        pair("/", "search", "g / G", "top / bottom"),
+        pair("?", "help", "q", "quit"),
         Line::from(""),
         heading("session & scroll"),
+        row("S-Tab", "cycle session mode"),
         row("C-o / click", "toggle thoughts & tool details"),
         row("PgUp/Dn C-u/d", "scroll transcript (half-page in normal)"),
         row("/  n / N", "search transcript, next / prev match"),
@@ -2399,6 +2482,12 @@ fn render_usage(f: &mut Frame, app: &App) {
     }
     if let Some(e) = s.effort_name() {
         header.push(Span::styled(format!("  · effort: {e}"), DIM));
+    }
+    if let (Some(mode_id), Some(mode_name)) = (s.session_mode(), s.session_mode_name()) {
+        header.push(Span::styled(
+            format!("  · mode: {mode_name}"),
+            session_mode_style(mode_id, &mode_name),
+        ));
     }
     let mut lines: Vec<Line<'static>> = vec![Line::from(header), Line::from("")];
 
@@ -4636,6 +4725,54 @@ mod tests {
     }
 
     #[test]
+    fn render_shows_session_mode_in_header_and_picker_modal() {
+        use crate::agent::acp::{SessionModeInfo, SessionModeState};
+
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/wt"),
+            crate::store::Store::new(tempfile::tempdir().unwrap().keep()),
+            tx,
+        );
+        let (mut s, _) = Session::detached(0, find("claude").unwrap());
+        s.status = Status::Idle;
+        s.modes = SessionModeState {
+            current: Some("bypassPermissions".into()),
+            available: vec![
+                SessionModeInfo {
+                    id: "default".into(),
+                    name: "Default".into(),
+                    description: Some("Ask before edits".into()),
+                },
+                SessionModeInfo {
+                    id: "bypassPermissions".into(),
+                    name: "Auto".into(),
+                    description: Some("Approve edits automatically".into()),
+                },
+            ],
+            config_id: Some("mode".into()),
+        };
+        app.sessions.push(s);
+
+        let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("· mode: Auto"), "{screen}");
+
+        app.mode = Mode::SessionModes;
+        app.session_mode_cursor = 1;
+        term.draw(|f| render(f, &app)).unwrap();
+        let modal_screen = dump(&term);
+        assert!(modal_screen.contains("MODE"), "{modal_screen}");
+        assert!(modal_screen.contains("Auto ✓"), "{modal_screen}");
+        assert!(
+            modal_screen.contains("Approve edits automatically"),
+            "{modal_screen}"
+        );
+    }
+
+    #[test]
     fn render_shows_slash_command_popup_above_prompt() {
         use crate::agent::acp::AvailableCommand;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -4668,10 +4805,11 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(90, 22)).unwrap();
         term.draw(|f| render(f, &app)).unwrap();
         let screen = dump(&term);
-        assert!(screen.contains("/ commands (4)"), "{screen}");
+        assert!(screen.contains("/ commands (5)"), "{screen}");
         assert!(screen.contains("/model"), "{screen}");
         assert!(screen.contains("local"), "{screen}");
         assert!(screen.contains("/effort"), "{screen}");
+        assert!(screen.contains("/mode"), "{screen}");
         assert!(screen.contains("/compact"), "{screen}");
         assert!(screen.contains("Compact conversation history"), "{screen}");
         assert!(screen.contains("/web"), "{screen}");

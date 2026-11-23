@@ -28,6 +28,9 @@ pub struct Record {
     /// Effort level id the user last had selected, re-applied on restore.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Session mode id the user last had selected, re-applied on restore.
+    #[serde(default)]
+    pub mode: Option<String>,
     /// Optional user-assigned session label, restored across `--resume`.
     #[serde(default)]
     pub label: Option<String>,
@@ -261,6 +264,7 @@ mod tests {
             entries: vec![Entry::User("hi".into()), Entry::Agent("hello".into())],
             model: None,
             effort: None,
+            mode: None,
             label: None,
         }
     }
@@ -321,9 +325,10 @@ mod tests {
         let mut labeled = record("/p");
         labeled.label = Some("fix-retry".into());
         labeled.effort = Some("high".into());
+        labeled.mode = Some("acceptEdits".into());
         store.save("1-claude", &labeled).unwrap();
 
-        // Simulate an older on-disk JSON record that lacks the `label` and `effort` fields.
+        // Simulate an older on-disk JSON record that lacks `label`, `effort`, and `mode`.
         let legacy_json = r#"{
             "agent": "codex",
             "cwd": "/p",
@@ -338,9 +343,11 @@ mod tests {
         assert_eq!(loaded[0].0, "1-claude");
         assert_eq!(loaded[0].1.label.as_deref(), Some("fix-retry"));
         assert_eq!(loaded[0].1.effort.as_deref(), Some("high"));
+        assert_eq!(loaded[0].1.mode.as_deref(), Some("acceptEdits"));
         assert_eq!(loaded[1].0, "2-codex");
         assert_eq!(loaded[1].1.label, None);
         assert_eq!(loaded[1].1.effort, None);
+        assert_eq!(loaded[1].1.mode, None);
     }
 
     #[test]

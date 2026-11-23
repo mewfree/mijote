@@ -29,6 +29,8 @@ pub enum Mode {
     Model,
     /// Choosing a reasoning/effort level for the current session's model.
     Effort,
+    /// Choosing an ACP execution/permission mode for the current session.
+    SessionModes,
     /// Floating session list.
     Switcher,
     /// Key-binding help overlay.
@@ -168,8 +170,8 @@ pub fn active_slash_command(chars: &[char], cursor: usize) -> Option<(usize, Str
 }
 
 /// Build the combined slash-command list for `session`: local built-ins
-/// (`/model`, `/effort`) alongside agent-advertised commands (deduplicated
-/// case-insensitively with local commands taking precedence).
+/// (`/model`, `/effort`, `/mode`) alongside agent-advertised commands
+/// (deduplicated case-insensitively with local commands taking precedence).
 pub fn session_slash_commands(session: &Session) -> Vec<SlashCommandEntry> {
     let mut out = vec![
         SlashCommandEntry {
@@ -182,6 +184,12 @@ pub fn session_slash_commands(session: &Session) -> Vec<SlashCommandEntry> {
             name: "effort".to_string(),
             description: "Switch reasoning effort level".to_string(),
             input_hint: Some("[level]".to_string()),
+            local: true,
+        },
+        SlashCommandEntry {
+            name: "mode".to_string(),
+            description: "Switch session mode".to_string(),
+            input_hint: Some("[mode]".to_string()),
             local: true,
         },
     ];
@@ -359,7 +367,11 @@ pub struct App {
     pub picker_isolated: bool,
     pub model_cursor: usize,
     pub effort_cursor: usize,
+    pub session_mode_cursor: usize,
     pub switcher_cursor: usize,
+    /// Optional default ACP session mode (from `--mode`) applied to newly
+    /// opened sessions when supported by the agent.
+    pub default_mode: Option<String>,
     /// Buffer edited while in `Mode::Rename`.
     pub rename_buf: String,
     /// Index in `sessions` being renamed in `Mode::Rename`.
@@ -443,7 +455,9 @@ impl App {
             picker_isolated: true,
             model_cursor: 0,
             effort_cursor: 0,
+            session_mode_cursor: 0,
             switcher_cursor: 0,
+            default_mode: None,
             rename_buf: String::new(),
             rename_target: 0,
             rename_return: Mode::Normal,
@@ -625,6 +639,7 @@ impl App {
                 worktree,
                 rec.model,
                 rec.effort,
+                rec.mode,
                 self.ui_tx.clone(),
             );
             s.key = key;
@@ -678,6 +693,7 @@ impl App {
             worktree,
             None,
             None,
+            self.default_mode.clone(),
             self.ui_tx.clone(),
         ));
         self.selected = self.sessions.len() - 1;
@@ -776,12 +792,22 @@ impl App {
             self.toggle_trace();
             return;
         }
+        if matches!(self.mode, Mode::Normal | Mode::Insert)
+            && !self.sessions.is_empty()
+            && self.slash.is_none()
+            && self.mention.is_none()
+            && key.code == KeyCode::BackTab
+        {
+            self.cycle_session_mode();
+            return;
+        }
         match self.mode {
             Mode::Normal => self.handle_normal(key),
             Mode::Insert => self.handle_insert(key),
             Mode::Picker => self.handle_picker(key),
             Mode::Model => self.handle_model(key),
             Mode::Effort => self.handle_effort(key),
+            Mode::SessionModes => self.handle_session_mode(key),
             Mode::Switcher => self.handle_switcher(key),
             Mode::Help => self.handle_help(key),
             Mode::Rename => self.handle_rename(key),
@@ -856,6 +882,7 @@ impl App {
             Mode::Picker
                 | Mode::Model
                 | Mode::Effort
+                | Mode::SessionModes
                 | Mode::Switcher
                 | Mode::Help
                 | Mode::Rename
@@ -1443,6 +1470,7 @@ impl App {
             KeyCode::Char('r') => self.open_rename(self.selected, Mode::Normal),
             KeyCode::Char('M') => self.open_models(),
             KeyCode::Char('e') => self.open_effort(),
+            KeyCode::Char('o') => self.open_session_mode(),
             KeyCode::Char('u') => self.open_usage(),
             KeyCode::Char('s') | KeyCode::Tab => self.open_switcher(),
             KeyCode::Char('?') => self.mode = Mode::Help,
@@ -1909,7 +1937,7 @@ impl App {
                 if text.is_empty() {
                     return;
                 }
-                if self.slash_model(&text) || self.slash_effort(&text) {
+                if self.slash_model(&text) || self.slash_effort(&text) || self.slash_mode(&text) {
                     self.history_nav = None;
                     self.input.clear();
                     self.pastes.clear();
@@ -2245,6 +2273,127 @@ impl App {
         if let Some(s) = self.current_mut() {
             if let Some(id) = s.effort.available.get(i).map(|e| e.id.clone()) {
                 s.set_effort(id);
+                self.mode = Mode::Normal;
+            }
+        }
+    }
+
+    /// Handle `/mode` and `/mode <name>` locally; returns whether `text` was
+    /// that command.
+    fn slash_mode(&mut self, text: &str) -> bool {
+        let Some(rest) = text.strip_prefix("/mode") else {
+            return false;
+        };
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            return false; // e.g. `/modes`
+        }
+        let want = rest.trim();
+        if want.is_empty() {
+            self.open_session_mode();
+            return true;
+        }
+        let Some(s) = self.current_mut() else {
+            return true;
+        };
+        let found = s
+            .modes
+            .available
+            .iter()
+            .find(|m| m.id.eq_ignore_ascii_case(want) || m.name.eq_ignore_ascii_case(want))
+            .map(|m| m.id.clone());
+        let msg = if s.modes.available.is_empty() {
+            if s.status == Status::Starting {
+                "agent is still starting".into()
+            } else {
+                format!("{} does not offer session modes", s.spec.name)
+            }
+        } else if !s.can_prompt() {
+            "change the mode between turns".into()
+        } else if let Some(id) = found {
+            s.set_session_mode(id);
+            return true;
+        } else {
+            let names: Vec<_> = s.modes.available.iter().map(|m| m.name.as_str()).collect();
+            format!("unknown mode `{want}`; try: {}", names.join(", "))
+        };
+        self.set_message(msg);
+        true
+    }
+
+    fn open_session_mode(&mut self) {
+        let Some(s) = self.current() else { return };
+        if s.modes.available.is_empty() {
+            let msg = if s.status == Status::Starting {
+                "agent is still starting".into()
+            } else {
+                format!("{} does not offer session modes", s.spec.name)
+            };
+            self.set_message(msg);
+        } else if !s.can_prompt() {
+            self.set_message("change the mode between turns");
+        } else {
+            self.session_mode_cursor = s
+                .session_mode()
+                .and_then(|cur| s.modes.available.iter().position(|m| m.id == cur))
+                .unwrap_or(0);
+            self.mode = Mode::SessionModes;
+        }
+    }
+
+    fn cycle_session_mode(&mut self) {
+        let Some(s) = self.current_mut() else { return };
+        if s.modes.available.is_empty() {
+            let msg = if s.status == Status::Starting {
+                "agent is still starting".into()
+            } else {
+                format!("{} does not offer session modes", s.spec.name)
+            };
+            self.set_message(msg);
+            return;
+        }
+        if !s.can_prompt() {
+            self.set_message("change the mode between turns");
+            return;
+        }
+        let len = s.modes.available.len();
+        if len == 1 {
+            let name = s.modes.available[0].name.clone();
+            self.set_message(format!("only one mode available: {name}"));
+            return;
+        }
+        let cur = s
+            .session_mode()
+            .and_then(|id| s.modes.available.iter().position(|m| m.id == id));
+        let next_idx = cur.map_or(0, |i| (i + 1) % len);
+        let next = s.modes.available[next_idx].clone();
+        s.set_session_mode(next.id);
+        self.set_message(format!("mode: {}", next.name));
+    }
+
+    fn handle_session_mode(&mut self, key: KeyEvent) {
+        let n = self.current().map_or(0, |s| s.modes.available.len());
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down if n > 0 => {
+                self.session_mode_cursor = (self.session_mode_cursor + 1) % n
+            }
+            KeyCode::Char('k') | KeyCode::Up if n > 0 => {
+                self.session_mode_cursor = (self.session_mode_cursor + n - 1) % n
+            }
+            KeyCode::Enter => self.choose_session_mode(self.session_mode_cursor),
+            KeyCode::Char(c) => {
+                if let Some(i) = c.to_digit(10).and_then(|d| (d as usize).checked_sub(1)) {
+                    self.choose_session_mode(i);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn choose_session_mode(&mut self, i: usize) {
+        if let Some(s) = self.current_mut() {
+            if let Some(id) = s.modes.available.get(i).map(|m| m.id.clone()) {
+                s.set_session_mode(id);
                 self.mode = Mode::Normal;
             }
         }
@@ -2993,6 +3142,116 @@ mod tests {
     }
 
     #[test]
+    fn session_mode_picker_and_shift_tab_cycle_between_turns() {
+        use crate::agent::acp::{SessionModeInfo, SessionModeState};
+        let (mut app, _) = app_with_session();
+        // No modes advertised yet -> informative notice.
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('o')));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app
+            .message()
+            .unwrap()
+            .contains("does not offer session modes"));
+
+        app.sessions[0].modes = SessionModeState {
+            current: Some("plan".into()),
+            available: vec![
+                SessionModeInfo {
+                    id: "default".into(),
+                    name: "Default".into(),
+                    description: Some("Ask before edits".into()),
+                },
+                SessionModeInfo {
+                    id: "plan".into(),
+                    name: "Plan Mode".into(),
+                    description: Some("Read-only planning".into()),
+                },
+                SessionModeInfo {
+                    id: "bypassPermissions".into(),
+                    name: "Auto".into(),
+                    description: None,
+                },
+            ],
+            config_id: Some("mode".into()),
+        };
+
+        // Leader + o opens the mode picker positioned on the current mode.
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('o')));
+        assert_eq!(app.mode, Mode::SessionModes);
+        assert_eq!(app.session_mode_cursor, 1, "starts on the current mode");
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.session_mode_cursor, 2);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Normal);
+
+        // Shift+Tab (BackTab) cycles to the next mode in Normal and Insert modes.
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.message(), Some("mode: Auto"));
+        app.mode = Mode::Insert;
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.message(), Some("mode: Auto"));
+
+        // Mid-turn mode change is refused with a notice.
+        app.sessions[0].status = Status::Running;
+        app.mode = Mode::Normal;
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.message(), Some("change the mode between turns"));
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('o')));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.message(), Some("change the mode between turns"));
+    }
+
+    #[test]
+    fn slash_mode_is_handled_locally() {
+        use crate::agent::acp::{SessionModeInfo, SessionModeState};
+        let (mut app, _) = app_with_session();
+        app.sessions[0].modes = SessionModeState {
+            current: Some("default".into()),
+            available: vec![
+                SessionModeInfo {
+                    id: "default".into(),
+                    name: "Default".into(),
+                    description: None,
+                },
+                SessionModeInfo {
+                    id: "plan".into(),
+                    name: "Plan Mode".into(),
+                    description: None,
+                },
+                SessionModeInfo {
+                    id: "bypassPermissions".into(),
+                    name: "Auto".into(),
+                    description: None,
+                },
+            ],
+            config_id: Some("mode".into()),
+        };
+        let say = |app: &mut App, t: &str| {
+            app.mode = Mode::Insert;
+            app.input.set_text(t);
+            app.handle_key(key(KeyCode::Enter));
+        };
+        say(&mut app, "/mode");
+        assert_eq!(app.mode, Mode::SessionModes);
+        assert!(app.input.is_empty());
+        assert!(app.sessions[0].entries.is_empty(), "not sent as a prompt");
+
+        say(&mut app, "/mode nope");
+        assert!(app.message().unwrap().contains("Default, Plan Mode, Auto"));
+        assert_eq!(app.sessions[0].status, Status::Idle);
+
+        say(&mut app, "/mode AUTO");
+        assert!(app.sessions[0].entries.is_empty());
+
+        // Not the command: goes to the agent as a normal prompt.
+        say(&mut app, "/modes please");
+        assert_eq!(app.sessions[0].status, Status::Running);
+    }
+
+    #[test]
     fn m_toggles_mouse_capture() {
         let (mut app, _) = app_with_session();
         assert!(app.mouse);
@@ -3431,6 +3690,7 @@ mod tests {
                     entries: vec![Entry::User("hi".into())],
                     model: None,
                     effort: None,
+                    mode: None,
                     label: None,
                 },
             )
@@ -3938,7 +4198,7 @@ mod tests {
                 .iter()
                 .map(|m| m.command.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["model", "effort"]
+            vec!["model", "effort", "mode"]
         );
 
         // Live `available_commands_update` refreshes the open popup and deduplicates `/model`.
@@ -3972,6 +4232,7 @@ mod tests {
             vec![
                 ("model", true),
                 ("effort", true),
+                ("mode", true),
                 ("review", false),
                 ("web", false),
             ]
@@ -3994,17 +4255,17 @@ mod tests {
         assert_eq!(app.input.text(), "/web ");
         assert_eq!(app.sessions[0].status, Status::Idle);
 
-        // Clear and test `Tab` completion on `/mo` -> `/model `.
+        // Clear and test `Tab` completion on `/ml` -> `/model `.
         app.input.clear();
-        type_keys(&mut app, "/mo");
+        type_keys(&mut app, "/ml");
         assert_eq!(app.slash.as_ref().unwrap().matches[0].command.name, "model");
         app.handle_key(key(KeyCode::Tab));
         assert!(app.slash.is_none());
         assert_eq!(app.input.text(), "/model ");
 
-        // Clear and test `Enter` on `/mo` -> opens local model picker immediately.
+        // Clear and test `Enter` on `/ml` -> opens local model picker immediately.
         app.input.clear();
-        type_keys(&mut app, "/mo");
+        type_keys(&mut app, "/ml");
         app.handle_key(key(KeyCode::Enter));
         assert!(app.slash.is_none());
         assert_eq!(app.mode, Mode::Model);
@@ -4289,6 +4550,7 @@ mod tests {
                     ],
                     model: None,
                     effort: None,
+                    mode: None,
                     label: None,
                 },
             )

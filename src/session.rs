@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::acp::{
     AcpClient, AvailableCommand, CacheTtl, CancelHandle, CostInfo, EffortState, ElicitationRequest,
-    ElicitationResponse, Event, ModelState, PermissionRequest, StopReason, TokenUsage, ToolContent,
-    UsageUpdate,
+    ElicitationResponse, Event, ModelState, PermissionRequest, SessionModeState, StopReason,
+    TokenUsage, ToolContent, UsageUpdate,
 };
 use crate::agent::{install, AgentSpec};
 use crate::store::{self, Record};
@@ -171,6 +171,7 @@ pub enum UiMsg {
         CancelHandle,
         ModelState,
         EffortState,
+        SessionModeState,
         Vec<AvailableCommand>,
         Option<UsageUpdate>,
     ),
@@ -178,6 +179,8 @@ pub enum UiMsg {
     ModelFailed(String),
     /// Setting the effort level failed; the effort is unchanged.
     EffortFailed(String),
+    /// Setting the session mode failed; the mode is unchanged.
+    ModeFailed(String),
     Event(Event),
     Permission(PermissionRequest),
     Question(ElicitationRequest),
@@ -198,6 +201,7 @@ enum WorkerCmd {
     Prompt(String),
     SetModel(String),
     SetEffort(String),
+    SetMode(String),
     Quit,
 }
 
@@ -228,6 +232,10 @@ pub struct Session {
     pub effort: EffortState,
     /// Effort level to apply once the agent is up (restored from the record).
     preferred_effort: Option<String>,
+    /// Execution/permission modes the agent advertised; empty if unsupported.
+    pub modes: SessionModeState,
+    /// Session mode to apply once the agent is up (from `--mode` or restored record).
+    preferred_mode: Option<String>,
     /// Slash commands advertised by the agent (`available_commands_update`).
     pub commands: Vec<AvailableCommand>,
     /// Live context window, cost, and token usage reported by the agent.
@@ -243,6 +251,7 @@ impl Session {
     /// Start a session; the agent is installed (if needed) and launched on a
     /// worker thread, reporting back through `ui_tx`. The agent runs in the
     /// worktree if there is one, else in `cwd`.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         id: usize,
         spec: &'static AgentSpec,
@@ -250,6 +259,7 @@ impl Session {
         worktree: Option<Worktree>,
         model: Option<String>,
         effort: Option<String>,
+        mode: Option<String>,
         ui_tx: Sender<Msg>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -258,6 +268,7 @@ impl Session {
         let dir = worktree.as_ref().map_or(cwd, |w| w.path.clone());
         let preferred_model = model.clone();
         let preferred_effort = effort.clone();
+        let preferred_mode = mode.clone();
         let handle = thread::spawn(move || {
             worker(
                 id,
@@ -265,6 +276,7 @@ impl Session {
                 dir,
                 preferred_model,
                 preferred_effort,
+                preferred_mode,
                 ui_tx,
                 cmd_rx,
                 perm_rx,
@@ -276,6 +288,7 @@ impl Session {
         s.refresh_worktree_state();
         s.preferred_model = model;
         s.preferred_effort = effort;
+        s.preferred_mode = mode;
         s.thread = Some(handle);
         s
     }
@@ -304,6 +317,8 @@ impl Session {
             preferred_model: None,
             effort: EffortState::default(),
             preferred_effort: None,
+            modes: SessionModeState::default(),
+            preferred_mode: None,
             commands: Vec::new(),
             usage: SessionUsage::default(),
             cancel: None,
@@ -378,6 +393,11 @@ impl Session {
                 .current
                 .clone()
                 .or_else(|| self.preferred_effort.clone()),
+            mode: self
+                .modes
+                .current
+                .clone()
+                .or_else(|| self.preferred_mode.clone()),
             label: self.label.clone(),
         }
     }
@@ -434,6 +454,31 @@ impl Session {
             let name = self.effort.display(&id);
             self.entries.push(Entry::Notice(format!("effort: {name}")));
             self.effort.current = Some(id);
+        }
+    }
+
+    /// Id of the session mode in use, if the agent reported one.
+    pub fn session_mode(&self) -> Option<&str> {
+        self.modes.current.as_deref()
+    }
+
+    /// Human name of the session mode in use.
+    pub fn session_mode_name(&self) -> Option<String> {
+        self.session_mode().map(|id| self.modes.display(id))
+    }
+
+    /// Ask the agent to switch session modes (only between turns).
+    pub fn set_session_mode(&mut self, id: String) {
+        if self.can_prompt() && self.modes.available.iter().any(|m| m.id == id) {
+            let _ = self.cmd_tx.send(WorkerCmd::SetMode(id));
+        }
+    }
+
+    fn note_mode(&mut self, id: String) {
+        if self.modes.current.as_deref() != Some(&id) {
+            let name = self.modes.display(&id);
+            self.entries.push(Entry::Notice(format!("mode: {name}")));
+            self.modes.current = Some(id);
         }
     }
 
@@ -511,13 +556,15 @@ impl Session {
     pub fn apply(&mut self, body: UiMsg) {
         match body {
             UiMsg::Closed(_) => {}
-            UiMsg::Ready(handle, models, effort, commands, usage) => {
+            UiMsg::Ready(handle, models, effort, modes, commands, usage) => {
                 self.cancel = Some(handle);
                 self.status = Status::Idle;
                 self.models = models;
                 self.preferred_model = None;
                 self.effort = effort;
                 self.preferred_effort = None;
+                self.modes = modes;
+                self.preferred_mode = None;
                 self.commands = commands;
                 if let Some(u) = usage {
                     self.usage.apply_update(u);
@@ -529,6 +576,9 @@ impl Session {
             UiMsg::EffortFailed(e) => self
                 .entries
                 .push(Entry::Notice(format!("could not change effort: {e}"))),
+            UiMsg::ModeFailed(e) => self
+                .entries
+                .push(Entry::Notice(format!("could not change mode: {e}"))),
             UiMsg::Event(e) => self.apply_event(e),
             UiMsg::Permission(req) => {
                 self.pending = Some(req);
@@ -625,7 +675,12 @@ impl Session {
             }
             Event::ModelChanged(id) => self.note_model(id),
             Event::EffortChanged(id) => self.note_effort(id),
-            Event::ConfigOptionsUpdated { models, effort } => {
+            Event::ModeChanged(id) => self.note_mode(id),
+            Event::ConfigOptionsUpdated {
+                models,
+                effort,
+                modes,
+            } => {
                 let model_updated = models.is_some();
                 if let Some(m) = models {
                     let prev = self.models.current.clone();
@@ -650,6 +705,19 @@ impl Session {
                         let name = self.effort.display(&id);
                         self.entries.push(Entry::Notice(format!("effort: {name}")));
                     }
+                }
+                if let Some(m) = modes {
+                    let prev_mode = self.modes.current.clone();
+                    let next_mode_id = m.current.clone();
+                    self.modes = m;
+                    if let Some(id) = next_mode_id {
+                        if prev_mode.as_deref() != Some(id.as_str()) {
+                            let name = self.modes.display(&id);
+                            self.entries.push(Entry::Notice(format!("mode: {name}")));
+                        }
+                    }
+                } else if self.modes.config_id.is_some() {
+                    self.modes = SessionModeState::default();
                 }
             }
             Event::AvailableCommands(cmds) => {
@@ -682,6 +750,7 @@ fn worker(
     cwd: PathBuf,
     preferred_model: Option<String>,
     preferred_effort: Option<String>,
+    preferred_mode: Option<String>,
     ui_tx: Sender<Msg>,
     cmd_rx: Receiver<WorkerCmd>,
     perm_rx: Receiver<Option<String>>,
@@ -709,7 +778,7 @@ fn worker(
             .new_session_with_meta(&cwd, session_meta)
             .map_err(|e| e.to_string())?;
         // Re-apply a restored model first (changing models may update available
-        // effort levels), then re-apply any restored effort level.
+        // effort levels), then re-apply any restored effort level and mode.
         if let Some(want) = preferred_model {
             let m = client.models();
             if m.current.as_deref() != Some(&want) && m.available.iter().any(|a| a.id == want) {
@@ -722,10 +791,24 @@ fn worker(
                 let _ = client.set_effort(&sid, &want);
             }
         }
+        if let Some(want) = preferred_mode {
+            let m = client.modes();
+            if let Some(chosen) = m
+                .available
+                .iter()
+                .find(|a| a.id.eq_ignore_ascii_case(&want) || a.name.eq_ignore_ascii_case(&want))
+                .map(|a| a.id.clone())
+            {
+                if m.current.as_deref() != Some(chosen.as_str()) {
+                    let _ = client.set_mode(&sid, &chosen);
+                }
+            }
+        }
         send(UiMsg::Ready(
             client.cancel_handle(&sid),
             client.models().clone(),
             client.effort().clone(),
+            client.modes().clone(),
             client.commands().to_vec(),
             client.usage().cloned(),
         ));
@@ -745,9 +828,13 @@ fn worker(
                         Ok(()) => {
                             let effort = (!client.effort().available.is_empty())
                                 .then(|| client.effort().clone());
+                            let modes = (!client.modes().available.is_empty()
+                                && client.modes().config_id.is_some())
+                            .then(|| client.modes().clone());
                             send(UiMsg::Event(Event::ConfigOptionsUpdated {
                                 models: Some(client.models().clone()),
                                 effort,
+                                modes,
                             }));
                             if client.commands() != prev_cmds.as_slice() {
                                 send(UiMsg::Event(Event::AvailableCommands(
@@ -772,9 +859,13 @@ fn worker(
                             if client.effort().available.is_empty() {
                                 send(UiMsg::Event(Event::EffortChanged(id)));
                             } else {
+                                let modes = (!client.modes().available.is_empty()
+                                    && client.modes().config_id.is_some())
+                                .then(|| client.modes().clone());
                                 send(UiMsg::Event(Event::ConfigOptionsUpdated {
                                     models: None,
                                     effort: Some(client.effort().clone()),
+                                    modes,
                                 }));
                             }
                             if client.commands() != prev_cmds.as_slice() {
@@ -789,6 +880,39 @@ fn worker(
                             }
                         }
                         Err(e) => send(UiMsg::EffortFailed(e.to_string())),
+                    }
+                    continue;
+                }
+                WorkerCmd::SetMode(id) => {
+                    let prev_cmds = client.commands().to_vec();
+                    let prev_usage = client.usage().cloned();
+                    match client.set_mode(&sid, &id) {
+                        Ok(()) => {
+                            if client.modes().config_id.is_some()
+                                && !client.modes().available.is_empty()
+                            {
+                                let effort = (!client.effort().available.is_empty())
+                                    .then(|| client.effort().clone());
+                                send(UiMsg::Event(Event::ConfigOptionsUpdated {
+                                    models: None,
+                                    effort,
+                                    modes: Some(client.modes().clone()),
+                                }));
+                            } else {
+                                send(UiMsg::Event(Event::ModeChanged(id)));
+                            }
+                            if client.commands() != prev_cmds.as_slice() {
+                                send(UiMsg::Event(Event::AvailableCommands(
+                                    client.commands().to_vec(),
+                                )));
+                            }
+                            if client.usage() != prev_usage.as_ref() {
+                                if let Some(u) = client.usage().cloned() {
+                                    send(UiMsg::Event(Event::UsageUpdated(u)));
+                                }
+                            }
+                        }
+                        Err(e) => send(UiMsg::ModeFailed(e.to_string())),
                     }
                     continue;
                 }
@@ -1022,6 +1146,7 @@ mod tests {
                 config_id: Some("model".into()),
             }),
             effort: None,
+            modes: None,
         }));
         assert_eq!(s.model_name().as_deref(), Some("Haiku"));
         assert!(s.effort.available.is_empty());
@@ -1036,6 +1161,77 @@ mod tests {
         assert_eq!(
             s.entries.last(),
             Some(&Entry::Notice("could not change effort: rpc error".into()))
+        );
+    }
+
+    #[test]
+    fn mode_updates_log_persist_and_preserve_legacy_modes() {
+        use crate::agent::acp::SessionModeInfo;
+
+        let (mut s, _) = session();
+        s.modes = SessionModeState {
+            current: Some("default".into()),
+            available: vec![
+                SessionModeInfo {
+                    id: "default".into(),
+                    name: "Default".into(),
+                    description: None,
+                },
+                SessionModeInfo {
+                    id: "plan".into(),
+                    name: "Plan Mode".into(),
+                    description: Some("Read-only planning".into()),
+                },
+                SessionModeInfo {
+                    id: "bypassPermissions".into(),
+                    name: "Auto".into(),
+                    description: None,
+                },
+            ],
+            config_id: None, // legacy modes
+        };
+
+        // Re-applying current mode is a no-op.
+        s.apply(UiMsg::Event(Event::ModeChanged("default".into())));
+        assert!(s.entries.is_empty());
+
+        // Switching logs once and updates record.
+        s.apply(UiMsg::Event(Event::ModeChanged("bypassPermissions".into())));
+        assert_eq!(s.entries, vec![Entry::Notice("mode: Auto".into())]);
+        assert_eq!(s.session_mode_name().as_deref(), Some("Auto"));
+        assert_eq!(
+            s.record(std::path::Path::new(".")).mode.as_deref(),
+            Some("bypassPermissions")
+        );
+
+        // A config_option_update with `modes: None` does not clobber legacy modes.
+        s.apply(UiMsg::Event(Event::ConfigOptionsUpdated {
+            models: None,
+            effort: None,
+            modes: None,
+        }));
+        assert_eq!(s.session_mode(), Some("bypassPermissions"));
+
+        // A config_option_update with `modes: Some(...)` updates mode state & logs.
+        let mut cfg_modes = s.modes.clone();
+        cfg_modes.config_id = Some("mode".into());
+        cfg_modes.current = Some("plan".into());
+        s.apply(UiMsg::Event(Event::ConfigOptionsUpdated {
+            models: None,
+            effort: None,
+            modes: Some(cfg_modes),
+        }));
+        assert_eq!(s.session_mode_name().as_deref(), Some("Plan Mode"));
+        assert_eq!(
+            s.entries.last(),
+            Some(&Entry::Notice("mode: Plan Mode".into()))
+        );
+
+        // Failure notice is logged cleanly.
+        s.apply(UiMsg::ModeFailed("unsupported".into()));
+        assert_eq!(
+            s.entries.last(),
+            Some(&Entry::Notice("could not change mode: unsupported".into()))
         );
     }
 

@@ -227,11 +227,14 @@ pub enum Event {
     ModelChanged(String),
     /// The agent switched reasoning/effort level.
     EffortChanged(String),
+    /// The agent switched session modes (e.g. legacy `current_mode_update`).
+    ModeChanged(String),
     /// The agent pushed a refreshed `configOptions` snapshot (may update model,
-    /// effort, or available effort levels after a model switch).
+    /// effort, or session mode).
     ConfigOptionsUpdated {
         models: Option<ModelState>,
         effort: Option<EffortState>,
+        modes: Option<SessionModeState>,
     },
     /// The agent advertised or replaced its available slash commands.
     AvailableCommands(Vec<AvailableCommand>),
@@ -560,6 +563,126 @@ impl EffortState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionModeInfo {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// Execution / permission modes an agent advertises for a session (e.g.
+/// `default`, `acceptEdits`, `plan`, `bypassPermissions`, `auto`). Empty
+/// `available` means the agent offers no mode selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionModeState {
+    pub current: Option<String>,
+    pub available: Vec<SessionModeInfo>,
+    /// Set when the mode is a session config option (switched with
+    /// `session/set_config_option`) rather than the older `modes` field
+    /// (switched with `session/set_mode`).
+    pub config_id: Option<String>,
+}
+
+impl SessionModeState {
+    fn parse(modes: &Value) -> Self {
+        Self {
+            current: modes
+                .get("currentModeId")
+                .and_then(non_empty_str)
+                .map(str::to_string),
+            config_id: None,
+            available: modes
+                .get("availableModes")
+                .and_then(Value::as_array)
+                .map(|ms| {
+                    ms.iter()
+                        .filter_map(|m| {
+                            let id = m
+                                .get("id")
+                                .or_else(|| m.get("modeId"))
+                                .and_then(non_empty_str)?
+                                .to_string();
+                            let name = m
+                                .get("name")
+                                .and_then(non_empty_str)
+                                .map_or_else(|| id.clone(), str::to_string);
+                            let description = m
+                                .get("description")
+                                .and_then(non_empty_str)
+                                .map(str::to_string);
+                            Some(SessionModeInfo {
+                                id,
+                                name,
+                                description,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Pull the session mode select out of a `configOptions` array, if there is
+    /// one. Matches standard ACP `category: "mode"`, falling back to an option
+    /// with `id: "mode"`.
+    fn from_config_options(options: &Value) -> Option<Self> {
+        let arr = options.as_array()?;
+        let opt = arr
+            .iter()
+            .find(|o| o.get("category").and_then(Value::as_str) == Some("mode"))
+            .or_else(|| {
+                arr.iter().find(|o| {
+                    let cat = o.get("category").and_then(Value::as_str);
+                    !matches!(cat, Some("model" | "thought_level"))
+                        && o.get("id").and_then(Value::as_str) == Some("mode")
+                })
+            })?;
+        let config_id = opt.get("id").and_then(non_empty_str)?.to_string();
+        let mut available = Vec::new();
+        for v in opt.get("options").and_then(Value::as_array)? {
+            let group = v.get("options").and_then(Value::as_array);
+            for item in group.map_or(std::slice::from_ref(v), Vec::as_slice) {
+                let id = str_of(item, "value");
+                if id.is_empty() {
+                    continue;
+                }
+                let name = item
+                    .get("name")
+                    .and_then(non_empty_str)
+                    .map_or_else(|| id.clone(), str::to_string);
+                let description = item
+                    .get("description")
+                    .and_then(non_empty_str)
+                    .map(str::to_string);
+                available.push(SessionModeInfo {
+                    id,
+                    name,
+                    description,
+                });
+            }
+        }
+        if available.is_empty() {
+            return None;
+        }
+        Some(Self {
+            current: opt
+                .get("currentValue")
+                .and_then(non_empty_str)
+                .map(str::to_string),
+            available,
+            config_id: Some(config_id),
+        })
+    }
+
+    /// Display name for `id`, falling back to the id itself.
+    pub fn display(&self, id: &str) -> String {
+        self.available
+            .iter()
+            .find(|m| m.id == id)
+            .map_or_else(|| id.to_string(), |m| m.name.clone())
+    }
+}
+
 /// Sends `session/cancel` from any thread, even while a prompt is running.
 #[derive(Clone, Debug)]
 pub struct CancelHandle {
@@ -596,6 +719,7 @@ pub struct AcpClient {
     next_id: u64,
     models: ModelState,
     effort: EffortState,
+    modes: SessionModeState,
     commands: Vec<AvailableCommand>,
     usage: Option<UsageUpdate>,
     embedded_context: bool,
@@ -631,6 +755,7 @@ impl AcpClient {
             next_id: 0,
             models: ModelState::default(),
             effort: EffortState::default(),
+            modes: SessionModeState::default(),
             commands: Vec::new(),
             usage: None,
             embedded_context: false,
@@ -655,11 +780,21 @@ impl AcpClient {
         match &ev {
             Event::ModelChanged(id) => self.models.current = Some(id.clone()),
             Event::EffortChanged(id) => self.effort.current = Some(id.clone()),
-            Event::ConfigOptionsUpdated { models, effort } => {
+            Event::ModeChanged(id) => self.modes.current = Some(id.clone()),
+            Event::ConfigOptionsUpdated {
+                models,
+                effort,
+                modes,
+            } => {
                 if let Some(m) = models {
                     self.models = m.clone();
                 }
                 self.effort = effort.clone().unwrap_or_default();
+                if let Some(m) = modes {
+                    self.modes = m.clone();
+                } else if self.modes.config_id.is_some() {
+                    self.modes = SessionModeState::default();
+                }
             }
             Event::AvailableCommands(cmds) => {
                 self.commands = cmds.clone();
@@ -838,6 +973,7 @@ impl AcpClient {
         let result = self.call_quiet("session/new", params)?;
         self.models = ModelState::default();
         self.effort = EffortState::default();
+        self.modes = SessionModeState::default();
         if let Some(opts) = result.get("configOptions") {
             if let Some(m) = ModelState::from_config_options(opts) {
                 self.models = m;
@@ -847,8 +983,18 @@ impl AcpClient {
             if let Some(e) = EffortState::from_config_options(opts) {
                 self.effort = e;
             }
-        } else if let Some(models) = result.get("models") {
-            self.models = ModelState::parse(models);
+            if let Some(m) = SessionModeState::from_config_options(opts) {
+                self.modes = m;
+            } else if let Some(modes) = result.get("modes") {
+                self.modes = SessionModeState::parse(modes);
+            }
+        } else {
+            if let Some(models) = result.get("models") {
+                self.models = ModelState::parse(models);
+            }
+            if let Some(modes) = result.get("modes") {
+                self.modes = SessionModeState::parse(modes);
+            }
         }
         if let Some(cmds) = result.get("availableCommands").filter(|v| v.is_array()) {
             self.commands = parse_available_commands(cmds);
@@ -870,6 +1016,11 @@ impl AcpClient {
         &self.effort
     }
 
+    /// Session modes the agent advertised in `session/new` (empty if none).
+    pub fn modes(&self) -> &SessionModeState {
+        &self.modes
+    }
+
     /// Slash commands the agent advertised for the session (empty if none).
     pub fn commands(&self) -> &[AvailableCommand] {
         &self.commands
@@ -885,6 +1036,7 @@ impl AcpClient {
         opts: &Value,
         fallback_model: Option<&str>,
         fallback_effort: Option<&str>,
+        fallback_mode: Option<&str>,
     ) {
         if let Some(m) = ModelState::from_config_options(opts) {
             self.models = m;
@@ -898,6 +1050,13 @@ impl AcpClient {
         } else {
             self.effort = EffortState::default();
         }
+        if let Some(m) = SessionModeState::from_config_options(opts) {
+            self.modes = m;
+        } else if let Some(id) = fallback_mode {
+            self.modes.current = Some(id.to_string());
+        } else if self.modes.config_id.is_some() {
+            self.modes = SessionModeState::default();
+        }
     }
 
     /// Switch the session's model. Agents that do not support it answer with
@@ -910,7 +1069,7 @@ impl AcpClient {
                     json!({"sessionId": session_id, "configId": config_id, "value": model_id}),
                 )?;
                 if let Some(opts) = result.get("configOptions") {
-                    self.sync_config_options(opts, Some(model_id), None);
+                    self.sync_config_options(opts, Some(model_id), None, None);
                 } else {
                     self.models.current = Some(model_id.to_string());
                 }
@@ -938,9 +1097,36 @@ impl AcpClient {
             json!({"sessionId": session_id, "configId": config_id, "value": effort_id}),
         )?;
         if let Some(opts) = result.get("configOptions") {
-            self.sync_config_options(opts, None, Some(effort_id));
+            self.sync_config_options(opts, None, Some(effort_id), None);
         } else {
             self.effort.current = Some(effort_id.to_string());
+        }
+        Ok(())
+    }
+
+    /// Switch the session's execution/permission mode via
+    /// `session/set_config_option` (when advertised as a config option) or
+    /// legacy `session/set_mode`.
+    pub fn set_mode(&mut self, session_id: &str, mode_id: &str) -> Result<(), AcpError> {
+        match self.modes.config_id.clone() {
+            Some(config_id) => {
+                let result = self.call_quiet(
+                    "session/set_config_option",
+                    json!({"sessionId": session_id, "configId": config_id, "value": mode_id}),
+                )?;
+                if let Some(opts) = result.get("configOptions") {
+                    self.sync_config_options(opts, None, None, Some(mode_id));
+                } else {
+                    self.modes.current = Some(mode_id.to_string());
+                }
+            }
+            None => {
+                self.call_quiet(
+                    "session/set_mode",
+                    json!({"sessionId": session_id, "modeId": mode_id}),
+                )?;
+                self.modes.current = Some(mode_id.to_string());
+            }
         }
         Ok(())
     }
@@ -1101,6 +1287,7 @@ fn parse_update(u: &Value) -> Event {
             Some(opts) => Event::ConfigOptionsUpdated {
                 models: ModelState::from_config_options(opts),
                 effort: EffortState::from_config_options(opts),
+                modes: SessionModeState::from_config_options(opts),
             },
             None => Event::Other(kind),
         },
@@ -1109,6 +1296,14 @@ fn parse_update(u: &Value) -> Event {
             None => Event::Other(kind),
         },
         "current_model_update" => Event::ModelChanged(str_of(u, "currentModelId")),
+        "current_mode_update" => match u
+            .get("currentModeId")
+            .or_else(|| u.get("modeId"))
+            .and_then(non_empty_str)
+        {
+            Some(id) => Event::ModeChanged(id.to_string()),
+            None => Event::Other(kind),
+        },
         "usage_update" => match UsageUpdate::parse(u) {
             Some(usage) => Event::UsageUpdated(usage),
             None => Event::Other(kind),
@@ -1619,6 +1814,7 @@ case "$l" in *'"modelId":"b"'*) echo '{"jsonrpc":"2.0","id":2,"result":{}}';; *)
             Event::ConfigOptionsUpdated {
                 models: Some(m),
                 effort: None,
+                modes: None,
             }
         );
         assert!(ModelState::from_config_options(&json!([])).is_none());
@@ -1665,6 +1861,7 @@ case "$l" in *'"modelId":"b"'*) echo '{"jsonrpc":"2.0","id":2,"result":{}}';; *)
             Event::ConfigOptionsUpdated {
                 models: ModelState::from_config_options(&claude_opts),
                 effort: Some(e),
+                modes: None,
             }
         );
         assert!(EffortState::from_config_options(&json!([])).is_none());
@@ -1771,6 +1968,157 @@ for line in sys.stdin:
     fn model_update_notification_is_parsed() {
         let u = json!({"sessionUpdate": "current_model_update", "currentModelId": "b"});
         assert_eq!(parse_update(&u), Event::ModelChanged("b".into()));
+    }
+
+    #[test]
+    fn session_mode_parses_config_options_and_legacy_modes() {
+        let opts = json!([
+            {"id": "mode", "category": "mode", "type": "select", "currentValue": "default",
+             "options": [
+                {"value": "default", "name": "Default", "description": "Ask before edits"},
+                {"value": "acceptEdits", "name": "Accept Edits"},
+                {"value": "plan", "name": "Plan Mode", "description": "Read-only planning"},
+                {"value": "bypassPermissions", "name": "Bypass Permissions"}
+             ]}
+        ]);
+        let m = SessionModeState::from_config_options(&opts).unwrap();
+        assert_eq!(m.current.as_deref(), Some("default"));
+        assert_eq!(m.config_id.as_deref(), Some("mode"));
+        assert_eq!(m.display("plan"), "Plan Mode");
+        assert_eq!(m.available.len(), 4);
+        assert_eq!(
+            m.available[0].description.as_deref(),
+            Some("Ask before edits")
+        );
+
+        let u = json!({"sessionUpdate": "config_option_update", "configOptions": opts});
+        assert_eq!(
+            parse_update(&u),
+            Event::ConfigOptionsUpdated {
+                models: None,
+                effort: None,
+                modes: Some(m),
+            }
+        );
+
+        let legacy = json!({
+            "currentModeId": "ask",
+            "availableModes": [
+                {"id": "ask", "name": "Ask", "description": "Read-only"},
+                {"id": "code", "name": "Code"}
+            ]
+        });
+        let lm = SessionModeState::parse(&legacy);
+        assert_eq!(lm.current.as_deref(), Some("ask"));
+        assert_eq!(lm.config_id, None);
+        assert_eq!(lm.available.len(), 2);
+        assert_eq!(lm.available[0].description.as_deref(), Some("Read-only"));
+        assert_eq!(lm.display("code"), "Code");
+
+        let mu = json!({"sessionUpdate": "current_mode_update", "currentModeId": "code"});
+        assert_eq!(parse_update(&mu), Event::ModeChanged("code".into()));
+    }
+
+    #[test]
+    fn session_mode_switches_via_config_option_and_legacy_set_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        // Config-option mode + mid-turn mode update.
+        let config_script = r#"
+import json, sys
+
+mode = "default"
+
+def config_options():
+    return [{
+        "id": "mode", "category": "mode", "type": "select", "currentValue": mode,
+        "options": [
+            {"value": "default", "name": "Default"},
+            {"value": "plan", "name": "Plan Mode"},
+            {"value": "bypassPermissions", "name": "Auto"}
+        ]
+    }]
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    m, mid = msg.get("method"), msg.get("id")
+    if m == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":1,"agentInfo":{"name":"fake"}}}), flush=True)
+    elif m == "session/new":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"sessionId":"s1","configOptions":config_options()}}), flush=True)
+    elif m == "session/set_config_option":
+        mode = msg["params"]["value"]
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"configOptions":config_options()}}), flush=True)
+    elif m == "session/prompt":
+        mode = "bypassPermissions"
+        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"s1",
+            "update":{"sessionUpdate":"config_option_update","configOptions":config_options()}
+        }}), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"stopReason":"end_turn"}}), flush=True)
+"#;
+        let mut c = AcpClient::spawn("python3", &["-c", config_script], dir.path()).unwrap();
+        c.initialize().unwrap();
+        let sid = c.new_session(dir.path()).unwrap();
+        assert_eq!(c.modes().current.as_deref(), Some("default"));
+        assert_eq!(c.modes().config_id.as_deref(), Some("mode"));
+        c.set_mode(&sid, "plan").unwrap();
+        assert_eq!(c.modes().current.as_deref(), Some("plan"));
+
+        let mut events = Vec::new();
+        c.prompt(&sid, "go", |e| events.push(e), |_| None).unwrap();
+        assert_eq!(c.modes().current.as_deref(), Some("bypassPermissions"));
+        assert!(matches!(
+            events.first(),
+            Some(Event::ConfigOptionsUpdated { modes: Some(m), .. })
+                if m.current.as_deref() == Some("bypassPermissions")
+        ));
+
+        // Legacy `modes` + `session/set_mode` + `current_mode_update`.
+        let legacy_script = r#"
+import json, sys
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    m, mid = msg.get("method"), msg.get("id")
+    if m == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":1,"agentInfo":{"name":"legacy"}}}), flush=True)
+    elif m == "session/new":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{
+            "sessionId":"s2",
+            "modes":{
+                "currentModeId":"ask",
+                "availableModes":[
+                    {"id":"ask","name":"Ask"},
+                    {"id":"code","name":"Code"}
+                ]
+            }
+        }}), flush=True)
+    elif m == "session/set_mode":
+        if msg["params"]["modeId"] == "code":
+            print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{}}), flush=True)
+        else:
+            print(json.dumps({"jsonrpc":"2.0","id":mid,"error":{"code":-32602,"message":"bad mode"}}), flush=True)
+    elif m == "session/prompt":
+        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"s2",
+            "update":{"sessionUpdate":"current_mode_update","currentModeId":"ask"}
+        }}), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"stopReason":"end_turn"}}), flush=True)
+"#;
+        let mut lc = AcpClient::spawn("python3", &["-c", legacy_script], dir.path()).unwrap();
+        lc.initialize().unwrap();
+        let lsid = lc.new_session(dir.path()).unwrap();
+        assert_eq!(lc.modes().current.as_deref(), Some("ask"));
+        assert_eq!(lc.modes().config_id, None);
+        lc.set_mode(&lsid, "code").unwrap();
+        assert_eq!(lc.modes().current.as_deref(), Some("code"));
+        assert!(lc.set_mode(&lsid, "nope").is_err());
+
+        let mut levents = Vec::new();
+        lc.prompt(&lsid, "go", |e| levents.push(e), |_| None)
+            .unwrap();
+        assert_eq!(lc.modes().current.as_deref(), Some("ask"));
+        assert_eq!(levents, vec![Event::ModeChanged("ask".into())]);
     }
 
     #[test]

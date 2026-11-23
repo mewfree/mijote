@@ -22,6 +22,9 @@ struct Cli {
     /// Reopen saved sessions for the current directory instead of starting a new one
     #[arg(short, long)]
     resume: bool,
+    /// Default ACP session mode for new sessions (e.g. default, plan, acceptEdits, auto)
+    #[arg(long)]
+    mode: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -33,6 +36,9 @@ enum Command {
         /// Reopen saved sessions for the current directory instead of starting a new one
         #[arg(short, long)]
         resume: bool,
+        /// Default ACP session mode for new sessions (e.g. default, plan, acceptEdits, auto)
+        #[arg(long)]
+        mode: Option<String>,
     },
     /// List known agent backends and whether they are on PATH
     Agents,
@@ -50,20 +56,27 @@ enum Command {
         /// Model reasoning/effort level (e.g. low, medium, high, max)
         #[arg(short, long)]
         effort: Option<String>,
+        /// ACP session mode (e.g. default, plan, acceptEdits, bypassPermissions)
+        #[arg(short, long)]
+        mode: Option<String>,
     },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Tui { resume: false }) {
-        Command::Tui { resume } => tui(cli.resume || resume),
+    match cli.command.unwrap_or(Command::Tui {
+        resume: false,
+        mode: None,
+    }) {
+        Command::Tui { resume, mode } => tui(cli.resume || resume, mode.or(cli.mode)),
         Command::Agents => list_agents(),
         Command::Install { agent } => install(&agent),
         Command::Ask {
             agent,
             prompt,
             effort,
-        } => ask(&agent, &prompt, effort.as_deref()),
+            mode,
+        } => ask(&agent, &prompt, effort.as_deref(), mode.as_deref()),
     }
 }
 
@@ -102,7 +115,7 @@ fn install(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn ask(id: &str, prompt: &str, effort: Option<&str>) -> Result<()> {
+fn ask(id: &str, prompt: &str, effort: Option<&str>, mode: Option<&str>) -> Result<()> {
     let (spec, program) = resolve(id)?;
     let cwd = std::env::current_dir()?;
     let mut client = AcpClient::spawn(&program.to_string_lossy(), spec.args, &cwd)
@@ -125,6 +138,22 @@ fn ask(id: &str, prompt: &str, effort: Option<&str>) -> Result<()> {
             bail!("unknown effort `{want}`; try: {}", names.join(", "));
         };
         client.set_effort(&session, &chosen)?;
+    }
+    if let Some(want) = mode {
+        let state = client.modes();
+        if state.available.is_empty() {
+            bail!("{} does not offer session modes", spec.name);
+        }
+        let Some(chosen) = state
+            .available
+            .iter()
+            .find(|m| m.id.eq_ignore_ascii_case(want) || m.name.eq_ignore_ascii_case(want))
+            .map(|m| m.id.clone())
+        else {
+            let names: Vec<_> = state.available.iter().map(|m| m.name.as_str()).collect();
+            bail!("unknown mode `{want}`; try: {}", names.join(", "));
+        };
+        client.set_mode(&session, &chosen)?;
     }
 
     let blocks = files::expand_mentions(prompt, &cwd, client.supports_embedded_context());
@@ -271,7 +300,7 @@ fn ask(id: &str, prompt: &str, effort: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn tui(resume: bool) -> Result<()> {
+fn tui(resume: bool, default_mode: Option<String>) -> Result<()> {
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -289,6 +318,7 @@ fn tui(resume: bool) -> Result<()> {
         store::Store::new(agent::install::data_dir().join("sessions")),
         tx,
     );
+    app.default_mode = default_mode;
     if resume {
         app.restore();
     } else {
@@ -401,7 +431,25 @@ mod tests {
         assert!(cli.resume);
 
         let cli = Cli::try_parse_from(["mijote", "tui", "--resume"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Tui { resume: true })));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Tui {
+                resume: true,
+                mode: None,
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["mijote", "--mode", "auto"]).unwrap();
+        assert_eq!(cli.mode.as_deref(), Some("auto"));
+
+        let cli = Cli::try_parse_from(["mijote", "tui", "--mode", "plan"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Tui {
+                resume: false,
+                mode: Some(m),
+            }) if m == "plan"
+        ));
 
         let cli =
             Cli::try_parse_from(["mijote", "ask", "claude", "--effort", "high", "hi"]).unwrap();
@@ -411,16 +459,19 @@ mod tests {
                 agent,
                 prompt,
                 effort: Some(e),
+                mode: None,
             }) if agent == "claude" && prompt == "hi" && e == "high"
         ));
 
-        let cli = Cli::try_parse_from(["mijote", "ask", "-e", "low", "claude", "hi"]).unwrap();
+        let cli = Cli::try_parse_from(["mijote", "ask", "-e", "low", "-m", "plan", "claude", "hi"])
+            .unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Ask {
                 effort: Some(e),
+                mode: Some(m),
                 ..
-            }) if e == "low"
+            }) if e == "low" && m == "plan"
         ));
     }
 }

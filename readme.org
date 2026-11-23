@@ -53,6 +53,7 @@ App commands sit behind a leader, =Space= in normal mode or =Ctrl-a= anywhere
 | =g= / =G=   | top / bottom of transcript (also =Home= / =End=)  |
 | =M=         | model picker (also =/model= in the prompt)        |
 | =e=         | effort picker (also =/effort= in the prompt)      |
+| =o=         | session mode picker (also =/mode=, =Shift-Tab= cycles) |
 | =u=         | usage & context window breakdown modal            |
 | =t=         | toggle thoughts & tool details (also =Ctrl-o=)    |
 | =m=         | toggle mouse capture                              |
